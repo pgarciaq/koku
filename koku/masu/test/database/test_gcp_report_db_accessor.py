@@ -18,70 +18,49 @@ from django.db.models import Sum
 from django_tenants.utils import schema_context
 from trino.exceptions import TrinoExternalError
 
-from api.metrics.constants import DEFAULT_DISTRIBUTION_TYPE
-from api.utils import DateHelper
+from api.models import Provider
+from koku.trino_database import TrinoHiveMetastoreError
 from masu.database import GCP_REPORT_TABLE_MAP
 from masu.database.cost_model_db_accessor import CostModelDBAccessor
 from masu.database.gcp_report_db_accessor import GCPReportDBAccessor
-from masu.database.report_manifest_db_accessor import ReportManifestDBAccessor
-from masu.external.date_accessor import DateAccessor
 from masu.test import MasuTestCase
+from reporting.models import OCPGCPCostLineItemProjectDailySummaryP
+from reporting.provider.all.models import EnabledTagKeys
+from reporting.provider.all.models import TagMapping
+from reporting.provider.gcp.models import GCPCostEntryBill
 from reporting.provider.gcp.models import GCPCostEntryLineItemDailySummary
-from reporting.provider.gcp.models import GCPEnabledTagKeys
-from reporting.provider.gcp.models import GCPTagsSummary
 from reporting.provider.gcp.models import GCPTopology
+from reporting_common.models import CostUsageReportManifest
 from reporting_common.models import CostUsageReportStatus
 
 
 class GCPReportDBAccessorTest(MasuTestCase):
     """Test Cases for the ReportDBAccessor object."""
 
-    @classmethod
-    def setUpClass(cls):
-        """Set up the test class with required objects."""
-        super().setUpClass()
-
-        cls.accessor = GCPReportDBAccessor(schema=cls.schema)
-        cls.report_schema = cls.accessor.report_schema
-
-        cls.all_tables = list(GCP_REPORT_TABLE_MAP.values())
-        cls.foreign_key_tables = [
-            GCP_REPORT_TABLE_MAP["bill"],
-        ]
-        cls.manifest_accessor = ReportManifestDBAccessor()
-
     def setUp(self):
         """Set up a test with database objects."""
         super().setUp()
-        today = DateAccessor().today_with_timezone("UTC")
-        billing_start = today.replace(day=1)
-
-        self.manifest_dict = {
-            "assembly_id": "1234",
-            "billing_period_start_datetime": billing_start,
-            "num_total_files": 2,
-            "provider_id": self.gcp_provider.uuid,
-        }
-        self.manifest = self.manifest_accessor.add(**self.manifest_dict)
+        self.accessor = GCPReportDBAccessor(schema=self.schema)
+        self.manifest = CostUsageReportManifest.objects.filter(provider_id=self.gcp_provider.uuid).first()
 
     def test_get_gcp_scan_range_from_report_name_with_manifest(self):
         """Test that we can scan range given the manifest id."""
-        dh = DateHelper()
-        today_date = dh.today
+        CostUsageReportStatus.objects.filter(manifest=self.manifest).delete()
+        today_date = self.dh.today
         expected_start_date = "2020-11-01"
         expected_end_date = "2020-11-30"
         etag = "1234"
         invoice_month = "202011"
         CostUsageReportStatus.objects.create(
             report_name=f"{invoice_month}_{etag}_{expected_start_date}:{expected_end_date}.csv",
-            last_completed_datetime=today_date,
-            last_started_datetime=today_date,
+            completed_datetime=today_date,
+            started_datetime=today_date,
             etag=etag,
             manifest=self.manifest,
         )
         scan_range = self.accessor.get_gcp_scan_range_from_report_name(manifest_id=self.manifest.id)
-        self.assertEqual(str(expected_start_date), scan_range.get("start"))
-        self.assertEqual(str(expected_end_date), scan_range.get("end"))
+        self.assertEqual(expected_start_date, scan_range.get("start"))
+        self.assertEqual(expected_end_date, scan_range.get("end"))
 
     def test_get_gcp_scan_range_from_report_name_with_report_name(self):
         """Test that we can scan range given the manifest id."""
@@ -109,30 +88,26 @@ class GCPReportDBAccessorTest(MasuTestCase):
 
     def test_populate_markup_cost(self):
         """Test that the daily summary table is populated."""
-        summary_table_name = GCP_REPORT_TABLE_MAP["line_item_daily_summary"]
-        summary_table = getattr(self.accessor.report_schema, summary_table_name)
-
         bills = self.accessor.get_cost_entry_bills_query_by_provider(self.gcp_provider.uuid)
         with schema_context(self.schema):
             bill_ids = [str(bill.id) for bill in bills.all()]
 
-            summary_entry = summary_table.objects.all().aggregate(Min("usage_start"), Max("usage_start"))
+            summary_entry = GCPCostEntryLineItemDailySummary.objects.all().aggregate(
+                Min("usage_start"), Max("usage_start")
+            )
             start_date = summary_entry["usage_start__min"]
             end_date = summary_entry["usage_start__max"]
 
-        query = self.accessor._get_db_obj_query(summary_table_name)
         with schema_context(self.schema):
-            expected_markup = query.filter(cost_entry_bill__in=bill_ids).aggregate(
+            expected_markup = GCPCostEntryLineItemDailySummary.objects.filter(cost_entry_bill__in=bill_ids).aggregate(
                 markup=Sum(F("unblended_cost") * decimal.Decimal(0.1))
             )
             expected_markup = expected_markup.get("markup")
 
         self.accessor.populate_markup_cost(decimal.Decimal(0.1), start_date, end_date, bill_ids)
         with schema_context(self.schema):
-            query = (
-                self.accessor._get_db_obj_query(summary_table_name)
-                .filter(cost_entry_bill__in=bill_ids)
-                .aggregate(Sum("markup_cost"))
+            query = GCPCostEntryLineItemDailySummary.objects.filter(cost_entry_bill__in=bill_ids).aggregate(
+                Sum("markup_cost")
             )
             actual_markup = query.get("markup_cost__sum")
             self.assertAlmostEqual(actual_markup, expected_markup, 6)
@@ -140,9 +115,7 @@ class GCPReportDBAccessorTest(MasuTestCase):
     def test_get_bill_query_before_date(self):
         """Test that gets a query for cost entry bills before a date."""
         with schema_context(self.schema):
-            table_name = GCP_REPORT_TABLE_MAP["bill"]
-            query = self.accessor._get_db_obj_query(table_name)
-            first_entry = query.first()
+            first_entry = GCPCostEntryBill.objects.first()
 
             # Verify that the result is returned for cutoff_date == billing_period_start
             cutoff_date = first_entry.billing_period_start
@@ -164,13 +137,22 @@ class GCPReportDBAccessorTest(MasuTestCase):
             self.assertEqual(cost_entries.count(), 0)
 
     @patch("masu.database.gcp_report_db_accessor.GCPReportDBAccessor._execute_trino_raw_sql_query")
+    def test_fetch_invoice_month_dates(self, mock_trino):
+        """Test that we fetch extended date range for given invoice month correctly querying Trino."""
+        start_date = self.dh.this_month_start.date()
+        end_date = self.dh.this_month_end.date()
+        invoice_month = start_date.strftime("%Y%m")
+
+        self.accessor.fetch_invoice_month_dates(start_date, end_date, invoice_month, self.gcp_provider_uuid)
+        mock_trino.assert_called()
+
+    @patch("masu.database.gcp_report_db_accessor.GCPReportDBAccessor._execute_trino_raw_sql_query")
     def test_populate_line_item_daily_summary_table_trino(self, mock_trino):
         """Test that we construst our SQL and query using Trino."""
-        dh = DateHelper()
-        start_date = dh.this_month_start.date()
-        end_date = dh.this_month_end.date()
-        invoice_month = dh.gcp_find_invoice_months_in_date_range(start_date, end_date)[0]
-        invoice_month_date = dh.invoice_month_start(invoice_month)
+        start_date = self.dh.this_month_start.date()
+        end_date = self.dh.this_month_end.date()
+        invoice_month = self.dh.gcp_find_invoice_months_in_date_range(start_date, end_date)[0]
+        invoice_month_date = self.dh.invoice_month_start(invoice_month)
 
         bills = self.accessor.get_cost_entry_bills_query_by_provider(self.gcp_provider.uuid)
         with schema_context(self.schema):
@@ -186,10 +168,7 @@ class GCPReportDBAccessorTest(MasuTestCase):
         mock_trino.assert_called()
 
     @patch("masu.database.gcp_report_db_accessor.GCPReportDBAccessor._execute_trino_raw_sql_query")
-    def test_populate_ocp_on_gcp_ui_summary_tables_trino(
-        self,
-        mock_trino,
-    ):
+    def test_populate_ocp_on_gcp_ui_summary_tables_trino_managed(self, mock_trino):
         """Test that Trino is used to populate UI summary."""
         start_date = self.dh.today.date()
         end_date = start_date + datetime.timedelta(days=1)
@@ -198,70 +177,6 @@ class GCPReportDBAccessorTest(MasuTestCase):
         )
         mock_trino.assert_called()
 
-    def test_populate_enabled_tag_keys(self):
-        """Test that enabled tag keys are populated."""
-        dh = DateHelper()
-        start_date = dh.this_month_start.date()
-        end_date = dh.this_month_end.date()
-
-        bills = self.accessor.bills_for_provider_uuid(self.gcp_provider_uuid, start_date)
-        with schema_context(self.schema):
-            GCPTagsSummary.objects.all().delete()
-            GCPEnabledTagKeys.objects.all().delete()
-            bill_ids = [bill.id for bill in bills]
-            self.assertEqual(GCPEnabledTagKeys.objects.count(), 0)
-            self.accessor.populate_enabled_tag_keys(start_date, end_date, bill_ids)
-            self.assertNotEqual(GCPEnabledTagKeys.objects.count(), 0)
-
-    def test_update_line_item_daily_summary_with_enabled_tags(self):
-        """Test that we filter the daily summary table's tags with only enabled tags."""
-        dh = DateHelper()
-        start_date = dh.this_month_start.date()
-        end_date = dh.this_month_end.date()
-
-        bills = self.accessor.bills_for_provider_uuid(self.gcp_provider_uuid, start_date)
-        with schema_context(self.schema):
-            GCPTagsSummary.objects.all().delete()
-            key_to_keep = GCPEnabledTagKeys.objects.filter(key="app").first()
-            GCPEnabledTagKeys.objects.all().update(enabled=False)
-            GCPEnabledTagKeys.objects.filter(key="app").update(enabled=True)
-            bill_ids = [bill.id for bill in bills]
-            self.accessor.update_line_item_daily_summary_with_enabled_tags(start_date, end_date, bill_ids)
-            tags = (
-                GCPCostEntryLineItemDailySummary.objects.filter(
-                    usage_start__gte=start_date, cost_entry_bill_id__in=bill_ids
-                )
-                .values_list("tags")
-                .distinct()
-            )
-
-            for tag in tags:
-                tag_dict = tag[0] if tag[0] is not None else {}  # account for null tags value
-                tag_keys = list(tag_dict.keys())
-                if tag_keys:
-                    self.assertEqual([key_to_keep.key], tag_keys)
-                else:
-                    self.assertEqual([], tag_keys)
-
-    def test_delete_line_item_daily_summary_entries_for_date_range(self):
-        """Test that daily summary rows are deleted."""
-        with schema_context(self.schema):
-            start_date = GCPCostEntryLineItemDailySummary.objects.aggregate(Max("usage_start")).get("usage_start__max")
-            end_date = start_date
-
-        table_query = GCPCostEntryLineItemDailySummary.objects.filter(
-            source_uuid=self.gcp_provider_uuid, usage_start__gte=start_date, usage_start__lte=end_date
-        )
-        with schema_context(self.schema):
-            self.assertNotEqual(table_query.count(), 0)
-
-        self.accessor.delete_line_item_daily_summary_entries_for_date_range(
-            self.gcp_provider_uuid, start_date, end_date
-        )
-
-        with schema_context(self.schema):
-            self.assertEqual(table_query.count(), 0)
-
     def test_table_properties(self):
         self.assertEqual(self.accessor.line_item_daily_summary_table, GCPCostEntryLineItemDailySummary)
 
@@ -269,126 +184,33 @@ class GCPReportDBAccessorTest(MasuTestCase):
         self.assertEqual(self.accessor._table_map, GCP_REPORT_TABLE_MAP)
 
     @patch("masu.database.gcp_report_db_accessor.GCPReportDBAccessor.delete_ocp_on_gcp_hive_partition_by_day")
-    @patch("masu.database.gcp_report_db_accessor.GCPReportDBAccessor.delete_hive_partition_by_month")
     @patch("masu.database.gcp_report_db_accessor.GCPReportDBAccessor._execute_trino_multipart_sql_query")
-    def test_populate_ocp_on_gcp_cost_daily_summary_trino(self, mock_trino, mock_month_delete, mock_delete):
+    @patch("masu.database.gcp_report_db_accessor.GCPReportDBAccessor._get_matched_tags_strings")
+    def test_populate_ocp_on_gcp_cost_daily_summary_trino_managed(self, mock_get_tags, mock_trino, mock_delete):
         """Test that we construst our SQL and query using Trino."""
-        dh = DateHelper()
-        start_date = dh.this_month_start.date()
-        end_date = dh.this_month_end.date()
+        start_date = self.dh.this_month_start.date()
+        end_date = self.dh.this_month_end.date()
 
         bills = self.accessor.get_cost_entry_bills_query_by_provider(self.gcp_provider.uuid)
         with schema_context(self.schema):
             current_bill_id = bills.first().id if bills else None
 
-        with CostModelDBAccessor(self.schema, self.gcp_provider.uuid) as cost_model_accessor:
-            markup = cost_model_accessor.markup
-            markup_value = float(markup.get("value", 0)) / 100
-            distribution = cost_model_accessor.distribution_info.get("distribution_type", DEFAULT_DISTRIBUTION_TYPE)
+        mock_get_tags.return_value = "fake-tags"
 
         self.accessor.populate_ocp_on_gcp_cost_daily_summary_trino(
             start_date,
             end_date,
             self.ocp_provider_uuid,
-            self.ocp_cluster_id,
             self.gcp_provider_uuid,
             self.ocp_cluster_id,
             current_bill_id,
-            markup_value,
-            distribution,
         )
         mock_trino.assert_called()
-        mock_month_delete.assert_called()
         mock_delete.assert_called()
-
-    @patch("masu.database.gcp_report_db_accessor.GCPReportDBAccessor.delete_ocp_on_gcp_hive_partition_by_day")
-    @patch("masu.database.gcp_report_db_accessor.GCPReportDBAccessor.delete_hive_partition_by_month")
-    @patch("masu.database.gcp_report_db_accessor.GCPReportDBAccessor._execute_trino_multipart_sql_query")
-    def test_populate_ocp_on_gcp_cost_daily_summary_trino_resource_names(
-        self, mock_trino, mock_month_delete, mock_delete
-    ):
-        """Test that we construst our SQL and query using Trino."""
-        dh = DateHelper()
-        start_date = dh.this_month_start.date()
-        end_date = dh.this_month_end.date()
-
-        bills = self.accessor.get_cost_entry_bills_query_by_provider(self.gcp_provider.uuid)
-        with schema_context(self.schema):
-            current_bill_id = bills.first().id if bills else None
-
-        with CostModelDBAccessor(self.schema, self.gcp_provider.uuid) as cost_model_accessor:
-            markup = cost_model_accessor.markup
-            markup_value = float(markup.get("value", 0)) / 100
-
-        for distribution in ["cpu", "memory"]:
-            with self.subTest(distribution=distribution):
-                expected_log = "INFO:masu.util.gcp.common:OCP GCP matching set to resource level"
-                with patch(
-                    "masu.util.gcp.common.ProviderDBAccessor.get_data_source",
-                    Mock(return_value={"table_id": "resource"}),
-                ):
-                    with self.assertLogs("masu.util.gcp.common", level="INFO") as logger:
-                        self.accessor.populate_ocp_on_gcp_cost_daily_summary_trino(
-                            start_date,
-                            end_date,
-                            self.ocp_provider_uuid,
-                            self.ocp_cluster_id,
-                            self.gcp_provider_uuid,
-                            self.ocp_cluster_id,
-                            current_bill_id,
-                            markup_value,
-                            distribution,
-                        )
-                        mock_trino.assert_called()
-                        mock_delete.assert_called()
-                        mock_month_delete.assert_called()
-                        self.assertIn(expected_log, logger.output)
-
-    @patch("masu.database.gcp_report_db_accessor.GCPReportDBAccessor.delete_ocp_on_gcp_hive_partition_by_day")
-    @patch("masu.database.gcp_report_db_accessor.GCPReportDBAccessor.delete_hive_partition_by_month")
-    @patch("masu.database.gcp_report_db_accessor.GCPReportDBAccessor._execute_trino_multipart_sql_query")
-    def test_populate_ocp_on_gcp_cost_daily_summary_trino_by_node(
-        self,
-        mock_trino,
-        mock_month_delete,
-        mock_delete,
-    ):
-        """Test that we construst our SQL and query using Trino."""
-        dh = DateHelper()
-        start_date = dh.this_month_start.date()
-        end_date = dh.this_month_end.date()
-
-        bills = self.accessor.get_cost_entry_bills_query_by_provider(self.gcp_provider.uuid)
-        with schema_context(self.schema):
-            current_bill_id = bills.first().id if bills else None
-
-        with CostModelDBAccessor(self.schema, self.gcp_provider.uuid) as cost_model_accessor:
-            markup = cost_model_accessor.markup
-            markup_value = float(markup.get("value", 0)) / 100
-
-        for distribution in ["cpu", "memory"]:
-            with self.subTest(distribution=distribution):
-                self.accessor.populate_ocp_on_gcp_cost_daily_summary_trino_by_node(
-                    start_date,
-                    end_date,
-                    self.ocp_provider_uuid,
-                    self.ocp_cluster_id,
-                    self.gcp_provider_uuid,
-                    self.ocp_cluster_id,
-                    current_bill_id,
-                    markup_value,
-                    distribution,
-                    "node",
-                    12,
-                )
-                mock_trino.assert_called()
-                mock_delete.assert_called()
-                mock_month_delete.assert_called()
 
     def test_get_openshift_on_cloud_matched_tags(self):
         """Test that matched tags are returned."""
-        dh = DateHelper()
-        start_date = dh.this_month_start.date()
+        start_date = self.dh.this_month_start.date()
 
         with schema_context(self.schema_name):
             bills = self.accessor.bills_for_provider_uuid(self.gcp_provider_uuid, start_date)
@@ -402,11 +224,10 @@ class GCPReportDBAccessorTest(MasuTestCase):
     @patch("masu.database.gcp_report_db_accessor.GCPReportDBAccessor._execute_trino_raw_sql_query")
     def test_get_openshift_on_cloud_matched_tags_trino(self, mock_trino):
         """Test that Trino is used to find matched tags."""
-        dh = DateHelper()
-        start_date = dh.this_month_start.date()
-        end_date = dh.this_month_end.date()
-        invoice_month = dh.gcp_find_invoice_months_in_date_range(start_date, end_date)[0]
-        invoice_month_date = dh.invoice_month_start(invoice_month)
+        start_date = self.dh.this_month_start.date()
+        end_date = self.dh.this_month_end.date()
+        invoice_month = self.dh.gcp_find_invoice_months_in_date_range(start_date, end_date)[0]
+        invoice_month_date = self.dh.invoice_month_start(invoice_month)
         ocp_uuids = (self.ocp_on_gcp_ocp_provider.uuid,)
 
         self.accessor.get_openshift_on_cloud_matched_tags_trino(
@@ -422,7 +243,7 @@ class GCPReportDBAccessorTest(MasuTestCase):
     def test_check_for_matching_enabled_keys_no_matches(self, mock_trino):
         """Test that Trino is used to find matched tags."""
         with schema_context(self.schema):
-            GCPEnabledTagKeys.objects.all().delete()
+            EnabledTagKeys.objects.filter(provider_type=Provider.PROVIDER_GCP).delete()
         value = self.accessor.check_for_matching_enabled_keys()
         self.assertFalse(value)
 
@@ -435,9 +256,8 @@ class GCPReportDBAccessorTest(MasuTestCase):
     @patch("masu.database.gcp_report_db_accessor.GCPReportDBAccessor._execute_raw_sql_query")
     def test_back_populate_ocp_infrastructure_costs(self, mock_sql_execute):
         """Test that ocp on gcp back populate runs"""
-        dh = DateHelper()
-        start_date = dh.this_month_start.date()
-        end_date = dh.this_month_end.date()
+        start_date = self.dh.this_month_start.date()
+        end_date = self.dh.this_month_end.date()
         report_period_id = 4
         self.accessor.back_populate_ocp_infrastructure_costs(start_date, end_date, report_period_id)
 
@@ -460,11 +280,10 @@ class GCPReportDBAccessorTest(MasuTestCase):
         ]
         mock_get_topo.return_value = mock_topo_record
 
-        dh = DateHelper()
-        start_date = dh.this_month_start
-        end_date = dh.this_month_end
-        invoice_month = dh.gcp_find_invoice_months_in_date_range(start_date, end_date)[0]
-        invoice_month_date = dh.invoice_month_start(invoice_month)
+        start_date = self.dh.this_month_start
+        end_date = self.dh.this_month_end
+        invoice_month = self.dh.gcp_find_invoice_months_in_date_range(start_date, end_date)[0]
+        invoice_month_date = self.dh.invoice_month_start(invoice_month)
         self.accessor.populate_gcp_topology_information_tables(
             self.gcp_provider, start_date, end_date, invoice_month_date
         )
@@ -486,21 +305,18 @@ class GCPReportDBAccessorTest(MasuTestCase):
     @patch("masu.database.gcp_report_db_accessor.GCPReportDBAccessor._execute_trino_raw_sql_query")
     def test_get_gcp_topology_trino(self, mock_trino):
         """Test that we call Trino to get topology."""
-        dh = DateHelper()
-        start_date = dh.this_month_start
-        end_date = dh.this_month_end
-        invoice_month = dh.gcp_find_invoice_months_in_date_range(start_date, end_date)[0]
-        invoice_month_date = dh.invoice_month_start(invoice_month)
-        self.accessor.get_gcp_topology_trino(self.gcp_provider_uuid, start_date, end_date, invoice_month_date)
+        start_date = self.dh.this_month_start
+        end_date = self.dh.this_month_end
+        invoice_month = self.dh.invoice_month_from_bill_date(start_date)
+        self.accessor.get_gcp_topology_trino(self.gcp_provider_uuid, start_date, end_date, invoice_month)
 
         mock_trino.assert_called()
 
     @patch("masu.database.gcp_report_db_accessor.GCPReportDBAccessor._execute_raw_sql_query")
     def test_populate_ocp_gcp_ui_summary_tables(self, mock_sql):
         """Test that we construst our SQL and query using Trino."""
-        dh = DateHelper()
-        start_date = dh.this_month_start.date()
-        end_date = dh.this_month_end.date()
+        start_date = self.dh.this_month_start.date()
+        end_date = self.dh.this_month_end.date()
         summary_sql_params = {
             "schema": self.schema,
             "start_date": start_date,
@@ -512,39 +328,43 @@ class GCPReportDBAccessorTest(MasuTestCase):
         mock_sql.assert_called()
 
     @patch("masu.database.gcp_report_db_accessor.GCPReportDBAccessor._execute_raw_sql_query")
-    def test_populate_ocp_on_gcp_tags_summary_table(self, mock_trino):
+    def test_populate_ocp_on_gcp_tag_information_assert_call(self, mock_trino):
         """Test that we construst our SQL and execute our query."""
-        dh = DateHelper()
-        start_date = dh.this_month_start.date()
-        end_date = dh.this_month_end.date()
+        report_period_id = 1
+        start_date = self.dh.this_month_start.date()
+        end_date = self.dh.this_month_end.date()
 
         mock_gcp_bills = [Mock(), Mock()]
-        self.accessor.populate_ocp_on_gcp_tags_summary_table(mock_gcp_bills, start_date, end_date)
+        self.accessor.populate_ocp_on_gcp_tag_information(mock_gcp_bills, start_date, end_date, report_period_id)
         mock_trino.assert_called()
 
     @patch("masu.database.gcp_report_db_accessor.GCPReportDBAccessor.schema_exists_trino")
     @patch("masu.database.gcp_report_db_accessor.GCPReportDBAccessor.table_exists_trino")
-    @patch("masu.database.gcp_report_db_accessor.GCPReportDBAccessor._execute_trino_raw_sql_query")
-    def test_delete_ocp_on_gcp_hive_partition_by_day(self, mock_trino, mock_table_exist, mock_schema_exists):
+    @patch("masu.database.report_db_accessor_base.trino_db.connect")
+    @patch("time.sleep", return_value=None)
+    def test_delete_ocp_on_gcp_hive_partition_by_day(
+        self, mock_sleep, mock_connect, mock_table_exists, mock_schema_exists
+    ):
         """Test that deletions work with retries."""
         mock_schema_exists.return_value = False
         self.accessor.delete_ocp_on_gcp_hive_partition_by_day(
             [1], self.gcp_provider_uuid, self.ocp_provider_uuid, "2022", "01"
         )
-        mock_trino.assert_not_called()
+        mock_connect.assert_not_called()
+
+        mock_connect.reset_mock()
 
         mock_schema_exists.return_value = True
-        mock_trino.reset_mock()
-        error = {"errorName": "HIVE_METASTORE_ERROR"}
-        mock_trino.side_effect = TrinoExternalError(error)
-        with self.assertRaises(TrinoExternalError):
+        attrs = {"cursor.side_effect": TrinoExternalError({"errorName": "HIVE_METASTORE_ERROR"})}
+        mock_connect.return_value = Mock(**attrs)
+
+        with self.assertRaises(TrinoHiveMetastoreError):
             self.accessor.delete_ocp_on_gcp_hive_partition_by_day(
                 [1], self.gcp_provider_uuid, self.ocp_provider_uuid, "2022", "01"
             )
-        mock_trino.assert_called()
-        # Confirms that the error log would be logged on last attempt
-        self.assertEqual(mock_trino.call_args_list[-1].kwargs.get("attempts_left"), 0)
-        self.assertEqual(mock_trino.call_count, settings.HIVE_PARTITION_DELETE_RETRIES)
+
+        mock_connect.assert_called()
+        self.assertEqual(mock_connect.call_count, settings.HIVE_PARTITION_DELETE_RETRIES)
 
     @patch("masu.database.report_db_accessor_base.ReportDBAccessorBase.table_exists_trino")
     @patch("masu.database.report_db_accessor_base.ReportDBAccessorBase._execute_trino_raw_sql_query")
@@ -560,7 +380,6 @@ class GCPReportDBAccessorTest(MasuTestCase):
                 self.accessor.delete_hive_partition_by_month(table, self.ocp_provider_uuid, "2022", "01")
             mock_trino.assert_called()
             # Confirms that the error log would be logged on last attempt
-            self.assertEqual(mock_trino.call_args_list[-1].kwargs.get("attempts_left"), 0)
             self.assertEqual(mock_trino.call_count, settings.HIVE_PARTITION_DELETE_RETRIES)
 
         # Test that deletions short circuit if the schema does not exist
@@ -572,3 +391,152 @@ class GCPReportDBAccessorTest(MasuTestCase):
             self.accessor.delete_hive_partition_by_month(table, self.ocp_provider_uuid, "2022", "01")
             mock_trino.assert_not_called()
             mock_table_exist.assert_not_called()
+
+    @patch("masu.database.gcp_report_db_accessor.GCPReportDBAccessor.schema_exists_trino")
+    @patch("masu.database.gcp_report_db_accessor.GCPReportDBAccessor.table_exists_trino")
+    @patch("masu.database.report_db_accessor_base.trino_db.connect")
+    @patch("time.sleep", return_value=None)
+    def test_delete_ocp_on_gcp_hive_partition_by_day_managed_table(
+        self, mock_sleep, mock_connect, mock_table_exists, mock_schema_exists
+    ):
+        """Test that deletions work with retries."""
+        mock_schema_exists.return_value = False
+        self.accessor.delete_ocp_on_gcp_hive_partition_by_day(
+            [1],
+            self.gcp_provider_uuid,
+            self.ocp_provider_uuid,
+            "2022",
+            "01",
+        )
+        mock_connect.assert_not_called()
+
+        mock_connect.reset_mock()
+
+        mock_schema_exists.return_value = True
+        attrs = {"cursor.side_effect": TrinoExternalError({"errorName": "HIVE_METASTORE_ERROR"})}
+        mock_connect.return_value = Mock(**attrs)
+
+        with self.assertRaises(TrinoHiveMetastoreError):
+            self.accessor.delete_ocp_on_gcp_hive_partition_by_day(
+                [1],
+                self.gcp_provider_uuid,
+                self.ocp_provider_uuid,
+                "2022",
+                "01",
+            )
+
+        mock_connect.assert_called()
+        self.assertEqual(mock_connect.call_count, settings.HIVE_PARTITION_DELETE_RETRIES)
+
+    def test_update_line_item_daily_summary_with_tag_mapping(self):
+        """
+        This tests the tag mapping feature.
+        """
+        populated_keys = []
+        with schema_context(self.schema):
+            enabled_tags = EnabledTagKeys.objects.filter(provider_type=Provider.PROVIDER_GCP, enabled=True)
+            for enabled_tag in enabled_tags:
+                tag_count = GCPCostEntryLineItemDailySummary.objects.filter(
+                    tags__has_key=enabled_tag.key,
+                    usage_start__gte=self.dh.this_month_start,
+                    usage_start__lte=self.dh.today,
+                ).count()
+                if tag_count > 0:
+                    key_metadata = [enabled_tag.key, enabled_tag, tag_count]
+                    populated_keys.append(key_metadata)
+                if len(populated_keys) == 2:
+                    break
+            parent_key, parent_obj, parent_count = populated_keys[0]
+            child_key, child_obj, child_count = populated_keys[1]
+            TagMapping.objects.create(parent=parent_obj, child=child_obj)
+            self.accessor.update_line_item_daily_summary_with_tag_mapping(self.dh.this_month_start, self.dh.today)
+            expected_parent_count = parent_count + child_count
+            actual_parent_count = GCPCostEntryLineItemDailySummary.objects.filter(
+                tags__has_key=parent_key, usage_start__gte=self.dh.this_month_start, usage_start__lte=self.dh.today
+            ).count()
+            self.assertEqual(expected_parent_count, actual_parent_count)
+            actual_child_count = GCPCostEntryLineItemDailySummary.objects.filter(
+                tags__has_key=child_key, usage_start__gte=self.dh.this_month_start, usage_start__lte=self.dh.today
+            ).count()
+            self.assertEqual(0, actual_child_count)
+
+    def test_populate_ocp_on_gcp_tag_information(self):
+        """
+        This tests the tag mapping feature.
+        """
+        populated_keys = []
+        report_period_id = 1
+        with schema_context(self.schema):
+            enabled_tags = EnabledTagKeys.objects.filter(provider_type=Provider.PROVIDER_GCP, enabled=True)
+            for enabled_tag in enabled_tags:
+                tag_count = OCPGCPCostLineItemProjectDailySummaryP.objects.filter(
+                    tags__has_key=enabled_tag.key,
+                    usage_start__gte=self.dh.this_month_start,
+                    usage_start__lte=self.dh.today,
+                ).count()
+                if tag_count > 0:
+                    key_metadata = [enabled_tag.key, enabled_tag, tag_count]
+                    populated_keys.append(key_metadata)
+                if len(populated_keys) == 2:
+                    break
+            bill_ids = OCPGCPCostLineItemProjectDailySummaryP.objects.filter(
+                tags__has_key=enabled_tag.key,
+                usage_start__gte=self.dh.this_month_start,
+                usage_start__lte=self.dh.today,
+            ).values_list("cost_entry_bill", flat=True)
+            parent_key, parent_obj, parent_count = populated_keys[0]
+            child_key, child_obj, child_count = populated_keys[1]
+            TagMapping.objects.create(parent=parent_obj, child=child_obj)
+            self.accessor.populate_ocp_on_gcp_tag_information(
+                bill_ids, self.dh.this_month_start, self.dh.today, report_period_id
+            )
+            expected_parent_count = parent_count + child_count
+            actual_parent_count = OCPGCPCostLineItemProjectDailySummaryP.objects.filter(
+                tags__has_key=parent_key, usage_start__gte=self.dh.this_month_start, usage_start__lte=self.dh.today
+            ).count()
+            self.assertEqual(expected_parent_count, actual_parent_count)
+            actual_child_count = OCPGCPCostLineItemProjectDailySummaryP.objects.filter(
+                tags__has_key=child_key, usage_start__gte=self.dh.this_month_start, usage_start__lte=self.dh.today
+            ).count()
+            self.assertEqual(0, actual_child_count)
+
+    @patch(
+        "masu.database.gcp_report_db_accessor.GCPReportDBAccessor.get_openshift_on_cloud_matched_tags",
+        return_value=None,
+    )
+    @patch("masu.database.gcp_report_db_accessor.GCPReportDBAccessor.get_openshift_on_cloud_matched_tags_trino")
+    def test_get_matched_tags_strings_trino(self, mock_postgres_tags, mock_trino_tags):
+        """Test fetching match tag strings via trino."""
+        tags = ['"app"']
+        mock_trino_tags.return_value = {"app"}
+        start = self.dh.this_month_start
+        end = self.dh.this_month_end
+        result = self.accessor._get_matched_tags_strings(1, self.gcp_provider_uuid, self.ocp_provider_uuid, start, end)
+        self.assertEqual(tags, result)
+
+    @patch(
+        "masu.database.gcp_report_db_accessor.GCPReportDBAccessor.get_openshift_on_cloud_matched_tags",
+        return_value=None,
+    )
+    @patch(
+        "masu.database.gcp_report_db_accessor.GCPReportDBAccessor.get_openshift_on_cloud_matched_tags_trino",
+        return_value=[],
+    )
+    def test_get_matched_tags_strings_no_tags(self, mock_postgres_tags, mock_trino_tags):
+        """Test fetching match tag with no tags returned."""
+        start = self.dh.this_month_start
+        end = self.dh.this_month_end
+        result = self.accessor._get_matched_tags_strings(1, self.gcp_provider_uuid, self.ocp_provider_uuid, start, end)
+        self.assertEqual([], result)
+
+    @patch(
+        "masu.database.gcp_report_db_accessor.GCPReportDBAccessor.get_openshift_on_cloud_matched_tags",
+        return_value=None,
+    )
+    @patch("masu.database.gcp_report_db_accessor.is_tag_processing_disabled", return_value=True)
+    def test_get_matched_tags_strings_trino_disabled(self, mock_postgres_tags, mock_unleash):
+        """Test fetching match tag strings."""
+        result = self.accessor._get_matched_tags_strings(
+            1, self.gcp_provider_uuid, self.ocp_provider_uuid, "2022-04-01", "2022-04-10"
+        )
+        self.assertEqual([], result)

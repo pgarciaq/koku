@@ -6,15 +6,16 @@
 import copy
 from unittest.mock import patch
 
+import pandas as pd
 from django_tenants.utils import schema_context
-from numpy import isnan
-from pandas import DataFrame
 
+from api.models import Provider
 from api.utils import DateHelper
 from masu.test import MasuTestCase
 from masu.util.azure.azure_post_processor import AzurePostProcessor
-from reporting.provider.azure.models import AzureEnabledTagKeys
-from reporting.provider.azure.models import TRINO_COLUMNS
+from masu.util.azure.common import INGRESS_REQUIRED_COLUMNS
+from reporting.provider.all.models import EnabledTagKeys
+from reporting.provider.azure.models import TRINO_REQUIRED_COLUMNS
 
 
 class TestAzurePostProcessor(MasuTestCase):
@@ -28,7 +29,7 @@ class TestAzurePostProcessor(MasuTestCase):
 
     def test_azure_generate_daily_data(self):
         """Test that we return the original data frame."""
-        df = DataFrame([{"key": "value"}])
+        df = pd.DataFrame([{"key": "value"}])
         result = self.post_processor._generate_daily_data(df)
         self.assertEqual(id(df), id(result))
 
@@ -36,15 +37,47 @@ class TestAzurePostProcessor(MasuTestCase):
         """Test that we end up with a dataframe with the correct columns."""
 
         data = {"MeterSubCategory": [1], "tags": ['{"key1": "val1", "key2": "val2"}']}
-        df = DataFrame(data)
+        df = pd.DataFrame(data)
+
+        with patch("masu.util.azure.azure_post_processor.AzurePostProcessor._generate_daily_data"):
+            result, _ = self.post_processor.process_dataframe(df)
+        columns = list(result)
+        expected_columns = sorted(
+            col.replace("-", "_").replace("/", "_").replace(":", "_").lower() for col in TRINO_REQUIRED_COLUMNS
+        )
+        expected_columns.append("row_uuid")
+        self.assertEqual(sorted(columns), sorted(expected_columns))
+
+    def test_azure_process_dataframe_mapped_cols(self):
+        """Test that we end up with a dataframe with mapped column names."""
+
+        expected_rg = "my-fake-rg"
+        expected_resource_id = "my-fake-resource"
+        expected_product = "my-fake-product"
+
+        data = {
+            "MeterSubCategory": [1],
+            "tags": ['{"key1": "val1", "key2": "val2"}'],
+            "resourceGroupName": expected_rg,
+            "InstanceName": expected_resource_id,
+            "Product": expected_product,
+        }
+        df = pd.DataFrame(data)
 
         with patch("masu.util.azure.azure_post_processor.AzurePostProcessor._generate_daily_data"):
             result, _ = self.post_processor.process_dataframe(df)
             columns = list(result)
-            expected_columns = sorted(
-                col.replace("-", "_").replace("/", "_").replace(":", "_").lower() for col in TRINO_COLUMNS
-            )
-            self.assertEqual(columns, expected_columns)
+        expected_columns = sorted(
+            col.replace("-", "_").replace("/", "_").replace(":", "_").lower() for col in TRINO_REQUIRED_COLUMNS
+        )
+        expected_columns.append("row_uuid")
+        self.assertEqual(sorted(columns), sorted(expected_columns))
+        self.assertIsNone(result.get("resourceGroupName"))
+        self.assertEqual(result.get("resourcegroup").iloc[0], expected_rg)
+        self.assertIsNone(result.get("InstanceName"))
+        self.assertEqual(result.get("resourceid").iloc[0], expected_resource_id)
+        self.assertIsNone(result.get("resourceGroupName"))
+        self.assertEqual(result.get("productname").iloc[0], expected_product)
 
     def test_azure_date_converter(self):
         """Test that we convert the new Azure date format."""
@@ -56,7 +89,7 @@ class TestAzurePostProcessor(MasuTestCase):
             with self.subTest(acceptable_format=acceptable_format):
                 date = today.strftime(acceptable_format)
                 self.assertEqual(date_converter(date).date(), today.date())
-        self.assertTrue(isnan(date_converter("")))
+        self.assertTrue(pd.isnull(date_converter("")))
 
     def test_azure_json_converter(self):
         """Test that we successfully process both Azure JSON formats."""
@@ -91,7 +124,7 @@ class TestAzurePostProcessor(MasuTestCase):
             expected_tag_keys.append(expected_tag_key)
             tags = str({expected_tag_key: f"val{idx}"}).replace("'", '"')
             data = {"MeterSubCategory": [1], "tags": [tags]}
-            data_frame = DataFrame.from_dict(data)
+            data_frame = pd.DataFrame.from_dict(data)
             with patch("masu.util.azure.azure_post_processor.AzurePostProcessor._generate_daily_data"):
                 self.post_processor.process_dataframe(data_frame)
                 self.assertIn(expected_tag_key, self.post_processor.enabled_tag_keys)
@@ -99,12 +132,16 @@ class TestAzurePostProcessor(MasuTestCase):
         self.post_processor.finalize_post_processing()
 
         with schema_context(self.schema):
-            tag_key_count = AzureEnabledTagKeys.objects.filter(key__in=expected_tag_keys).count()
+            tag_key_count = EnabledTagKeys.objects.filter(
+                provider_type=Provider.PROVIDER_AZURE, key__in=expected_tag_keys
+            ).count()
             self.assertEqual(tag_key_count, len(expected_tag_keys))
 
     def test_ingress_required_columns(self):
         """Test the ingress required columns."""
-        ingress_required_columns = list(copy.deepcopy(self.post_processor.INGRESS_REQUIRED_COLUMNS))
+        ingress_required_columns = list(copy.deepcopy(INGRESS_REQUIRED_COLUMNS))
+        ingress_required_columns.append("billingcurrencycode")
+        ingress_required_columns.append("resourcegroup")
         self.assertIsNone(self.post_processor.check_ingress_required_columns(ingress_required_columns))
         expected_missing_column = ingress_required_columns[-1]
         missing_column = self.post_processor.check_ingress_required_columns(set(ingress_required_columns[:-1]))

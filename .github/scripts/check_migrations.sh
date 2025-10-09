@@ -1,8 +1,11 @@
 #!/bin/bash
+set -x
 
-set -e
-
-pipenv run make make-migrations
+OUTPUT=$(pipenv run make make-migrations 2>&1 > /dev/null)
+if echo "$OUTPUT" | grep -q "ImportError: Couldn't import Django"; then
+    echo "Django is not installed or the virtual environment isn't activated. Maybe clear github-action cache?"
+    exit 2
+fi
 
 changed=`git add -N . && git diff --name-only HEAD`
 

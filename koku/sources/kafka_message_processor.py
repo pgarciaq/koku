@@ -5,18 +5,18 @@
 import json
 import logging
 
+from django.conf import settings
 from rest_framework.exceptions import ValidationError
 
 from api.provider.models import Provider
 from kafka_utils.utils import extract_from_header
+from kafka_utils.utils import SOURCES_TOPIC
 from sources import storage
-from sources.config import Config
 from sources.sources_http_client import AUTH_TYPES
 from sources.sources_http_client import convert_header_to_dict
 from sources.sources_http_client import SourceNotFoundError
 from sources.sources_http_client import SourcesHTTPClient
 from sources.sources_http_client import SourcesHTTPClientError
-
 
 LOG = logging.getLogger(__name__)
 
@@ -41,8 +41,6 @@ SOURCES_AZURE_SOURCE_NAME = "azure"
 SOURCES_AZURE_LOCAL_SOURCE_NAME = "azure-local"
 SOURCES_GCP_SOURCE_NAME = "google"
 SOURCES_GCP_LOCAL_SOURCE_NAME = "google-local"
-SOURCES_OCI_SOURCE_NAME = "oracle-cloud-infrastructure"
-SOURCES_OCI_LOCAL_SOURCE_NAME = "oracle-cloud-infrastructure-local"
 
 SOURCE_PROVIDER_MAP = {
     SOURCES_OCP_SOURCE_NAME: Provider.PROVIDER_OCP,
@@ -52,8 +50,6 @@ SOURCE_PROVIDER_MAP = {
     SOURCES_AZURE_LOCAL_SOURCE_NAME: Provider.PROVIDER_AZURE_LOCAL,
     SOURCES_GCP_SOURCE_NAME: Provider.PROVIDER_GCP,
     SOURCES_GCP_LOCAL_SOURCE_NAME: Provider.PROVIDER_GCP_LOCAL,
-    SOURCES_OCI_SOURCE_NAME: Provider.PROVIDER_OCI,
-    SOURCES_OCI_LOCAL_SOURCE_NAME: Provider.PROVIDER_OCI_LOCAL,
 }
 
 
@@ -68,6 +64,7 @@ class SourceDetails:
         sources_network = SourcesHTTPClient(auth_header, source_id, account_id, org_id)
         details = sources_network.get_source_details()
         self.name = details.get("name")
+        self.auth_header = auth_header
         self.source_type_id = int(details.get("source_type_id"))
         self.source_uuid = details.get("uid")
         self.source_type_name = sources_network.get_source_type_name(self.source_type_id)
@@ -84,23 +81,24 @@ class KafkaMessageProcessor:
         except (AttributeError, ValueError, TypeError) as error:
             msg = f"[KafkaMessageProcessor] unable to load message: {msg.value}. Error: {error}"
             LOG.error(msg)
-            raise SourcesMessageError(msg)
+            raise SourcesMessageError(msg) from error
         self.event_type = event_type
         self.cost_mgmt_id = cost_mgmt_id
         self.offset = msg.offset()
         self.partition = msg.partition()
         self.auth_header = extract_from_header(msg.headers(), KAFKA_HDR_RH_IDENTITY)
         decoded_header = convert_header_to_dict(self.auth_header, True)
-        self.account_number = extract_from_header(msg.headers(), KAFKA_HDR_ACCOUNT_NUMBER) or decoded_header.get(
-            "identity", {}
-        ).get("account_number")
-        self.org_id = extract_from_header(msg.headers(), KAFKA_HDR_ORG_ID) or decoded_header.get("identity", {}).get(
-            "org_id"
+        identity = decoded_header.get("identity", {})
+        self.account_number = extract_from_header(msg.headers(), KAFKA_HDR_ACCOUNT_NUMBER) or identity.get(
+            "account_number"
         )
+        self.org_id = extract_from_header(msg.headers(), KAFKA_HDR_ORG_ID) or identity.get("org_id")
         if None in (self.org_id, self.auth_header):
             msg = f"[KafkaMessageProcessor] missing `{KAFKA_HDR_RH_IDENTITY}` or  org_id: {msg.headers()}"
             LOG.warning(msg)
             raise SourcesMessageError(msg)
+        if isinstance(self.org_id, str) and not self.org_id.endswith(settings.SCHEMA_SUFFIX):
+            self.org_id = f"{self.org_id}{settings.SCHEMA_SUFFIX}"
         self.source_id = None
         self.application_type_id = None
 
@@ -130,9 +128,9 @@ class KafkaMessageProcessor:
         return self.event_type in (KAFKA_SOURCE_UPDATE,)
 
     def get_sources_client(self):
-        return SourcesHTTPClient(self.auth_header, self.source_id, self.account_number)
+        return SourcesHTTPClient(self.auth_header, self.source_id, self.account_number, self.org_id)
 
-    def get_source_details(self):
+    def get_source_details(self) -> SourceDetails:
         return SourceDetails(self.auth_header, self.source_id, self.account_number, self.org_id)
 
     def save_sources_details(self):
@@ -161,11 +159,6 @@ class KafkaMessageProcessor:
         if not source_type:
             LOG.info(f"[save_credentials] source_type not found for source_id: {self.source_id}")
             return
-
-        if source_type == Provider.PROVIDER_OCI or source_type == Provider.PROVIDER_OCI_LOCAL:
-            # OCI sources do not have authentication, so skip running thru this function
-            LOG.info("[save_credentials] skipping for OCI source")
-            return True
 
         sources_network = self.get_sources_client()
 
@@ -344,7 +337,7 @@ class SourceMsgProcessor(KafkaMessageProcessor):
 
 def create_msg_processor(msg, cost_mgmt_id):
     """Create the message processor based on the event_type."""
-    if msg.topic() == Config.SOURCES_TOPIC:
+    if msg.topic() == SOURCES_TOPIC:
         event_type = extract_from_header(msg.headers(), KAFKA_HDR_EVENT_TYPE)
         LOG.debug(f"event_type: {event_type}")
         if event_type in (

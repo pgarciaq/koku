@@ -1,5 +1,5 @@
 -- Populate the daily aggregate line item data
-INSERT INTO postgres.{{schema_name | sqlsafe}}.reporting_ocpgcp_storage_summary_p (
+INSERT INTO postgres.{{schema | sqlsafe}}.reporting_ocpgcp_storage_summary_p (
     id,
     cluster_id,
     cluster_alias,
@@ -33,17 +33,27 @@ INSERT INTO postgres.{{schema_name | sqlsafe}}.reporting_ocpgcp_storage_summary_
         cast({{gcp_source_uuid}} as uuid) as source_uuid,
         sum(credit_amount) as credit_amount,
         invoice_month
-    FROM hive.{{schema_name | sqlsafe}}.reporting_ocpgcpcostlineitem_project_daily_summary
+    FROM hive.{{schema | sqlsafe}}.managed_reporting_ocpgcpcostlineitem_project_daily_summary
     -- Get data for this month or last month
-    WHERE gcp_source = {{gcp_source_uuid}}
+    WHERE source = {{gcp_source_uuid}}
         AND ocp_source = {{ocp_source_uuid}}
-        AND invoice_month = {{invoice_month}}
         AND year = {{year}}
         AND lpad(month, 2, '0') = {{month}} -- Zero pad the month when fewer than 2 characters
         AND day in {{days | inclause}}
         AND usage_start >= {{start_date}}
         AND usage_start <= date_add('day', 1, {{end_date}})
-        AND service_alias IN ('Filestore', 'Storage', 'Cloud Storage', 'Data Transfer')
+        AND (
+            service_alias IN ('Filestore', 'Storage', 'Cloud Storage', 'Data Transfer')
+            OR
+            (
+                -- Gets Persistent Disk rows safely
+                service_alias = 'Compute Engine' AND
+                (
+                    LOWER(sku_alias) LIKE '%% pd %%' OR
+                    LOWER(sku_alias) LIKE '%%snapshot%%'
+                )
+            )
+        )
     GROUP BY cluster_id,
         cluster_alias,
         usage_start,

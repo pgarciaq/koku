@@ -12,9 +12,7 @@ from api.report.test.util.constants import AWS_CONSTANTS
 from api.report.test.util.constants import AWS_GEOG
 from api.report.test.util.constants import AZURE_CONSTANTS
 from api.report.test.util.constants import GCP_CONSTANTS
-from api.report.test.util.constants import OCI_CONSTANTS
 from api.report.test.util.constants import OCP_CONSTANTS
-
 
 fake = Faker()
 
@@ -40,6 +38,20 @@ aws_daily_summary = Recipe(
     cost_category=cycle(AWS_CONSTANTS["cost_category"]),
     _fill_optional=True,
     _quantity=10,
+)
+
+aws_ec2_compute_summary = Recipe(
+    "AWSCostEntryLineItemSummaryByEC2ComputeP",
+    resource_id=cycle(f"i-000000{i}" for i in range(AWS_CONSTANTS.length - 1)),
+    instance_type=cycle(AWS_CONSTANTS["instance_types"]),
+    operating_system=cycle(AWS_CONSTANTS["operating_systems"]),
+    unit=cycle(AWS_CONSTANTS["units"]),
+    region=cycle(AWS_GEOG["regions"]),
+    memory=cycle(AWS_CONSTANTS["memory"]),
+    vcpu=cycle(AWS_CONSTANTS["vcpus"]),
+    cost_category=cycle(AWS_CONSTANTS["cost_category"]),
+    _fill_optional=True,
+    _quantity=AWS_CONSTANTS.length,
 )
 
 azure_daily_summary = Recipe(
@@ -90,6 +102,7 @@ ocp_usage_pod = Recipe(  # Pod data_source
     cluster_capacity_cpu_core_hours=cycle(decimal_yielder()),
     cluster_capacity_memory_gigabyte_hours=cycle(decimal_yielder()),
     pod_labels=cycle(OCP_CONSTANTS["pod_labels"]),
+    all_labels=cycle(OCP_CONSTANTS["pod_labels"]),
     _fill_optional=False,
     _quantity=OCP_CONSTANTS.length,
 )
@@ -114,6 +127,63 @@ ocp_usage_storage = Recipe(  # Storage data_source
     cluster_capacity_cpu_core_hours=cycle(decimal_yielder()),
     cluster_capacity_memory_gigabyte_hours=cycle(decimal_yielder()),
     volume_labels=cycle(OCP_CONSTANTS["pvc_labels"]),
+    all_labels=cycle(OCP_CONSTANTS["pvc_labels"]),
+    _fill_optional=False,
+    _quantity=OCP_CONSTANTS.length,
+)
+
+ocp_usage_network_in = Recipe(  # Inbound network flow
+    "OCPUsageLineItemDailySummary",
+    data_source="Pod",
+    node=cycle(f"node_{i}" for i in range(OCP_CONSTANTS.length - 1)),
+    resource_id=cycle(f"i-000000{i}" for i in range(OCP_CONSTANTS.length - 1)),
+    namespace="Network unattributed",
+    infrastructure_data_in_gigabytes=cycle(decimal_yielder()),
+    infrastructure_data_out_gigabytes=None,
+    pod_usage_cpu_core_hours=0,
+    pod_request_cpu_core_hours=0,
+    pod_limit_cpu_core_hours=0,
+    pod_usage_memory_gigabyte_hours=0,
+    pod_request_memory_gigabyte_hours=0,
+    pod_limit_memory_gigabyte_hours=0,
+    node_capacity_cpu_cores=0,
+    node_capacity_cpu_core_hours=0,
+    node_capacity_memory_gigabytes=0,
+    node_capacity_memory_gigabyte_hours=0,
+    cluster_capacity_cpu_core_hours=0,
+    cluster_capacity_memory_gigabyte_hours=0,
+    persistentvolumeclaim_capacity_gigabyte=0,
+    persistentvolumeclaim_capacity_gigabyte_months=0,
+    volume_request_storage_gigabyte_months=0,
+    persistentvolumeclaim_usage_gigabyte_months=0,
+    _fill_optional=False,
+    _quantity=OCP_CONSTANTS.length,
+)
+
+ocp_usage_network_out = Recipe(  # Outbound network flow
+    "OCPUsageLineItemDailySummary",
+    data_source="Pod",
+    node=cycle(f"node_{i}" for i in range(OCP_CONSTANTS.length - 1)),
+    resource_id=cycle(f"i-000000{i}" for i in range(OCP_CONSTANTS.length - 1)),
+    namespace="Network unattributed",
+    infrastructure_data_in_gigabytes=None,
+    infrastructure_data_out_gigabytes=cycle(decimal_yielder()),
+    pod_usage_cpu_core_hours=0,
+    pod_request_cpu_core_hours=0,
+    pod_limit_cpu_core_hours=0,
+    pod_usage_memory_gigabyte_hours=0,
+    pod_request_memory_gigabyte_hours=0,
+    pod_limit_memory_gigabyte_hours=0,
+    node_capacity_cpu_cores=0,
+    node_capacity_cpu_core_hours=0,
+    node_capacity_memory_gigabytes=0,
+    node_capacity_memory_gigabyte_hours=0,
+    cluster_capacity_cpu_core_hours=0,
+    cluster_capacity_memory_gigabyte_hours=0,
+    persistentvolumeclaim_capacity_gigabyte=0,
+    persistentvolumeclaim_capacity_gigabyte_months=0,
+    volume_request_storage_gigabyte_months=0,
+    persistentvolumeclaim_usage_gigabyte_months=0,
     _fill_optional=False,
     _quantity=OCP_CONSTANTS.length,
 )
@@ -290,16 +360,4 @@ ocp_on_gcp_project_daily_summary_storage = Recipe(  # Storage data_source
     unit=cycle(GCP_CONSTANTS["units"]),
     _fill_optional=True,
     _quantity=min(GCP_CONSTANTS.length, 9),
-)
-
-oci_daily_summary = Recipe(
-    "OCICostEntryLineItemDailySummary",
-    product_service=cycle(OCI_CONSTANTS["product_service"]),
-    instance_type=cycle(OCI_CONSTANTS["instance_type"]),
-    resource_ids=cycle(OCI_CONSTANTS["resource_ids"]),
-    resource_count=cycle(OCI_CONSTANTS["resource_count"]),
-    unit=cycle(OCI_CONSTANTS["unit"]),
-    region="uk-london-1",
-    _fill_optional=True,
-    _quantity=OCI_CONSTANTS.length,
 )

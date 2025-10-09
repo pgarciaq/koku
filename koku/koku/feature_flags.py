@@ -7,7 +7,7 @@ import logging
 
 from django.conf import settings
 from UnleashClient import UnleashClient
-from UnleashClient.strategies import Strategy
+from UnleashClient.periodic_tasks import aggregate_and_send_metrics
 
 from .env import ENVIRONMENT
 
@@ -36,36 +36,21 @@ class KokuUnleashClient(UnleashClient):
         self.fl_job.remove()
         if self.metric_job:
             self.metric_job.remove()
-        self.scheduler.shutdown()
 
+            # Flush metrics before shutting down.
+            aggregate_and_send_metrics(
+                url=self.unleash_url,
+                app_name=self.unleash_app_name,
+                connection_id=self.connection_id,
+                instance_id=self.unleash_instance_id,
+                headers=self.metrics_headers,
+                custom_options=self.unleash_custom_options,
+                request_timeout=self.unleash_request_timeout,
+                engine=self.engine,
+            )
 
-class SchemaStrategy(Strategy):
-    def load_provisioning(self) -> list:
-        return self.parameters["schema-name"].split(",")
+        self.unleash_scheduler.shutdown()
 
-    def apply(self, context) -> bool:
-        default_value = False
-        if "schema" in context and context["schema"] is not None:
-            default_value = context["schema"] in self.parsed_provisioning
-        return default_value
-
-
-class SourceStrategy(Strategy):
-    def load_provisioning(self) -> list:
-        return self.parameters["source-uuid"].split(",")
-
-    def apply(self, context) -> bool:
-        default_value = False
-        if source_uuid := context.get("source_uuid"):
-            default_value = source_uuid in self.parsed_provisioning
-        return default_value
-
-
-strategies = {
-    # All new strategies should be added here.
-    "schema-strategy": SchemaStrategy,
-    "source-strategy": SourceStrategy,
-}
 
 headers = {}
 if settings.UNLEASH_TOKEN:
@@ -77,7 +62,6 @@ UNLEASH_CLIENT = KokuUnleashClient(
     environment=ENVIRONMENT.get_value("KOKU_SENTRY_ENVIRONMENT", default="development"),
     instance_id=ENVIRONMENT.get_value("APP_POD_NAME", default="unleash-client-python"),
     custom_headers=headers,
-    custom_strategies=strategies,
     cache_directory=settings.UNLEASH_CACHE_DIR,
     verbose_log_level=log_level,
 )

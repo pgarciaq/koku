@@ -9,7 +9,6 @@ from django.contrib.postgres.indexes import GinIndex
 from django.db import models
 from django.db.models import JSONField
 
-
 UI_SUMMARY_TABLES = (
     "reporting_ocpgcp_cost_summary_p",
     "reporting_ocpgcp_compute_summary_p",
@@ -139,6 +138,9 @@ class OCPGCPCostLineItemProjectDailySummaryP(models.Model):
     instance_type = models.CharField(max_length=50, null=True)
     service_id = models.CharField(max_length=256, null=True)
     service_alias = models.CharField(max_length=256, null=True, blank=True)
+    infrastructure_data_in_gigabytes = models.DecimalField(max_digits=33, decimal_places=15, null=True)
+    infrastructure_data_out_gigabytes = models.DecimalField(max_digits=33, decimal_places=15, null=True)
+    data_transfer_direction = models.TextField(null=True)
     sku_id = models.CharField(max_length=256, null=True)
     sku_alias = models.CharField(max_length=256, null=True)
     region = models.TextField(null=True)
@@ -148,9 +150,6 @@ class OCPGCPCostLineItemProjectDailySummaryP(models.Model):
     invoice_month = models.CharField(max_length=256, null=True, blank=True)
     unblended_cost = models.DecimalField(max_digits=30, decimal_places=15, null=True)
     markup_cost = models.DecimalField(max_digits=30, decimal_places=15, null=True)
-    project_markup_cost = models.DecimalField(max_digits=30, decimal_places=15, null=True)
-    pod_cost = models.DecimalField(max_digits=30, decimal_places=15, null=True)
-    pod_credit = models.DecimalField(max_digits=30, decimal_places=15, null=True)
     tags = JSONField(null=True)
     source_uuid = models.UUIDField(unique=False, null=True)
     credit_amount = models.DecimalField(max_digits=24, decimal_places=9, null=True, blank=True)

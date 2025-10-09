@@ -13,7 +13,7 @@ from pprint import pformat
 from django.conf import settings
 from django.core.exceptions import PermissionDenied
 from django.db.models import Q
-from django.utils.translation import ugettext as _
+from django.utils.translation import gettext
 from django_tenants.utils import tenant_context
 from querystring_parser import parser
 from rest_framework.serializers import ValidationError
@@ -24,16 +24,24 @@ from api.provider.models import Provider
 from api.report.constants import AND_AWS_CATEGORY_PREFIX
 from api.report.constants import AND_TAG_PREFIX
 from api.report.constants import AWS_CATEGORY_PREFIX
+from api.report.constants import EXACT_AWS_CATEGORY_PREFIX
+from api.report.constants import EXACT_TAG_PREFIX
 from api.report.constants import OR_AWS_CATEGORY_PREFIX
 from api.report.constants import OR_TAG_PREFIX
+from api.report.constants import RESOLUTION_DAILY
+from api.report.constants import RESOLUTION_MONTHLY
 from api.report.constants import TAG_PREFIX
+from api.report.constants import TIME_SCOPE_UNITS_DAILY
+from api.report.constants import TIME_SCOPE_UNITS_MONTHLY
+from api.report.constants import TIME_SCOPE_VALUES_DAILY
+from api.report.constants import TIME_SCOPE_VALUES_MONTHLY
 from api.report.constants import URL_ENCODED_SAFE
 from api.report.queries import ReportQueryHandler
-from api.tags.serializers import month_list
 from reporting.models import OCPAllCostLineItemDailySummaryP
+from reporting.provider.all.models import EnabledTagKeys
+from reporting.provider.all.models import TagMapping
 from reporting.provider.aws.models import AWSEnabledCategoryKeys
 from reporting.provider.aws.models import AWSOrganizationalUnit
-
 
 LOG = logging.getLogger(__name__)
 
@@ -53,7 +61,6 @@ class QueryParameters:
             (Provider.PROVIDER_AWS, "org_unit_id", "aws.organizational_unit"),
         ],
         "azure": [(Provider.PROVIDER_AZURE, "subscription_guid", "azure.subscription_guid")],
-        "oci": [(Provider.PROVIDER_OCI, "payer_tenant_id", "oci.payer_tenant_id")],
         "ocp": [
             (Provider.PROVIDER_OCP, "cluster", "openshift.cluster", True),
             (Provider.PROVIDER_OCP, "node", "openshift.node", False),
@@ -63,7 +70,6 @@ class QueryParameters:
             (Provider.PROVIDER_GCP, "account", "gcp.account"),
             (Provider.PROVIDER_GCP, "gcp_project", "gcp.project"),
         ],
-        "ibm": [(Provider.PROVIDER_IBM, "account", "ibm.account")],
     }
 
     def __init__(self, request, caller, **kwargs):
@@ -86,7 +92,7 @@ class QueryParameters:
         self.report_type = caller.report
         self.serializer = caller.serializer
         self.query_handler = caller.query_handler
-        self.tag_handler = caller.tag_handler
+        self.tag_providers = caller.tag_providers
         self.aws_category_keys = set()
 
         try:
@@ -115,7 +121,7 @@ class QueryParameters:
     def __repr__(self):
         """Unambiguous representation."""
         out = {}
-        fields = ["parameters", "query_handler", "report_type", "request", "serializer", "tag_handler", "tag_keys"]
+        fields = ["parameters", "query_handler", "report_type", "request", "serializer", "tag_providers", "tag_keys"]
         for item in fields:
             try:
                 out[item] = getattr(self, item)
@@ -179,15 +185,12 @@ class QueryParameters:
         provider_list = provider.split("_")
         if "all" in provider_list:
             for p, v in self.provider_resource_list.items():
-                # Do not include GCP & IBM for OCP-on-All until OCP on GCP and IBM is implemented.
-                if "OCI" in v[0] or "IBM" in v[0]:
-                    continue
                 access.extend(v)
         else:
             for p in provider_list:
                 if self.provider_resource_list.get(p) is None:
                     msg = f'Invalid provider "{p}".'
-                    raise ValidationError({"details": _(msg)})
+                    raise ValidationError({"details": gettext(msg)})
                 access.extend(self.provider_resource_list[p])
         return access
 
@@ -277,7 +280,7 @@ class QueryParameters:
                 # the hierarchy for later checks regarding filtering.
                 access_list = self._check_org_unit_tree_hierarchy(group_by, access_list)
 
-            elif "org_unit_id" in filters and not access_list and self.parameters.get("ou_or_operator", False):
+            elif "org_unit_id" in filters and not access_list and self.parameters.get("aws_use_or_operator", False):
                 org_unit_filter = filters.get("org_unit_id")
                 access_list = set(
                     AWSOrganizationalUnit.objects.filter(
@@ -356,15 +359,20 @@ class QueryParameters:
 
     def _set_tag_keys(self, query_params):
         """Set the valid tag keys"""
-        prefix_list = [TAG_PREFIX, OR_TAG_PREFIX, AND_TAG_PREFIX]
+        prefix_list = [TAG_PREFIX, OR_TAG_PREFIX, AND_TAG_PREFIX, EXACT_TAG_PREFIX]
         self.tag_keys = set()
         if self.report_type == "tags" or not any(f"[{prefix}" in self.url_data for prefix in prefix_list):
             # we do not need to fetch the tags for tags report type.
             # we also do not need to fetch the tags if a tag prefix is not in the URL
             return
-        for tag_model in self.tag_handler:
-            with tenant_context(self.tenant):
-                self.tag_keys.update(tag_model.objects.values_list("key", flat=True).distinct())
+        with tenant_context(self.tenant):
+            # Step 1: get enabled tag keys
+            enabled_keys = EnabledTagKeys.objects.filter(provider_type__in=self.tag_providers).distinct()
+            # Step 2: get parent keys of enabled child keys
+            parent_keys = TagMapping.objects.filter(child__in=enabled_keys).distinct()
+
+            self.tag_keys.update(enabled_keys.values_list("key", flat=True))
+            self.tag_keys.update(parent_keys.values_list("parent__key", flat=True))
         if not self.tag_keys:
             # in case there are no tag keys in the models.
             return
@@ -389,7 +397,7 @@ class QueryParameters:
         to update the valid field names list. Any key added to this set
         will not a trigger the unsupport parameter or invalid value error.
         """
-        prefix_list = [AWS_CATEGORY_PREFIX, AND_AWS_CATEGORY_PREFIX, OR_AWS_CATEGORY_PREFIX]
+        prefix_list = [AWS_CATEGORY_PREFIX, AND_AWS_CATEGORY_PREFIX, OR_AWS_CATEGORY_PREFIX, EXACT_AWS_CATEGORY_PREFIX]
         if not any(f"[{prefix}" in self.url_data for prefix in prefix_list):
             return
         enabled_category_keys = set()
@@ -406,33 +414,50 @@ class QueryParameters:
             # Check Values
             if not isinstance(value, (dict, list)):
                 value = [value]
-            for inner_key in value:
-                stripped_key = self._strip_prefix(inner_key, AWS_CATEGORY_PREFIX, prefix_list)
-                if stripped_key in enabled_category_keys:
-                    self.aws_category_keys.add(inner_key)
+            for inner_value in value:
+                stripped_value = self._strip_prefix(inner_value, AWS_CATEGORY_PREFIX, prefix_list)
+                if stripped_value in enabled_category_keys:
+                    self.aws_category_keys.add(inner_value)
 
     def _set_time_scope_defaults(self):
         """Set the default filter parameters."""
+        end_date = self.get_end_date()
+        start_date = self.get_start_date()
+        if start_date or end_date:
+            if not self.get_filter("resolution"):
+                self.set_filter(resolution=RESOLUTION_DAILY)
+            # default time scopes are not needed for start_end & end_date params
+            return
+        if getattr(self.caller, "only_monthly_resolution", None):
+            monthly_scope_value = str(self.get_filter("time_scope_value", TIME_SCOPE_VALUES_MONTHLY[0]))
+            self.set_filter(
+                time_scope_value=monthly_scope_value,
+                time_scope_units=TIME_SCOPE_UNITS_MONTHLY,
+                resolution=RESOLUTION_MONTHLY,
+            )
+            return
+
         time_scope_units = self.get_filter("time_scope_units")
         time_scope_value = self.get_filter("time_scope_value")
-        start_date = self.get_start_date()
-        end_date = self.get_end_date()
         resolution = self.get_filter("resolution")
-        if not (start_date or end_date):
-            if not time_scope_value:
-                time_scope_value = -1 if time_scope_units == "month" else -10
-            if not time_scope_units:
-                time_scope_units = "month" if int(time_scope_value) in month_list else "day"
-            if not resolution:
-                resolution = "monthly" if int(time_scope_value) in month_list else "daily"
-            self.set_filter(
-                time_scope_value=str(time_scope_value),
-                time_scope_units=str(time_scope_units),
-                resolution=str(resolution),
+        if not time_scope_value:
+            time_scope_value = (
+                TIME_SCOPE_VALUES_MONTHLY[0]
+                if time_scope_units == TIME_SCOPE_UNITS_MONTHLY
+                else TIME_SCOPE_VALUES_DAILY[0]
             )
-        else:
-            if not resolution:
-                self.set_filter(resolution="daily")
+        if not time_scope_units:
+            time_scope_units = (
+                TIME_SCOPE_UNITS_MONTHLY if time_scope_value in TIME_SCOPE_VALUES_MONTHLY else TIME_SCOPE_UNITS_DAILY
+            )
+        if not resolution:
+            resolution = RESOLUTION_MONTHLY if time_scope_value in TIME_SCOPE_VALUES_MONTHLY else RESOLUTION_DAILY
+
+        self.set_filter(
+            time_scope_value=str(time_scope_value),
+            time_scope_units=str(time_scope_units),
+            resolution=str(resolution),
+        )
 
     def _validate(self, query_params):
         """Validate query parameters.
@@ -593,7 +618,7 @@ def get_replacement_result(param_res_list, access_list, raise_exception=True, re
         raise PermissionDenied()
     if return_access:
         return access_list
-    return param_res_list
+    return list(param_res_list)
 
 
 def get_tenant(user):
@@ -616,4 +641,4 @@ def get_tenant(user):
             pass
     if tenant:
         return tenant
-    raise ValidationError({"details": _("Invalid user definition")})
+    raise ValidationError({"details": gettext("Invalid user definition")})

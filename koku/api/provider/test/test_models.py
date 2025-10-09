@@ -4,11 +4,14 @@
 #
 """Test for the Provider model."""
 import logging
+from datetime import timedelta
 from unittest.mock import call
 from unittest.mock import patch
 from uuid import UUID
 
+from django.conf import settings
 from django.core.exceptions import ValidationError
+from django.test.utils import override_settings
 from django_tenants.utils import tenant_context
 from faker import Faker
 
@@ -134,3 +137,55 @@ class ProviderModelTest(MasuTestCase):
             call(self.schema, Provider.PROVIDER_AZURE_LOCAL, UUID(self.azure_provider_uuid)),
         ]
         mock_delete_archived_data.delay.assert_has_calls(expected_calls, any_order=True)
+
+    def test_get_pollable_providers(self):
+        """Test that the pollable manager returns non-OCP providers only."""
+        non_ocp_providers_count = Provider.objects.exclude(type=Provider.PROVIDER_OCP).count()
+        pollable = Provider.polling_objects.get_polling_batch()
+        self.assertEqual(pollable.count(), non_ocp_providers_count)
+        for p in pollable:
+            self.assertNotEqual(p.type, Provider.PROVIDER_OCP)
+
+    @override_settings(DEBUG=True)
+    def test_get_pollable_providers_debug(self):
+        """Test that the pollable manager returns OCP providers with DEBUG=True"""
+        all_providers_count = Provider.objects.count()
+        pollable = Provider.polling_objects.get_polling_batch()
+        self.assertLess(pollable.count(), all_providers_count)
+
+    def test_get_pollable_providers_with_timestamps(self):
+        """Test that the pollable manager returns non-OCP providers only."""
+        non_ocp_providers = Provider.objects.exclude(type=Provider.PROVIDER_OCP)
+        non_ocp_providers_count = non_ocp_providers.count()
+        self.assertGreaterEqual(non_ocp_providers_count, 3)
+        # need 3 provider: 1. with null polling_timestamp, 2. with polling_timestamp
+        # older than POLLING_TIMER 3. with polling_timestamp younger than POLLING_TIMER
+        p = non_ocp_providers[0]
+        p.polling_timestamp = self.dh.now_utc
+        p.save()
+
+        p = non_ocp_providers[1]
+        p.polling_timestamp = self.dh.now_utc - timedelta(seconds=settings.POLLING_TIMER + 1)
+        p.save()
+
+        pollable = Provider.polling_objects.get_polling_batch()
+        self.assertEqual(
+            pollable.count(), non_ocp_providers_count - 1
+        )  # subtract 1 because polling_timestamp is younger than POLLING_TIMER
+        for p in pollable:
+            self.assertNotEqual(p.type, Provider.PROVIDER_OCP)
+
+    def test_get_zero_batch_limit(self):
+        """Test batch limit of pollable providers."""
+        expected_count = Provider.polling_objects.get_polling_batch().count()
+
+        with patch("api.provider.models.math.ceil", return_value=0):
+            polling_batch = Provider.polling_objects.get_polling_batch().count()
+            self.assertEqual(polling_batch, expected_count)
+
+    def test_get_batch(self):
+        """Test batch limit of 2 pollable providers."""
+        expected_count = 2
+        with patch("api.provider.models.math.ceil", return_value=2):
+            polling_batch = Provider.polling_objects.get_polling_batch().count()
+            self.assertEqual(polling_batch, expected_count)

@@ -29,7 +29,7 @@ from reporting.provider.aws.openshift.models import OCPAWSStorageSummaryP
 class OCPAWSProviderMap(ProviderMap):
     """OCP on AWS Provider Map."""
 
-    def __init__(self, provider, report_type, cost_type, markup_cost="markup_cost"):
+    def __init__(self, provider, report_type, schema_name, cost_type, markup_cost="markup_cost"):
         """Constructor."""
         self.cost_type = cost_type
         self.markup_cost = markup_cost
@@ -207,7 +207,7 @@ class OCPAWSProviderMap(ProviderMap):
                                 Coalesce(F(self.markup_cost), Value(0, output_field=DecimalField()))
                                 * Coalesce("exchange_rate", Value(1, output_field=DecimalField()))
                             ),
-                            "usage": Sum(F("usage_amount")),
+                            "usage": Sum(Coalesce(F("usage_amount"), Value(0, output_field=DecimalField()))),
                             "usage_units": Coalesce(Max("unit"), Value("GB-Mo")),
                         },
                         "annotations": {
@@ -249,7 +249,7 @@ class OCPAWSProviderMap(ProviderMap):
                             ),
                             # the `currency_annotation` is inserted by the `annotations` property of the query-handler
                             "cost_units": Coalesce("currency_annotation", Value("USD", output_field=CharField())),
-                            "usage": Sum("usage_amount"),
+                            "usage": Sum(Coalesce(F("usage_amount"), Value(0, output_field=DecimalField()))),
                             "usage_units": Coalesce(Max("unit"), Value("GB-Mo")),
                             "clusters": ArrayAgg(Coalesce("cluster_alias", "cluster_id"), distinct=True),
                             "source_uuid": ArrayAgg(
@@ -303,7 +303,7 @@ class OCPAWSProviderMap(ProviderMap):
                                 Coalesce(F(self.markup_cost), Value(0, output_field=DecimalField()))
                                 * Coalesce("exchange_rate", Value(1, output_field=DecimalField()))
                             ),
-                            "usage": Sum(F("usage_amount")),
+                            "usage": Sum(Coalesce(F("usage_amount"), Value(0, output_field=DecimalField()))),
                             "usage_units": Coalesce(Max("unit"), Value("GB-Mo")),
                         },
                         "aggregate_key": "usage_amount",
@@ -346,7 +346,7 @@ class OCPAWSProviderMap(ProviderMap):
                             ),
                             # the `currency_annotation` is inserted by the `annotations` property of the query-handler
                             "cost_units": Coalesce("currency_annotation", Value("USD", output_field=CharField())),
-                            "usage": Sum("usage_amount"),
+                            "usage": Sum(Coalesce(F("usage_amount"), Value(0, output_field=DecimalField()))),
                             "usage_units": Coalesce(Max("unit"), Value("Hrs")),
                             "clusters": ArrayAgg(Coalesce("cluster_alias", "cluster_id"), distinct=True),
                             "source_uuid": ArrayAgg(
@@ -402,4 +402,8 @@ class OCPAWSProviderMap(ProviderMap):
                 ("account",): OCPAWSNetworkSummaryP,
             },
         }
-        super().__init__(provider, report_type)
+        super().__init__(provider, report_type, schema_name)
+
+    @property
+    def aws_category_column(self):
+        return self.provider_map.get("aws_category_column")

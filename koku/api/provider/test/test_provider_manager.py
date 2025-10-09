@@ -7,6 +7,7 @@ import json
 from datetime import date
 from unittest.mock import Mock
 from unittest.mock import patch
+from uuid import uuid4
 
 from dateutil import parser
 from django.db import IntegrityError
@@ -126,6 +127,83 @@ class ProviderManagerTest(IamTestCase):
         manager = ProviderManager(provider_uuid)
         self.assertFalse(manager.get_paused_status())
 
+    def test_get_state(self):
+        """Test getting provider state without a manifest."""
+        with patch("masu.celery.tasks.check_report_updates"):
+            provider = Provider.objects.create(name="sample_provider", created_by=self.user, customer=self.customer)
+        with patch("api.provider.provider_manager.ProviderManager.get_manifest_state") as mock_get_manifest_state:
+            mock_get_manifest_state.return_value = None
+            manager = ProviderManager(provider.uuid)
+            self.assertIsNone(manager.get_state())
+
+    def test_get_manifest_state(self):
+        """Test getting the current state for a manifest."""
+        datetime = DateHelper().today
+        # Create Provider
+        with patch("masu.celery.tasks.check_report_updates"):
+            provider = Provider.objects.create(
+                name="sample_provider_in-progress", created_by=self.user, customer=self.customer
+            )
+            baker.make(
+                CostUsageReportManifest,
+                provider=provider,
+                billing_period_start_datetime=DateHelper().this_month_start,
+                completed_datetime=datetime,
+                state={"download": {"start": str(datetime)}},
+            )
+            manager = ProviderManager(provider.uuid)
+            # Case when manifest is in-progress
+            self.assertEqual(manager.get_state().get("download"), {"start": str(datetime), "state": "in-progress"})
+
+        with patch("masu.celery.tasks.check_report_updates"):
+            provider = Provider.objects.create(
+                name="sample_provider_complete", created_by=self.user, customer=self.customer
+            )
+            baker.make(
+                CostUsageReportManifest,
+                provider=provider,
+                billing_period_start_datetime=DateHelper().this_month_start,
+                completed_datetime=datetime,
+                state={"download": {"end": str(datetime)}},
+            )
+            manager = ProviderManager(provider.uuid)
+            # Case when manifest is complete
+            self.assertEqual(manager.get_state().get("download"), {"end": str(datetime), "state": "complete"})
+
+        with patch("masu.celery.tasks.check_report_updates"):
+            provider = Provider.objects.create(
+                name="sample_provider_failed", created_by=self.user, customer=self.customer
+            )
+            baker.make(
+                CostUsageReportManifest,
+                provider=provider,
+                billing_period_start_datetime=DateHelper().this_month_start,
+                completed_datetime=datetime,
+                state={"download": {"failed": str(datetime)}},
+            )
+            manager = ProviderManager(provider.uuid)
+            # Case when manifest is failed
+            self.assertEqual(manager.get_state().get("download"), {"failed": str(datetime), "state": "failed"})
+
+    def test_get_last_polling_time(self):
+        """Test getting latest polling from for a provider"""
+        with patch("masu.celery.tasks.check_report_updates"):
+            provider = Provider.objects.create(name="sample_provider", created_by=self.user, customer=self.customer)
+        manager = ProviderManager(provider.uuid)
+        self.assertEqual(manager.get_last_polling_time(), None)
+
+        expected_time = self.dh.now
+        with patch("masu.celery.tasks.check_report_updates"):
+            provider = Provider.objects.create(
+                name="sample_provider_polling_time",
+                created_by=self.user,
+                customer=self.customer,
+                polling_timestamp=expected_time,
+            )
+            manager = ProviderManager(provider.uuid)
+        self.assertEqual(manager.get_last_polling_time(provider.uuid), expected_time.strftime("%Y-%m-%d %H:%M:%S"))
+        self.assertEqual(manager.get_last_polling_time(), expected_time.strftime("%Y-%m-%d %H:%M:%S"))
+
     def test_data_flags(self):
         """Test the data status flag."""
         # Get Provider UUID
@@ -139,7 +217,7 @@ class ProviderManagerTest(IamTestCase):
             CostUsageReportManifest,
             provider=provider,
             billing_period_start_datetime=DateHelper().this_month_start,
-            manifest_completed_datetime=DateHelper().today,
+            completed_datetime=DateHelper().today,
         )
 
         # Get Provider Manager
@@ -180,7 +258,7 @@ class ProviderManagerTest(IamTestCase):
             CostUsageReportManifest,
             provider=provider,
             billing_period_start_datetime=DateHelper().last_month_start,
-            manifest_completed_datetime=DateHelper().last_month_end,
+            completed_datetime=DateHelper().last_month_end,
         )
 
         # Get Provider Manager
@@ -336,7 +414,7 @@ class ProviderManagerTest(IamTestCase):
 
     def test_remove_all_ocp_providers(self):
         """Remove all OCP providers."""
-        provider_query = Provider.objects.all().filter(type="OCP")
+        provider_query = Provider.objects.all().filter(type=Provider.PROVIDER_OCP)
 
         customer = None
         for provider in provider_query:
@@ -574,9 +652,9 @@ class ProviderManagerTest(IamTestCase):
                 self.assertIsNotNone(manifest.get("assembly_id"))
                 self.assertIsNotNone(manifest.get("files_processed"))
                 self.assertEqual(manifest.get("billing_period_start"), key_date_obj.date())
-                self.assertGreater(parser.parse(manifest.get("last_process_start_date")), key_date_obj)
-                self.assertGreater(parser.parse(manifest.get("last_process_complete_date")), key_date_obj)
-                self.assertGreater(parser.parse(manifest.get("last_manifest_complete_date")), key_date_obj)
+                self.assertGreater(parser.parse(manifest.get("process_start_date")), key_date_obj)
+                self.assertGreater(parser.parse(manifest.get("process_complete_date")), key_date_obj)
+                self.assertGreater(parser.parse(manifest.get("manifest_complete_date")), key_date_obj)
 
     def test_provider_statistics_ocp_on_cloud(self):
         """Test that the provider statistics method returns report stats."""
@@ -644,18 +722,21 @@ class ProviderManagerTest(IamTestCase):
             )
 
         provider_uuid = provider.uuid
-        manager = ProviderManager(provider_uuid)
-        infrastructure_info = manager.get_infrastructure_info()
-        self.assertEqual(infrastructure_info.get("type", ""), Provider.PROVIDER_AWS)
-        self.assertEqual(infrastructure_info.get("uuid", ""), aws_provider.uuid)
+        with patch("api.provider.provider_manager.Sources.objects"):
+            manager = ProviderManager(provider_uuid)
+            infrastructure_info = manager.get_infrastructure_info()
+            self.assertEqual(infrastructure_info.get("type", ""), Provider.PROVIDER_AWS)
+            self.assertEqual(infrastructure_info.get("uuid", ""), aws_provider.uuid)
 
     def test_ocp_on_azure_infrastructure_type(self):
         """Test that the provider infrastructure returns Azure when running on Azure."""
         credentials = {"cluster_id": "cluster_id_1002"}
         provider_authentication = ProviderAuthentication.objects.create(credentials=credentials)
         azure_provider = Provider.objects.filter(type="Azure-local").first()
+
         infrastructure = ProviderInfrastructureMap.objects.create(
-            infrastructure_type=Provider.PROVIDER_AZURE, infrastructure_provider=azure_provider
+            infrastructure_type=Provider.PROVIDER_AZURE,
+            infrastructure_provider=azure_provider,
         )
         with patch("masu.celery.tasks.check_report_updates"):
             provider = Provider.objects.create(
@@ -666,12 +747,12 @@ class ProviderManagerTest(IamTestCase):
                 authentication=provider_authentication,
                 infrastructure=infrastructure,
             )
-
         provider_uuid = provider.uuid
-        manager = ProviderManager(provider_uuid)
-        infrastructure_info = manager.get_infrastructure_info()
-        self.assertEqual(infrastructure_info.get("type", ""), Provider.PROVIDER_AZURE)
-        self.assertEqual(infrastructure_info.get("uuid", ""), azure_provider.uuid)
+        with patch("api.provider.provider_manager.Sources.objects"):
+            manager = ProviderManager(provider_uuid)
+            infrastructure_info = manager.get_infrastructure_info()
+            self.assertEqual(infrastructure_info.get("type", ""), Provider.PROVIDER_AZURE)
+            self.assertEqual(infrastructure_info.get("uuid", ""), azure_provider.uuid)
 
     def test_ocp_infrastructure_type(self):
         """Test that the provider infrastructure returns Unknown when running stand alone."""
@@ -708,6 +789,117 @@ class ProviderManagerTest(IamTestCase):
         manager = ProviderManager(provider_uuid)
         infrastructure_info = manager.get_infrastructure_info()
         self.assertEqual(infrastructure_info, {})
+
+    def test_get_additional_context_ocp_with_manifest(self):
+        """Test get_additional_context for an OCP provider with manifest data."""
+        credentials = {"cluster_id": "cluster_id_ocp_context"}
+        provider_authentication = ProviderAuthentication.objects.create(credentials=credentials)
+        provider = Provider.objects.create(
+            name="ocp_provider_for_context",
+            type=Provider.PROVIDER_OCP,
+            created_by=self.user,
+            customer=self.customer,
+            authentication=provider_authentication,
+        )
+        manifest = baker.make(
+            CostUsageReportManifest,
+            provider=provider,
+            billing_period_start_datetime=DateHelper().this_month_start,
+            operator_version="4.7.0",
+            operator_airgapped=False,
+            operator_certified=True,
+        )
+
+        with patch("api.provider.provider_manager.utils.get_latest_operator_version") as mock_latest_version:
+            # Scenario 1: Current version is not the latest
+            mock_latest_version.return_value = "4.8.0"
+            manager = ProviderManager(provider.uuid)
+            additional_context = manager.get_additional_context()
+
+            self.assertIsNotNone(manager.manifest, "Manifest should be loaded by ProviderManager")
+            self.assertEqual(manager.manifest.id, manifest.id)
+            self.assertEqual(additional_context.get("operator_version"), "4.7.0")
+            self.assertEqual(additional_context.get("operator_airgapped"), False)
+            self.assertEqual(additional_context.get("operator_certified"), True)
+            self.assertEqual(additional_context.get("operator_update_available"), True)
+            self.assertEqual(additional_context.get("vm_cpu_core_cost_model_support"), True)
+
+            # Scenario 2: Current version is the latest
+            mock_latest_version.return_value = "4.7.0"
+            manager_updated_ver = ProviderManager(provider.uuid)
+            additional_context_updated = manager_updated_ver.get_additional_context()
+            self.assertEqual(additional_context_updated.get("operator_update_available"), False)
+
+            # Scenario 2a: Operator version just below cpu core cost model threshold ("3.3.2")
+            mock_latest_version.return_value = "3.3.2"
+            manifest.operator_version = "3.3.2"
+            manifest.save()
+            manager_below_threshold = ProviderManager(provider.uuid)
+            additional_context_below = manager_below_threshold.get_additional_context()
+            self.assertEqual(additional_context_below.get("operator_version"), "3.3.2")
+            self.assertEqual(additional_context_below.get("vm_cpu_core_cost_model_support"), False)
+
+            # Scenario 2b: Operator version exactly at the threshold ("4.0.0")
+            mock_latest_version.return_value = "4.0.0"
+            manifest.operator_version = "4.0.0"
+            manifest.save()
+            manager_at_threshold = ProviderManager(provider.uuid)
+            additional_context_at = manager_at_threshold.get_additional_context()
+            self.assertEqual(additional_context_at.get("operator_version"), "4.0.0")
+            self.assertEqual(additional_context_at.get("vm_cpu_core_cost_model_support"), True)
+
+            # Scenario 3: Invalid version
+            invalid_version = str(uuid4())
+            mock_latest_version.return_value = invalid_version
+            manifest.operator_version = invalid_version
+            manifest.save()
+            manager_at_threshold = ProviderManager(provider.uuid)
+            additional_context_at = manager_at_threshold.get_additional_context()
+            self.assertEqual(additional_context_at.get("vm_cpu_core_cost_model_support"), False)
+
+    def test_get_additional_context_ocp_no_manifest(self):
+        """Test get_additional_context for an OCP provider without manifest data."""
+        credentials = {"cluster_id": "cluster_id_ocp_no_manifest"}
+        provider_authentication = ProviderAuthentication.objects.create(credentials=credentials)
+        provider = Provider.objects.create(
+            name="ocp_provider_no_manifest",
+            type=Provider.PROVIDER_OCP,
+            created_by=self.user,
+            customer=self.customer,
+            authentication=provider_authentication,
+            additional_context={"initial_key": "initial_value"},
+        )
+        # No manifest created for this provider
+
+        manager = ProviderManager(provider.uuid)  # Manifest will be None
+        self.assertIsNone(manager.manifest, "Manifest should be None for this provider")
+
+        additional_context = manager.get_additional_context()
+        self.assertEqual(additional_context.get("initial_key"), "initial_value")
+        self.assertIsNone(additional_context.get("operator_version"))
+        self.assertIsNone(additional_context.get("operator_update_available"))
+
+    def test_get_additional_context_non_ocp_provider(self):
+        """Test get_additional_context for a non-OCP provider."""
+        aws_credentials = {"account_id": "123456789012"}
+        aws_provider_authentication = ProviderAuthentication.objects.create(credentials=aws_credentials)
+        aws_provider = Provider.objects.create(
+            name="aws_provider_for_context",
+            type=Provider.PROVIDER_AWS,
+            created_by=self.user,
+            customer=self.customer,
+            authentication=aws_provider_authentication,
+            additional_context={"aws_specific": "some_value"},
+        )
+        baker.make(
+            CostUsageReportManifest,
+            provider=aws_provider,
+            billing_period_start_datetime=DateHelper().this_month_start,
+        )
+        manager = ProviderManager(aws_provider.uuid)
+        additional_context = manager.get_additional_context()
+        self.assertEqual(additional_context.get("aws_specific"), "some_value")
+        self.assertIsNone(additional_context.get("operator_version"))
 
     @patch("api.provider.provider_manager.ProviderManager.is_removable_by_user", return_value=False)
     def test_remove_not_removeable(self, _):

@@ -1,7 +1,7 @@
 -- OCP ON ALL PROJECT DAILY SUMMARY PROCESSING (AZURE DATA)
 
 DELETE
-  FROM {{schema_name | sqlsafe}}.reporting_ocpallcostlineitem_project_daily_summary_p
+  FROM {{schema | sqlsafe}}.reporting_ocpallcostlineitem_project_daily_summary_p
  WHERE usage_start >= {{start_date}}::date
    AND usage_start <= {{end_date}}::date
    AND source_uuid = {{source_uuid}}::uuid
@@ -10,7 +10,7 @@ DELETE
 
 
 INSERT
-  INTO {{schema_name | sqlsafe}}.reporting_ocpallcostlineitem_project_daily_summary_p (
+  INTO {{schema | sqlsafe}}.reporting_ocpallcostlineitem_project_daily_summary_p (
            source_type,
            cluster_id,
            cluster_alias,
@@ -32,7 +32,6 @@ INSERT
            unit,
            unblended_cost,
            project_markup_cost,
-           pod_cost,
            currency_code,
            cost_category_id,
            source_uuid
@@ -57,12 +56,11 @@ SELECT 'Azure' as source_type,
        sum(usage_quantity) as usage_amount,
        max(unit_of_measure) as unit,
        sum(pretax_cost) as unblended_cost,
-       sum(project_markup_cost) as project_markup_cost,
-       sum(pod_cost) as pod_cost,
+       sum(markup_cost) as project_markup_cost,
        max(currency) as currency_code,
        max(cost_category_id) as cost_category_id,
        {{source_uuid}}::uuid as source_uuid
-  FROM {{schema_name | sqlsafe}}.reporting_ocpazurecostlineitem_project_daily_summary_p
+  FROM {{schema | sqlsafe}}.reporting_ocpazurecostlineitem_project_daily_summary_p
  WHERE usage_start >= {{start_date}}::date
    AND usage_start <= {{end_date}}::date
    AND cluster_id = {{cluster_id}}

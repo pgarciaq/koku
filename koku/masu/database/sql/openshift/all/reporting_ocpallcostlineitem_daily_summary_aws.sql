@@ -1,7 +1,7 @@
 -- OCP ON ALL DAILY SUMMARY PROCESSING (AWS DATA)
 
 DELETE
-  FROM {{schema_name | sqlsafe}}.reporting_ocpallcostlineitem_daily_summary_p
+  FROM {{schema | sqlsafe}}.reporting_ocpallcostlineitem_daily_summary_p
  WHERE usage_start >= {{start_date}}::date
    AND usage_start <= {{end_date}}::date
    AND source_uuid = {{source_uuid}}::uuid
@@ -10,7 +10,7 @@ DELETE
 
 
 INSERT
-  INTO {{schema_name | sqlsafe}}.reporting_ocpallcostlineitem_daily_summary_p (
+  INTO {{schema | sqlsafe}}.reporting_ocpallcostlineitem_daily_summary_p (
            source_type,
            cluster_id,
            cluster_alias,
@@ -39,7 +39,7 @@ INSERT
 SELECT 'AWS'::text AS source_type,
        aws.cluster_id,
        {{cluster_alias}},
-       array_agg(aws.namespace),
+       array_agg(distinct aws.namespace),
        aws.node,
        aws.resource_id,
        aws.usage_start,
@@ -54,13 +54,14 @@ SELECT 'AWS'::text AS source_type,
        aws.tags,
        sum(aws.usage_amount),
        max(aws.unit),
-       sum(aws.unblended_cost),
-       sum(aws.markup_cost),
+       --  OCP on ALL tables should use calculated_amortized_cost
+       sum(calculated_amortized_cost) as unblended_cost,
+       sum(aws.markup_cost_amortized),
        max(aws.currency_code),
        max(cost_category_id) as cost_category_id,
        cast(1 as decimal) as shared_projects,
        {{source_uuid}}::uuid as source_uuid
-  FROM {{schema_name | sqlsafe}}.reporting_ocpawscostlineitem_project_daily_summary_p AS aws
+  FROM {{schema | sqlsafe}}.reporting_ocpawscostlineitem_project_daily_summary_p AS aws
  WHERE aws.usage_start >= {{start_date}}::date
    AND aws.usage_start <= {{end_date}}::date
    AND aws.cluster_id = {{cluster_id}}

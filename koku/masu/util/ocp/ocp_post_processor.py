@@ -1,4 +1,3 @@
-import copy
 import json
 import logging
 
@@ -6,10 +5,12 @@ import ciso8601
 import pandas as pd
 from dateutil.parser import ParserError
 
-from masu.util.common import create_enabled_keys
+from api.common import log_json
+from api.models import Provider
+from masu.util.common import populate_enabled_tag_rows_with_false
 from masu.util.common import safe_float
 from masu.util.ocp.common import OCP_REPORT_TYPES
-from reporting.provider.ocp.models import OCPEnabledTagKeys
+from masu.util.ocp.common import THRESHOLDS
 
 LOG = logging.getLogger(__name__)
 
@@ -18,7 +19,7 @@ def process_openshift_datetime(val):
     """
     Convert the date time from the Metering operator reports to a consumable datetime.
     """
-    result = None
+    result = pd.NaT
     try:
         datetime_str = str(val).replace(" +0000 UTC", "")
         result = ciso8601.parse_datetime(datetime_str)
@@ -35,6 +36,10 @@ def process_openshift_labels(label_string):
 
     Returns:
         (dict): The JSON dictionary made from the label string
+
+    Dev Note:
+        You can reference the operator here to see what queries to run
+        in prometheus to see the labels.
 
     """
     labels = label_string.split("|") if label_string else []
@@ -106,11 +111,28 @@ class OCPPostProcessor:
             "persistentvolumeclaim_capacity_byte_seconds": safe_float,
             "volume_request_storage_byte_seconds": safe_float,
             "persistentvolumeclaim_usage_byte_seconds": safe_float,
+            "vm_uptime_total_seconds": safe_float,
+            "vm_cpu_limit_cores": safe_float,
+            "vm_cpu_limit_core_seconds": safe_float,
+            "vm_cpu_request_cores": safe_float,
+            "vm_cpu_request_core_seconds": safe_float,
+            "vm_cpu_request_sockets": safe_float,
+            "vm_cpu_request_socket_seconds": safe_float,
+            "vm_cpu_request_threads": safe_float,
+            "vm_cpu_request_thread_seconds": safe_float,
+            "vm_cpu_usage_total_seconds": safe_float,
+            "vm_memory_limit_bytes": safe_float,
+            "vm_memory_limit_byte_seconds": safe_float,
+            "vm_memory_request_bytes": safe_float,
+            "vm_memory_request_byte_seconds": safe_float,
+            "vm_memory_usage_byte_seconds": safe_float,
+            "vm_disk_allocated_size_byte_seconds": safe_float,
             "pod_labels": process_openshift_labels_to_json,
             "persistentvolume_labels": process_openshift_labels_to_json,
             "persistentvolumeclaim_labels": process_openshift_labels_to_json,
             "node_labels": process_openshift_labels_to_json,
             "namespace_labels": process_openshift_labels_to_json,
+            "vm_labels": process_openshift_labels_to_json,
         }
         csv_converters = {
             col_name: converters[col_name.lower()] for col_name in col_names if col_name.lower() in converters
@@ -126,28 +148,45 @@ class OCPPostProcessor:
         if data_frame.empty:
             return data_frame
 
-        report = self.ocp_report_types.get(self.report_type, {})
-        group_bys = copy.deepcopy(report.get("group_by", []))
+        report = self.ocp_report_types[self.report_type]
+        group_bys = [gb for gb in report["group_by"] if gb in data_frame.columns]
         group_bys.append(pd.Grouper(key="interval_start", freq="D"))
-        aggs = report.get("agg", {})
-        daily_data_frame = data_frame.groupby(group_bys, dropna=False).agg(
-            {k: v for k, v in aggs.items() if k in data_frame.columns}
-        )
+        aggs = {k: v for k, v in report["agg"].items() if k in data_frame.columns}
+        daily_data_frame = data_frame.groupby(group_bys, dropna=False).agg(aggs)
 
         columns = daily_data_frame.columns.droplevel(1)
         daily_data_frame.columns = columns
 
-        daily_data_frame.reset_index(inplace=True)
+        daily_data_frame = daily_data_frame.reset_index()
 
-        new_cols = report.get("new_required_columns")
-        for col in new_cols:
+        for col, dtype in report["new_required_columns"].items():
             if col not in daily_data_frame:
-                daily_data_frame[col] = None
+                daily_data_frame[col] = pd.Series(dtype=dtype)
 
         return daily_data_frame
 
-    def process_dataframe(self, data_frame):
-        label_columns = {"pod_labels", "volume_labels", "namespace_labels", "node_labels"}
+    def _remove_anomalies(self, data_frame: pd.DataFrame, filename: str) -> pd.DataFrame:
+        """Removes rows with anomalous values from the DataFrame."""
+
+        # only consider existing cols
+        common = data_frame.columns.intersection(THRESHOLDS)
+        # build boolean mask of any col > its threshold
+        mask = data_frame[common].gt(pd.Series(THRESHOLDS)).any(axis=1)
+
+        if mask.any():
+            LOG.warning(log_json(msg="Dropping anomalous rows", schema=self.schema, filename=filename))
+
+        return data_frame.loc[~mask]
+
+    def process_dataframe(self, data_frame, filename):
+        data_frame = self._remove_anomalies(data_frame, filename)
+        label_columns = {
+            "pod_labels",
+            "persistentvolume_labels",
+            "persistentvolumeclaim_labels",
+            "namespace_labels",
+            "node_labels",
+        }
         df_columns = set(data_frame.columns)
         columns_to_grab = df_columns.intersection(label_columns)
         label_key_set = set()
@@ -162,4 +201,4 @@ class OCPPostProcessor:
         """
         Uses information gather in the post processing to update the cost models.
         """
-        create_enabled_keys(self.schema, OCPEnabledTagKeys, self.enabled_tag_keys)
+        populate_enabled_tag_rows_with_false(self.schema, self.enabled_tag_keys, Provider.PROVIDER_OCP)

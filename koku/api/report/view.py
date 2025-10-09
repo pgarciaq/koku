@@ -13,6 +13,7 @@ from rest_framework.serializers import ValidationError
 from rest_framework.views import APIView
 
 from api.common import CACHE_RH_IDENTITY_HEADER
+from api.common.pagination import MonthlyPagination
 from api.common.pagination import OrgUnitPagination
 from api.common.pagination import ReportPagination
 from api.common.pagination import ReportRankedPagination
@@ -22,21 +23,22 @@ from api.query_params import QueryParameters
 LOG = logging.getLogger(__name__)
 
 
-def get_paginator(filter_query_params, count, group_by_params=False):
+def get_paginator(filter_query_params, count, group_by_params=False, monthly_pagination_key=None):
     """Determine which paginator to use based on query params."""
+
     if group_by_params and (
         "group_by[org_unit_id]" in group_by_params or "group_by[or:org_unit_id]" in group_by_params
     ):
         paginator = OrgUnitPagination(filter_query_params)
-        paginator.others = count
     else:
         if "offset" in filter_query_params:
             paginator = ReportRankedPagination()
             paginator.count = count
-            paginator.others = count
+        elif monthly_pagination_key:
+            paginator = MonthlyPagination(monthly_pagination_key)
         else:
             paginator = ReportPagination()
-            paginator.others = count
+    paginator.others = count
     return paginator
 
 
@@ -78,7 +80,27 @@ class ReportView(APIView):
 
         max_rank = handler.max_rank
 
-        paginator = get_paginator(params.parameters.get("filter", {}), max_rank, request.query_params)
+        if hasattr(self, "monthly_pagination_key"):
+            monthly_pagination_key = getattr(self, "monthly_pagination_key")
+        else:
+            monthly_pagination_key = None
+
+        paginator = get_paginator(
+            params.parameters.get("filter", {}),
+            max_rank,
+            request.query_params,
+            monthly_pagination_key=monthly_pagination_key,
+        )
         paginated_result = paginator.paginate_queryset(output, request)
+
+        # Developer's Note: Uncomment to see what query django runs
+        # from django.db import connection
+        # readable_queries = []
+        # for dikt in connection.queries:
+        #     for key, item in dikt.items():
+        #         item = item.replace("\"", "")
+        #         item = item.replace("\\", "")
+        #         readable_queries.append({key: item})
+        # LOG.info(readable_queries)
 
         return paginator.get_paginated_response(paginated_result)

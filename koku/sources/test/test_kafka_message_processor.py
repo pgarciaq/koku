@@ -11,6 +11,7 @@ from unittest.mock import patch
 from uuid import uuid4
 
 from django.db.models.signals import post_save
+from django.test.utils import override_settings
 from faker import Faker
 
 from api.iam.test.iam_test_case import IamTestCase
@@ -37,7 +38,6 @@ from sources.kafka_message_processor import SourceMsgProcessor
 from sources.kafka_message_processor import SOURCES_AWS_SOURCE_NAME
 from sources.kafka_message_processor import SOURCES_AZURE_SOURCE_NAME
 from sources.kafka_message_processor import SOURCES_GCP_SOURCE_NAME
-from sources.kafka_message_processor import SOURCES_OCI_SOURCE_NAME
 from sources.kafka_message_processor import SOURCES_OCP_SOURCE_NAME
 from sources.kafka_message_processor import SourcesMessageError
 from sources.sources_http_client import AUTH_TYPES
@@ -65,14 +65,12 @@ SOURCE_TYPE_IDS = {
     2: SOURCES_AZURE_SOURCE_NAME,
     3: SOURCES_GCP_SOURCE_NAME,
     4: SOURCES_OCP_SOURCE_NAME,
-    5: SOURCES_OCI_SOURCE_NAME,
 }
 SOURCE_TYPE_IDS_MAP = {
     Provider.PROVIDER_AWS: 1,
     Provider.PROVIDER_AZURE: 2,
     Provider.PROVIDER_GCP: 3,
     Provider.PROVIDER_OCP: 4,
-    Provider.PROVIDER_OCI: 5,
 }
 
 
@@ -144,7 +142,7 @@ class KafkaMessageProcessorTest(IamTestCase):
         post_save.disconnect(storage_callback, sender=Sources)
         account = "10001"
         org_id = "1234567"
-        IdentityHeaderMiddleware.create_customer(account, org_id)
+        IdentityHeaderMiddleware.create_customer(account, org_id, "POST")
 
     def setUp(self):
         self.valid_creds = {
@@ -163,11 +161,6 @@ class KafkaMessageProcessorTest(IamTestCase):
             Provider.PROVIDER_AZURE: {"resource_group": "rg1", "storage_account": "sa1"},
             Provider.PROVIDER_GCP: {"dataset": "dataset"},
             Provider.PROVIDER_OCP: {},
-            Provider.PROVIDER_OCI: {
-                "bucket": "bucket",
-                "bucket_namespace": "bucket-namespace",
-                "bucket_region": "bucket-region",
-            },
         }
 
     def test_fake_details_generator(self):
@@ -177,7 +170,6 @@ class KafkaMessageProcessorTest(IamTestCase):
             Provider.PROVIDER_AZURE,
             Provider.PROVIDER_GCP,
             Provider.PROVIDER_OCP,
-            Provider.PROVIDER_OCI,
         ]
         for provider in provider_types:
             with self.subTest(test=provider):
@@ -287,6 +279,22 @@ class KafkaMessageProcessorTest(IamTestCase):
         msg._headers = {}  # override the generator headers
         self.assertIsInstance(create_msg_processor(msg, COST_MGMT_APP_TYPE_ID), NoneType)
 
+    def test_schema_suffix_init(self):
+        event = KAFKA_APPLICATION_CREATE
+        cost_mgmt_id = 1
+        table = [
+            {"suffix": "", "expected": "1234567"},
+            {"suffix": "567", "expected": "1234567"},
+            {"suffix": "_real_suffix", "expected": "1234567_real_suffix"},
+        ]
+        for test in table:
+            with override_settings(SCHEMA_SUFFIX=test["suffix"]):
+                msg = msg_generator(
+                    event_type=event, value={"id": 1, "source_id": 1, "application_type_id": COST_MGMT_APP_TYPE_ID}
+                )
+                got = KafkaMessageProcessor(msg, event, cost_mgmt_id)
+                self.assertEqual(got.org_id, test["expected"])
+
     def test_msg_for_cost_mgmt(self):
         """Test msg_for_cost_mgmt true or false."""
         test_app_value_is_cost = {"id": 1, "source_id": 1, "application_type_id": COST_MGMT_APP_TYPE_ID}
@@ -366,31 +374,6 @@ class KafkaMessageProcessorTest(IamTestCase):
                         self.assertEqual(result, test.get("expected"))
                         mock_details_save.assert_called_once()
 
-    def test_save_sources_details_unknown_source_type(self):
-        """Test save_source_details does not call storage method."""
-        provider_list = [Provider.PROVIDER_IBM, "unknown"]
-        event = choice(EVENT_LIST)
-        msg = msg_generator(event)
-        processor = KafkaMessageProcessor(msg, event, COST_MGMT_APP_TYPE_ID)
-        for provider in provider_list:
-            mock_details = mock_details_generator(provider, FAKER.name(), uuid4(), FAKER.pyint())
-            with self.subTest(test=f"(provider={provider}, mock_details={mock_details.__dict__})"):
-                with patch.object(KafkaMessageProcessor, "get_source_details", return_value=mock_details):
-                    with patch("sources.storage.add_provider_sources_details") as mock_details_save:
-                        result = processor.save_sources_details()
-                        self.assertIsNone(result)
-                        mock_details_save.assert_not_called()
-
-    def test_save_oci_credentials(self):
-        """Test save oci credentials calls add_provider_sources_auth_info."""
-        event = choice(EVENT_LIST)
-        msg = msg_generator(event)
-        provider = "OCI"
-        processor = KafkaMessageProcessor(msg, event, COST_MGMT_APP_TYPE_ID)
-        with patch("sources.storage.get_source_type", return_value=provider):
-            result = processor.save_credentials()
-            self.assertEqual(result, True)
-
     def test_save_credentials(self):
         """Test save credentials calls add_provider_sources_auth_info."""
         event = choice(EVENT_LIST)
@@ -427,16 +410,15 @@ class KafkaMessageProcessorTest(IamTestCase):
             _get_ocp_credentials=MagicMock(side_effect=SourcesHTTPClientError),
         ):
             for provider in Provider.PROVIDER_LIST:
-                if provider not in ["OCI", "OCI-local"]:  # OCI has no credentials
-                    with self.subTest(test=provider):
-                        with patch("sources.storage.get_source_type", return_value=provider):
-                            with patch.object(SourcesHTTPClient, "set_source_status") as mock_set:
-                                with patch("sources.storage.add_provider_sources_auth_info") as mock_add:
-                                    with self.assertRaises(SourcesHTTPClientError):
-                                        result = processor.save_credentials()
-                                        self.assertIsNone(result)
-                                        mock_set.assert_called_once()
-                                        mock_add.assert_not_called()
+                with self.subTest(test=provider):
+                    with patch("sources.storage.get_source_type", return_value=provider):
+                        with patch.object(SourcesHTTPClient, "set_source_status") as mock_set:
+                            with patch("sources.storage.add_provider_sources_auth_info") as mock_add:
+                                with self.assertRaises(SourcesHTTPClientError):
+                                    result = processor.save_credentials()
+                                    self.assertIsNone(result)
+                                    mock_set.assert_called_once()
+                                    mock_add.assert_not_called()
 
     def test_save_billing_source(self):
         """Test save billing source calls add_provider_sources_billing_info."""
@@ -448,7 +430,6 @@ class KafkaMessageProcessorTest(IamTestCase):
                 Provider.PROVIDER_AZURE: self.valid_billing.get(Provider.PROVIDER_AZURE),
                 Provider.PROVIDER_GCP: self.valid_billing.get(Provider.PROVIDER_GCP),
                 Provider.PROVIDER_OCP: self.valid_billing.get(Provider.PROVIDER_OCP),
-                Provider.PROVIDER_OCI: self.valid_billing.get(Provider.PROVIDER_OCI),
             }
             return values.get(arg)
 

@@ -71,5 +71,7 @@ INSERT INTO {{schema | sqlsafe}}.reporting_ocp_pod_summary_by_project_p (
         AND data_source = 'Pod'
         AND namespace IS DISTINCT FROM 'Worker unallocated'
         AND namespace IS DISTINCT FROM 'Platform unallocated'
+        AND namespace IS DISTINCT FROM 'Network unattributed'
+        AND namespace IS DISTINCT FROM 'Storage unattributed'
     GROUP BY usage_start, cluster_id, cluster_alias, namespace, cost_model_rate_type
 ;

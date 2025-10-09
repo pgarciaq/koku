@@ -68,6 +68,17 @@ AWS_COST_CATEGORIES = (
     None,
     None,
 )
+AWS_VCPUS = (2, 4, 8, 32, 48, 96, 128)
+AWS_MEMORY = ("16 GiB", "8 GiB", "32 GiB", "128 GiB", "512 GiB", "64 GiB", "1024 GiB")
+AWS_OPERATING_SYSTEMS = (
+    "Ubuntu",
+    "Red Hat Enterprise Linux",
+    "Fedora",
+    "Debian",
+    "CentOS",
+    "Oracle Linux",
+    "FreeBSD",
+)
 
 AWS_CONSTANTS = SameLengthDict(
     {
@@ -78,6 +89,9 @@ AWS_CONSTANTS = SameLengthDict(
         "resource_ids": AWS_RESOURCE_IDS,
         "units": AWS_UNITS,
         "cost_category": AWS_COST_CATEGORIES,
+        "operating_systems": AWS_OPERATING_SYSTEMS,
+        "vcpus": AWS_VCPUS,
+        "memory": AWS_MEMORY,
     }
 )
 
@@ -130,12 +144,12 @@ OCP_PLATFORM_NAMESPACE = "openshift-default"
 OCP_NAMESPACES = (OCP_PLATFORM_NAMESPACE, "koku", "koku-dev", "koku-stage", "koku-perf", "koku-prod")
 OCP_STORAGE_CLASSES = ("bronze", "silver", "gold", "platinum", "adamantium", "vibranium")
 OCP_POD_LABELS = (
-    {"app": "mobile", "disabled": "Danilov"},
+    {"app": "mobile", "disabled": "Danilov", "vm_kubevirt_io_name": "test vm name"},
     {"app": "banking", "disabled": "Villabate"},
-    {"app": "weather", "disabled": "Elbeuf"},
+    {"app": "weather", "disabled": "Elbeuf", "vm_kubevirt_io_name": "test-vm-name"},
     {"app": "messaging", "disabled": "Pekanbaru"},
-    {"app": "social", "disabled": "Castelfranco_Emilia"},
-    {"app": "gaming", "disabled": "Teluk_Intan"},
+    {"app": "social", "disabled": "Castelfranco_Emilia", "vm_kubevirt_io_name": "TestVirtualMachineName"},
+    {"app": "gaming", "disabled": "Teluk_Intan", "vm_kubevirt_io_name": "test_vm_name"},
 )
 OCP_PVC_LABELS = (
     {"app": "temperature", "disabled": "Danilov", "storageclass": "Ruby"},
@@ -273,32 +287,3 @@ OCP_ON_PREM_COST_MODEL = {
         },
     ],
 }
-
-OCI_SERVICE_NAMES = (
-    "BLOCK_STORAGE",
-    "COMPUTE",
-    "LOGGING",
-    "NETWORK",
-    "OBJECTSTORE",
-    "ORACLE_FUNCTIONS",
-    "TELEMETRY",
-)
-OCI_INSTANCE_TYPES = (
-    None,
-    "Virtual Machine Standard - E2 Micro - Free",
-) + (None,) * 5
-OCI_INSTANCE_IDS = (
-    [None],
-    ["ocid1.instance.oc1.uk-london-1.anwgiljtcf22xzacqqiueuntvcjnqkbep26cg24lpnu5tpekmi2sdif2vpma"],
-) + ([None],) * 5
-OCI_INSTANCE_COUNTS = (1, 1) + (0,) * 5
-OCI_UNITS_OF_MEASURE = ("BYTES",) + (None,) * 3 + ("BYTE_MS",) + (None,) * 2
-OCI_CONSTANTS = SameLengthDict(
-    {
-        "product_service": OCI_SERVICE_NAMES,
-        "instance_type": OCI_INSTANCE_TYPES,
-        "resource_ids": OCI_INSTANCE_IDS,
-        "resource_count": OCI_INSTANCE_COUNTS,
-        "unit": OCI_UNITS_OF_MEASURE,
-    }
-)

@@ -15,6 +15,7 @@ from django.db.models.expressions import ExpressionWrapper
 from django.db.models.functions import Coalesce
 
 from api.models import Provider
+from api.report.gcp.filter_collection import gcp_storage_conditional_filter_collection
 from api.report.provider_map import ProviderMap
 from reporting.models import OCPGCPComputeSummaryP
 from reporting.models import OCPGCPCostLineItemProjectDailySummaryP
@@ -31,7 +32,7 @@ from reporting.models import OCPGCPStorageSummaryP
 class OCPGCPProviderMap(ProviderMap):
     """OCP on GCP Provider Map."""
 
-    def __init__(self, provider, report_type):
+    def __init__(self, provider, report_type, schema_name):
         """Constructor."""
         self._mapping = [
             {
@@ -438,12 +439,12 @@ class OCPGCPProviderMap(ProviderMap):
                         "delta_key": {"usage": Sum("usage_amount")},
                         "filter": [
                             {"field": "unit", "operation": "exact", "parameter": "gibibyte month"},
-                            {
-                                "field": "service_alias",
-                                "operation": "in",
-                                "parameter": ["Filestore", "Data Transfer", "Storage", "Cloud Storage"],
-                            },
                         ],
+                        "conditionals": {
+                            OCPGCPCostLineItemProjectDailySummaryP: {
+                                "filter_collection": gcp_storage_conditional_filter_collection(schema_name),
+                            },
+                        },
                         "cost_units_key": "currency",
                         "cost_units_fallback": "USD",
                         "sum_columns": ["usage", "cost_total", "infra_total", "sup_total"],
@@ -497,4 +498,4 @@ class OCPGCPProviderMap(ProviderMap):
                 ("cluster",): OCPGCPNetworkSummaryP,
             },
         }
-        super().__init__(provider, report_type)
+        super().__init__(provider, report_type, schema_name)

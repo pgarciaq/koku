@@ -4,11 +4,8 @@
 #
 """OCP Query Handling for Reports."""
 import copy
-import datetime
 import logging
 from collections import defaultdict
-from dataclasses import dataclass
-from dataclasses import field
 from decimal import Decimal
 from decimal import DivisionByZero
 from decimal import InvalidOperation
@@ -20,10 +17,14 @@ from django.db.models import DecimalField
 from django.db.models import F
 from django.db.models import Value
 from django.db.models import When
+from django.db.models.fields.json import KT
 from django.db.models.functions import Coalesce
 from django_tenants.utils import tenant_context
 
 from api.models import Provider
+from api.report.ocp.capacity.cluster_capacity import calculate_unused
+from api.report.ocp.capacity.cluster_capacity import ClusterCapacity
+from api.report.ocp.capacity.node_capacity import NodeCapacity
 from api.report.ocp.provider_map import OCPProviderMap
 from api.report.queries import is_grouped_by_node
 from api.report.queries import is_grouped_by_project
@@ -32,70 +33,6 @@ from cost_models.models import CostModel
 from cost_models.models import CostModelMap
 
 LOG = logging.getLogger(__name__)
-
-
-@dataclass
-class CapacitySubsets:
-    """
-    key: field_key for api return
-    level_key: what level we are calculating the capacity (node, cluster)
-    count_units: cores or gbs
-    total: Total capacity of the timescope
-    resolution: total capacity of a usage time
-    resolution_level_total: total capacity of a usage time per group by level
-    by_level: total capacity by group by level over full usage period
-    total_count: total instant count of usage period
-    """
-
-    key: str
-    level_key: str
-    count_units: str
-    total: Decimal = Decimal(0)
-    resolution_total: defaultdict = field(default_factory=lambda: defaultdict(Decimal))
-    resolution_level_total: defaultdict = field(default_factory=lambda: defaultdict(lambda: defaultdict(Decimal)))
-    by_level: defaultdict = field(default_factory=lambda: defaultdict(Decimal))
-    count_total: Decimal = Decimal(0)
-    count_level_total: defaultdict = field(default_factory=lambda: defaultdict(lambda: defaultdict(Decimal)))
-
-    def add(self, cap_value, usage_start, level_value):
-        """Adds the capacity value to to all capacity aggregrations."""
-        if cap_value:
-            self.total += cap_value
-            self.by_level[level_value] += cap_value
-            self.resolution_total[usage_start] += cap_value
-            self.resolution_level_total[usage_start][level_value] += cap_value
-
-    def add_instance_count(self, count_value, usage_start, level_value):
-        """adds the count values together."""
-        if count_value:
-            self.count_total += count_value
-            self.count_level_total[usage_start][level_value] += count_value
-
-    def generate_query_sum(self):
-        """
-        Returns the values that should be added to the meta total.
-        """
-        return {self.key: self.total, "capacity_count": self.count_total, "capacity_count_units": self.count_units}
-
-
-def _calculate_unused(row):
-    """Calculates the unused portions of the capacity & request."""
-    # Populate unused request and capacity
-    capacity = row.get("capacity", Decimal(0))
-    if not capacity:
-        capacity = Decimal(0)
-    usage = row.get("usage") if row.get("usage") else Decimal(0)
-    request = row.get("request") if row.get("request") else Decimal(0)
-    effective_usage = max(usage, request)
-    unused_capacity = max(capacity - effective_usage, 0)
-    capacity_unused_percent = (unused_capacity / max(capacity, Decimal(1))) * 100
-    row["capacity_unused"] = unused_capacity
-    row["capacity_unused_percent"] = capacity_unused_percent
-    unused_request = max(request - usage, 0)
-    row["request_unused"] = unused_request
-    if request <= 0:
-        request = 1
-    row["request_unused_percent"] = (unused_request / max(capacity, Decimal(1))) * 100
 
 
 class OCPReportQueryHandler(ReportQueryHandler):
@@ -116,7 +53,9 @@ class OCPReportQueryHandler(ReportQueryHandler):
         # Update which field is used to calculate cost by group by param.
         if is_grouped_by_project(parameters) and parameters.report_type == "costs":
             self._report_type = parameters.report_type + "_by_project"
-        self._mapper = mapper_class(provider=self.provider, report_type=self._report_type)
+        self._mapper = mapper_class(
+            provider=self.provider, report_type=self._report_type, schema_name=parameters.tenant.schema_name
+        )
         self.group_by_options = self._mapper.provider_map.get("group_by_options")
 
         # We need to overwrite the default pack definitions with these
@@ -137,11 +76,22 @@ class OCPReportQueryHandler(ReportQueryHandler):
             "cost_usage": {"key": "usage", "group": "cost"},
             "cost_platform_distributed": {"key": "platform_distributed", "group": "cost"},
             "cost_worker_unallocated_distributed": {"key": "worker_unallocated_distributed", "group": "cost"},
+            "cost_network_unattributed_distributed": {"key": "network_unattributed_distributed", "group": "cost"},
+            "cost_storage_unattributed_distributed": {"key": "storage_unattributed_distributed", "group": "cost"},
             "cost_total_distributed": {"key": "distributed", "group": "cost"},
             "cost_total": {"key": "total", "group": "cost"},
         }
         ocp_pack_definitions = copy.deepcopy(self._mapper.PACK_DEFINITIONS)
         ocp_pack_definitions["cost_groups"]["keys"] = ocp_pack_keys
+        ocp_pack_definitions["request_cpu"] = {"keys": ["request_cpu"], "units": "request_cpu_units"}
+        ocp_pack_definitions["request_memory"] = {"keys": ["request_memory"], "units": "request_memory_units"}
+        ocp_pack_definitions["request"] = {
+            "keys": {
+                "request_cpu": {"key": "cpu", "group": "request"},
+                "request_memory": {"key": "memory", "group": "request"},
+            },
+            "units": "usage_units",
+        }
         # Note: The value & units will be supplied by the usage keys in the parent class.
         ocp_pack_definitions["unused_usage"] = {
             "keys": {
@@ -154,6 +104,7 @@ class OCPReportQueryHandler(ReportQueryHandler):
             },
             "units": "usage_units",
         }
+        ocp_pack_definitions["usage"]["keys"].extend(["data_transfer_in", "data_transfer_out"])
 
         # super() needs to be called after _mapper and _limit is set
         super().__init__(parameters)
@@ -186,10 +137,13 @@ class OCPReportQueryHandler(ReportQueryHandler):
                 annotations["project"] = F("namespace")
 
         if is_grouped_by_node(self.parameters):
+            # This adds the instance counts to the node group by.
             if self._mapper.report_type_map.get("capacity_aggregate", {}).get("node"):
                 self.report_annotations.update(
                     self._mapper.report_type_map.get("capacity_aggregate", {}).get("node", {})
                 )
+        for tag_db_name, _, original_tag in self._tag_group_by:
+            annotations[tag_db_name] = KT(f"{self._mapper.tag_column}__{original_tag}")
 
         return annotations
 
@@ -225,6 +179,21 @@ class OCPReportQueryHandler(ReportQueryHandler):
             "infra_exchange_rate": Case(*infra_exchange_rate_whens, default=1, output_field=DecimalField()),
         }
 
+    def format_tags(self, tags_iterable):
+        """
+        Formats the tags into our standard format.
+        """
+        if not tags_iterable:
+            return []
+        transformed_tags = defaultdict(lambda: {"values": set()})
+
+        for tag in tags_iterable:
+            if tag:
+                for key, value in tag.items():
+                    transformed_tags[key]["values"].add(value)
+
+        return [{"key": key, "values": list(data["values"])} for key, data in transformed_tags.items()]
+
     def _format_query_response(self):
         """Format the query response with data.
 
@@ -232,6 +201,7 @@ class OCPReportQueryHandler(ReportQueryHandler):
             (Dict): Dictionary response of query params, data, and total
 
         """
+
         output = self._initialize_response_output(self.parameters)
         if self._report_type == "costs_by_project":
             # Add a boolean flag for the overhead dropdown in the UI
@@ -243,8 +213,8 @@ class OCPReportQueryHandler(ReportQueryHandler):
                     .exists()
                 ):
                     output["distributed_overhead"] = True
-        output["data"] = self.query_data
 
+        output["data"] = self.query_data
         self.query_sum = self._pack_data_object(self.query_sum, **self._mapper.PACK_DEFINITIONS)
         output["total"] = self.query_sum
 
@@ -278,9 +248,8 @@ class OCPReportQueryHandler(ReportQueryHandler):
                 query_data = self._project_classification_annotation(query_data)
             if self._limit and query_data:
                 query_data = self._group_by_ranks(query, query_data)
-                if not self.parameters.get("order_by") or self.parameters.get("order_by", {}).get(
-                    "cost_total_distributed"
-                ):
+                order_by = self.parameters.get("order_by")
+                if not order_by or set(order_by).intersection(["cost_total", "cost_total_distributed"]):
                     # https://issues.redhat.com/browse/COST-3901
                     # order_by[distributed_cost] is required for distributing platform cost,
                     # therefore others must be at the end.
@@ -296,15 +265,22 @@ class OCPReportQueryHandler(ReportQueryHandler):
             query_data, total_capacity = self.get_capacity(query_data)
             if total_capacity:
                 query_sum.update(total_capacity)
-                _calculate_unused(query_sum)
+                calculate_unused(query_sum)
 
             if self._delta:
                 query_data = self.add_deltas(query_data, query_sum)
 
             query_data = self.order_by(query_data, query_order_by)
+            for row in query_data:
+                if tag_iterable := row.get("tags"):
+                    row["tags"] = self.format_tags(tag_iterable)
 
             if self.is_csv_output:
-                data = list(query_data)
+                if self._report_type == "virtual_machines":
+                    date_string = self.date_to_string(self.time_interval[0])
+                    data = [{"date": date_string, "vm_names": query_data}]
+                else:
+                    data = list(query_data)
             else:
                 # Pass in a copy of the group by without the added
                 # tag column name prefix
@@ -327,80 +303,27 @@ class OCPReportQueryHandler(ReportQueryHandler):
         self.query_data = data
         return self._format_query_response()
 
-    def get_capacity(self, query_data):  # noqa: C901
-        """Calculate cluster capacity for all nodes over the date range."""
-        if is_grouped_by_node(self.parameters):
-            _capacity = self._generate_capacity_subsets("node", "node")
-        else:
-            _capacity = self._generate_capacity_subsets("cluster", "cluster_id")
-        if not _capacity:
-            return query_data, {}
+    # Capacity Calculations
 
-        if _capacity.level_key == "node":
-            for row in query_data:
-                row[_capacity.key] = _capacity.resolution_level_total.get(row.get("date"), {}).get(
-                    row.get("node"), Decimal(0)
-                )
-                _calculate_unused(row)
-            return query_data, _capacity.generate_query_sum()
-        else:
-            return self._get_cluster_capacity(query_data, _capacity)
-
-    def _generate_capacity_subsets(self, capacity_level, group_by):
-        """Calculate capacity over the timescope and resolution"""
-        _capacity = None
-        annotations = self._mapper.report_type_map.get("capacity_aggregate", {}).get(capacity_level)
-        if not annotations:
-            return None
-        cap_key = list(annotations.keys())[0]
+    def get_capacity(self, query_data):
+        """Calculate capacity & instance count for all nodes over the date range."""
         q_table = self._mapper.query_table
         LOG.debug(f"Using query table: {q_table}")
         query = q_table.objects.filter(self.query_filter)
         if self.query_exclusions:
             query = query.exclude(self.query_exclusions)
         with tenant_context(self.tenant):
-            cap_data = query.values(*["usage_start", group_by]).annotate(**annotations)
-            for entry in cap_data:
-                if not _capacity:
-                    _capacity = CapacitySubsets(
-                        key=cap_key, level_key=capacity_level, count_units=entry.get("capacity_count_units")
-                    )
-                level_value = entry.get(capacity_level, "")
-                usage_start = entry.get("usage_start", "")
-                if self.resolution == "daily" and isinstance(usage_start, datetime.date):
-                    usage_start = usage_start.isoformat()
-                if self.resolution == "monthly":
-                    usage_start = usage_start.strftime("%Y-%m")
-                cap_value = entry.get(cap_key, 0)
-                _capacity.add(cap_value, usage_start, level_value)
-                _capacity.add_instance_count(entry.get("capacity_count"), usage_start, level_value)
-        return _capacity
-
-    def _get_cluster_capacity(self, query_data, _capacity):
-        """Calculate the cluster capacity."""
+            _class = NodeCapacity if is_grouped_by_node(self.parameters) else ClusterCapacity
+            capacity = _class(self._mapper.report_type_map, query, self.resolution)
+            if not capacity.capacity_aggregate:
+                # short circuit for if the capacity dataclass in report provider map
+                return query_data, {}
+            capacity.populate_dataclass()
         for row in query_data:
-            row_date = row.get("date")
-            if self.resolution == "monthly" and not self.parameters.get("start_date"):
-                if cluster_list := row.get("clusters"):
-                    row[_capacity.key] = sum(
-                        [_capacity.by_level.get(cluster_id, Decimal(0)) for cluster_id in cluster_list]
-                    )
-                else:
-                    row[_capacity.key] = _capacity.total
-                _calculate_unused(row)
-                continue
+            capacity.update_row(row, self.parameters.get("start_date"))
+        return query_data, capacity.generate_query_sum()
 
-            if cluster_list := row.get("clusters"):
-                row[_capacity.key] = sum(
-                    [
-                        _capacity.resolution_level_total.get(row_date, {}).get(cluster_id, Decimal(0))
-                        for cluster_id in cluster_list
-                    ]
-                )
-            else:
-                row[_capacity.key] = _capacity.resolution_total.get(row_date, Decimal(0))
-            _calculate_unused(row)
-        return query_data, _capacity.generate_query_sum()
+    # Delta Calculations
 
     def add_deltas(self, query_data, query_sum):
         """Calculate and add cost deltas to a result set.

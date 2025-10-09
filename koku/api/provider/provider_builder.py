@@ -19,7 +19,7 @@ from api.provider.provider_manager import ProviderManager
 from api.provider.provider_manager import ProviderManagerAuthorizationError
 from api.provider.provider_manager import ProviderManagerError
 from api.provider.serializers import ProviderSerializer
-from koku.cache import invalidate_view_cache_for_tenant_and_cache_key
+from koku.cache import invalidate_cache_for_tenant_and_cache_key
 from koku.cache import SOURCES_CACHE_PREFIX
 from koku.middleware import IdentityHeaderMiddleware
 
@@ -35,8 +35,10 @@ class ProviderBuilderError(ValidationError):
 class ProviderBuilder:
     """Provider Builder to create koku providers."""
 
-    def __init__(self, auth_header):
+    def __init__(self, auth_header, account_number, org_id):
         """Initialize the client."""
+        self.account_number = account_number
+        self.org_id = org_id
         if isinstance(auth_header, dict) and auth_header.get("x-rh-identity"):
             self._identity_header = auth_header
         else:
@@ -51,14 +53,11 @@ class ProviderBuilder:
         return db_dict
 
     def _build_credentials_auth(self, provider_type, authentication):
-        if provider_type == Provider.PROVIDER_OCI or provider_type == Provider.PROVIDER_OCI_LOCAL:
-            auth = {}
+        credentials = authentication.get("credentials")
+        if credentials and isinstance(credentials, dict):
+            auth = {"credentials": credentials}
         else:
-            credentials = authentication.get("credentials")
-            if credentials and isinstance(credentials, dict):
-                auth = {"credentials": credentials}
-            else:
-                raise ProviderBuilderError("Missing credentials")
+            raise ProviderBuilderError("Missing credentials")
         return auth
 
     def _build_provider_data_source(self, billing_source):
@@ -81,35 +80,33 @@ class ProviderBuilder:
         """Create request context object."""
         user = None
         customer = None
-        encoded_auth_header = self._identity_header.get("x-rh-identity")
-        if encoded_auth_header:
-            identity = json.loads(b64decode(encoded_auth_header))
-            account = identity.get("identity", {}).get("account_number")
-            org_id = identity.get("identity", {}).get("org_id")
-            username = identity.get("identity", {}).get("user", {}).get("username")
-            email = identity.get("identity", {}).get("user", {}).get("email")
-            identity_type = identity.get("identity", {}).get("type", "User")
-            auth_type = identity.get("identity", {}).get("auth_type")
+        if encoded_auth_header := self._identity_header.get("x-rh-identity"):
+            identity = json.loads(b64decode(encoded_auth_header)).get("identity", {})
+            username = identity.get("user", {}).get("username")
+            email = identity.get("user", {}).get("email")
+            identity_type = identity.get("type", "User")
+            auth_type = identity.get("auth_type")
 
             if identity_type == "System" and auth_type == "uhc-auth":
-                username = identity.get("identity", {}).get("system", {}).get("cluster_id")
+                username = identity.get("system", {}).get("cluster_id")
+                email = ""
+
+            if identity_type == "ServiceAccount":
+                username = identity.get("service_account", {}).get("username")
                 email = ""
 
             try:
-                customer = Customer.objects.filter(org_id=org_id).get()
+                customer = Customer.objects.filter(org_id=self.org_id).get()
             except Customer.DoesNotExist:
-                customer = IdentityHeaderMiddleware.create_customer(account, org_id)
-            try:
-                user = User.objects.get(username=username)
-            except User.DoesNotExist:
-                user = IdentityHeaderMiddleware.create_user(username, email, customer, None)
+                customer = IdentityHeaderMiddleware.create_customer(self.account_number, self.org_id, "POST")
+            user = User(username=username, email=email, customer=customer)
 
         context = {"user": user, "customer": customer}
         return context, customer, user
 
     def _tenant_for_schema(self, schema_name):
         """Get or create tenant for schema."""
-        tenant, created = Tenant.objects.get_or_create(schema_name=schema_name)
+        tenant, _ = Tenant.objects.get_or_create(schema_name=schema_name)
         if not schema_exists(schema_name):
             tenant.create_schema()
             msg = f"Created tenant {schema_name}"
@@ -137,7 +134,7 @@ class ProviderBuilder:
             if serializer.is_valid(raise_exception=True):
                 instance = serializer.save()
         finally:
-            invalidate_view_cache_for_tenant_and_cache_key(customer.schema_name, SOURCES_CACHE_PREFIX)
+            invalidate_cache_for_tenant_and_cache_key(customer.schema_name, SOURCES_CACHE_PREFIX)
             connection.set_schema_to_public()
         return instance
 
@@ -160,7 +157,7 @@ class ProviderBuilder:
         serializer.is_valid(raise_exception=True)
         serializer.save()
         connection.set_schema_to_public()
-        invalidate_view_cache_for_tenant_and_cache_key(customer.schema_name, SOURCES_CACHE_PREFIX)
+        invalidate_cache_for_tenant_and_cache_key(customer.schema_name, SOURCES_CACHE_PREFIX)
         return instance
 
     def destroy_provider(self, provider_uuid, retry_count=None):
@@ -180,5 +177,5 @@ class ProviderBuilder:
             except ProviderManagerAuthorizationError as err:
                 LOG.warning(str(err), exc_info=err)
 
-        invalidate_view_cache_for_tenant_and_cache_key(customer.schema_name, SOURCES_CACHE_PREFIX)
+        invalidate_cache_for_tenant_and_cache_key(customer.schema_name, SOURCES_CACHE_PREFIX)
         connection.set_schema_to_public()

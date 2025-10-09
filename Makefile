@@ -11,13 +11,16 @@ PYTHON	= $(shell which python)
 TOPDIR  = $(shell pwd)
 PYDIR	= koku
 SCRIPTDIR = $(TOPDIR)/dev/scripts
-KOKU_SERVER = $(shell echo "${KOKU_API_HOST:-localhost}")
-KOKU_SERVER_PORT = $(shell echo "${KOKU_API_PORT:-8000}")
-MASU_SERVER = $(shell echo "${MASU_SERVICE_HOST:-localhost}")
-MASU_SERVER_PORT = $(shell echo "${MASU_SERVICE_PORT:-5042}")
+KOKU_SERVER = $(shell echo "$${KOKU_API_HOST:-localhost}")
+KOKU_SERVER_PORT = $(shell echo "$${KOKU_API_PORT:-8000}")
+MASU_SERVER = $(shell echo "$${MASU_SERVICE_HOST:-localhost}")
+MASU_SERVER_PORT = $(shell echo "$${MASU_SERVICE_PORT:-5042}")
 DOCKER := $(shell which docker 2>/dev/null || which podman 2>/dev/null)
-DOCKER_BUILDKIT = 1
 scale = 1
+
+export DOCKER_BUILDKIT = 1
+export USER_ID ?= $(shell id -u)
+export GROUP_ID ?= $(shell id -g)
 
 # Prefer Docker Compose v2
 DOCKER_COMPOSE_CHECK := $(shell $(DOCKER) compose version >/dev/null 2>&1 ; echo $$?)
@@ -26,11 +29,7 @@ ifneq ($(DOCKER_COMPOSE_CHECK), 0)
 	DOCKER_COMPOSE_BIN = $(DOCKER)-compose
 endif
 
-# Use ARM images on ARM systems
 DOCKER_COMPOSE = $(DOCKER_COMPOSE_BIN)
-ifeq (arm, $(findstring arm, $(shell uname -m)))
-	DOCKER_COMPOSE = $(DOCKER_COMPOSE_BIN) -f docker-compose.yml -f docker-compose.arm.yml
-endif
 
 # Testing directories
 TESTINGDIR = $(TOPDIR)/testing
@@ -61,12 +60,16 @@ help:
 	@echo "  clean                                 clean the project directory of any scratch files, bytecode, logs, etc"
 	@echo "  help                                  show this message"
 	@echo "  lint                                  run pre-commit against the project"
+	@echo "  get-release-commit                    show the latest commit that is safe to release"
+	@echo "  scan-project                          run a static analysis scan looking for vulnerabilities"
+	@echo "                                          @param path - (optional, default=koku) directory or file to scan"
 	@echo ""
 	@echo "--- Commands using local services ---"
-	@echo "  clear-testing                         Remove stale files/subdirectories from the testing directory."
-	@echo "  clear-trino                           Remove stale files/subdirectories from the trino data directory."
-	@echo "  clear-trino-data                      Remove old trino data from .trino/parquet_data/koku-bucket/data."
-	@echo "  clear-cache                           Flushes cache keys inside of the redis container."
+	@echo "  delete-testing                        Delete stale files/subdirectories from the testing directory."
+	@echo "  delete-trino                          Delete stale files/subdirectories from the trino data directory."
+	@echo "  delete-trino-data                     Delete old trino data from the Minio koku-bucket bucket."
+	@echo "  delete-redis-cache                    Flushes cache keys inside of the redis container."
+	@echo "  delete-valkey-cache                   Flushes cache keys inside of the valkey container."
 	@echo "  create-test-customer                  create a test customer and tenant in the database"
 	@echo "  create-test-customer-no-sources       create a test customer and tenant in the database without test sources"
 	@echo "  create-large-ocp-source-config-file   create a config file for nise to generate a large data sample"
@@ -88,14 +91,17 @@ help:
 	@echo "                                          @param schema - (optional) schema name. Default: 'org1234567'."
 	@echo "                                          @param nise_yml - (optional) Nise yaml file. Defaults to nise static yaml."
 	@echo "                                          @param start_date - (optional) Date delta zero in the aws_org_tree.yml"
+	@echo "  populate-currency-exchange-rates      populate the exchange rates table."
 	@echo "  backup-local-db-dir                   make a backup copy PostgreSQL database directory (pg_data.bak)"
 	@echo "  restore-local-db-dir                  overwrite the local PostgreSQL database directory with pg_data.bak"
 	@echo "  collect-static                        collect static files to host"
 	@echo "  make-migrations                       make migrations for the database"
 	@echo "  requirements                          generate Pipfile.lock"
 	@echo "  clowdapp                              generates a new clowdapp.yaml"
-	@echo "  remove-db                             remove local directory $(TOPDIR)/pg_data"
-	@echo "  remove-test-db                        remove the django test db"
+	@echo "  delete-db                             delete local directory $(TOPDIR)/dev/containers/postgresql/data"
+	@echo "  delete-glue-data                      delete s3 files + database created in AWS/glue"
+	@echo "                                          @param schema - (required) specify the schema to delete from catalog"
+	@echo "  delete-test-db                        delete the django test db"
 	@echo "  reset-db-statistics                   clear the pg_stat_statements statistics"
 	@echo "  run-migrations                        run migrations against database"
 	@echo "                                          @param applabel - (optional) Use specified application"
@@ -108,9 +114,6 @@ help:
 	@echo "  superuser                             create a Django super user"
 	@echo "  unittest                              run unittests"
 	@echo "  local-upload-data                     upload data to Ingress if it is up and running locally"
-	@echo "  unleash-export                        export feature-flags to file"
-	@echo "  unleash-import                        import feature-flags from file"
-	@echo "  unleash-import-drop                   import feature-flags from file AND wipe current database"
 	@echo "  scan_project                          run security scan"
 	@echo ""
 	@echo "--- Commands using Docker Compose ---"
@@ -127,6 +130,8 @@ help:
 	@echo "  docker-down                          shut down all containers"
 	@echo "  docker-up-min-trino                 start minimum targets for Trino usage"
 	@echo "  docker-up-min-trino-no-build        start minimum targets for Trino usage without building koku base"
+	@echo "  docker-up-min-with-subs             run database, koku/masu servers, worker and subs worker"
+	@echo "  docker-up-min-with-subs-no-build        run database, koku/masu servers, worker and subs worker without building koku base"
 	@echo "  docker-trino-down-all               Tear down Trino and Koku containers"
 	@echo "  docker-reinitdb                      drop and recreate the database"
 	@echo "  docker-reinitdb-with-sources         drop and recreate the database with fake sources"
@@ -161,17 +166,21 @@ clean:
 lint:
 	pre-commit run --all-files
 
-clear-testing:
-	$(PREFIX) $(PYTHON) $(SCRIPTDIR)/clear_testing.py -p $(TOPDIR)/testing
+delete-testing:
+	@$(PREFIX) $(PYTHON) $(SCRIPTDIR)/clear_testing.py -p $(TOPDIR)/testing
 
-clear-trino:
-	$(PREFIX) rm -fr ./.trino/
+delete-trino:
+	@$(PREFIX) rm -rf $(TOPDIR)/dev/containers/trino/data/*
+	@$(PREFIX) rm -rf $(TOPDIR)/dev/containers/trino/logs/*
 
-clear-trino-data:
-	$(PREFIX) rm -fr ./.trino/parquet_data/koku-bucket/data
+delete-trino-data:
+	@$(PREFIX) rm -rf $(TOPDIR)/dev/containers/minio/koku-bucket/*
 
-clear-cache:
+delete-redis-cache:
 	$(DOCKER) exec -it koku_redis redis-cli -n 1 flushall
+
+delete-valkey-cache:
+	$(DOCKER) exec -it koku_valkey valkey-cli flushall
 
 create-test-customer: run-migrations docker-up-koku
 	$(PYTHON) $(SCRIPTDIR)/create_test_customer.py || echo "WARNING: create_test_customer failed unexpectedly!"
@@ -185,12 +194,11 @@ delete-test-sources:
 delete-cost-models:
 	$(PYTHON) $(SCRIPTDIR)/delete_cost_models.py
 
-delete-test-customer-data: delete-test-sources delete-cost-models
+delete-test-customer-data: delete-test-sources delete-cost-models delete-testing
 
 test_source=all
 load-test-customer-data:
 	$(SCRIPTDIR)/load_test_customer_data.sh $(test_source) $(start) $(end)
-	make load-aws-org-unit-tree
 
 load-aws-org-unit-tree:
 	@if [ $(shell $(PYTHON) -c 'import sys; print(sys.version_info[0])') = '3' ] ; then \
@@ -199,6 +207,9 @@ load-aws-org-unit-tree:
 		echo "This make target requires python3." ; \
 	fi
 
+populate-currency-exchange-rates:
+	curl -s http://$(MASU_SERVER):$(MASU_SERVER_PORT)/api/cost-management/v1/update_exchange_rates/
+
 run-api-test:
 	$(PYTHON) $(SCRIPTDIR)/report_api_test.py || echo "WARNING: run-api-test failed unexpectedly!"
 
@@ -206,18 +217,21 @@ collect-static:
 	$(DJANGO_MANAGE) collectstatic --no-input
 
 make-migrations:
-	$(DJANGO_MANAGE) makemigrations api reporting reporting_common cost_models
+	$(DJANGO_MANAGE) makemigrations api reporting reporting_common cost_models key_metrics
 
-remove-db:
-	$(PREFIX) rm -rf $(TOPDIR)/pg_data
+delete-db:
+	@$(PREFIX) rm -rf $(TOPDIR)/dev/containers/postgresql/data/
 
-remove-test-db:
+delete-glue-data:
+	@$(PYTHON) $(SCRIPTDIR)/delete_glue.py $(schema)
+
+delete-test-db:
 	@PGPASSWORD=$$DATABASE_PASSWORD psql -h $$POSTGRES_SQL_SERVICE_HOST \
                                          -p $$POSTGRES_SQL_SERVICE_PORT \
                                          -d $$DATABASE_NAME \
                                          -U $$DATABASE_USER \
                                          -c "DROP DATABASE test_$$DATABASE_NAME;" >/dev/null
-	@echo "Test DB (test_$$DATABASE_NAME) has been removed."
+	@echo "Test DB (test_$$DATABASE_NAME) has been deleted."
 
 reset-db-statistics:
 	@PGPASSWORD=$$DATABASE_PASSWORD psql -h $$POSTGRES_SQL_SERVICE_HOST \
@@ -249,22 +263,6 @@ unittest:
 superuser:
 	$(DJANGO_MANAGE) createsuperuser
 
-unleash-export:
-	curl -X GET -H "Authorization: Basic YWRtaW46" \
-	"http://localhost:4242/api/admin/state/export?format=json&featureToggles=1&strategies=0&tags=0&projects=0&download=1" \
-	-s | python -m json.tool > .unleash/flags.json
-
-unleash-import:
-	curl -X POST -H "Content-Type: application/json" -H "Authorization: Basic YWRtaW46" \
-	-s -d @.unleash/flags.json http://localhost:4242/api/admin/state/import
-
-unleash-import-drop:
-	curl -X POST -H "Content-Type: application/json" -H "Authorization: Basic YWRtaW46" \
-	-s -d @.unleash/flags.json http://localhost:4242/api/admin/state/import?drop=true
-
-scan_project:
-	./sonarqube.sh
-
 clowdapp: kustomize
 	$(KUSTOMIZE) build deploy/kustomize > deploy/clowdapp.yaml
 
@@ -286,8 +284,8 @@ endif
 
 docker-down:
 	$(DOCKER_COMPOSE) down -v --remove-orphans
-	$(PREFIX) make clear-testing
-	$(PREFIX) make clear-trino-data
+	$(PREFIX) $(MAKE) delete-testing
+	$(PREFIX) $(MAKE) delete-trino-data
 
 docker-down-db:
 	$(DOCKER_COMPOSE) rm -s -v -f unleash
@@ -296,16 +294,19 @@ docker-down-db:
 docker-logs:
 	$(DOCKER_COMPOSE) logs -f koku-server koku-worker masu-server
 
+docker-logs-debug:
+	$(DOCKER_COMPOSE) logs -f koku-server koku-worker masu-server | grep --color=always -iE "ERROR|Exception|Traceback|CRITICAL|FATAL"
+
 docker-trino-logs:
 	$(DOCKER_COMPOSE) logs -f trino
 
-docker-reinitdb: docker-down-db remove-db docker-up-db run-migrations docker-restart-koku create-test-customer-no-sources
+docker-reinitdb: docker-down-db delete-db docker-up-db run-migrations docker-restart-koku create-test-customer-no-sources
 	@echo "Local database re-initialized with a test customer."
 
-docker-reinitdb-with-sources: docker-down-db remove-db docker-up-db run-migrations docker-restart-koku create-test-customer
+docker-reinitdb-with-sources: docker-down-db delete-db docker-up-db run-migrations docker-restart-koku create-test-customer
 	@echo "Local database re-initialized with a test customer and sources."
 
-docker-reinitdb-with-sources-lite: docker-down-db remove-db docker-up-db run-migrations create-test-customer
+docker-reinitdb-with-sources-lite: docker-down-db delete-db docker-up-db run-migrations create-test-customer
 	@echo "Local database re-initialized with a test customer and sources."
 
 docker-shell:
@@ -314,17 +315,17 @@ docker-shell:
 docker-restart-koku:
 	@if [ -n "$$($(DOCKER) ps -q -f name=koku_server)" ] ; then \
          $(DOCKER_COMPOSE) restart koku-server masu-server koku-worker koku-beat koku-listener ; \
-         make _koku-wait ; \
+         $(MAKE) _koku-wait ; \
          echo " koku is available" ; \
      else \
-         make docker-up-koku ; \
+         $(MAKE) docker-up-koku ; \
      fi
 
 docker-up-koku:
 	@if [ -z "$$($(DOCKER) ps -q -f name=koku_server)" ] ; then \
          echo "Starting koku_server ..." ; \
          $(DOCKER_COMPOSE) up $(build) -d koku-server ; \
-         make _koku-wait ; \
+         $(MAKE) _koku-wait ; \
      fi
 	@echo " koku is available!"
 
@@ -336,7 +337,9 @@ _koku-wait:
      done
 
 docker-build:
-	$(DOCKER_COMPOSE) build koku-base
+	# TARGETARCH: https://github.com/containers/podman/issues/23046 is resolved.
+	$(DOCKER_COMPOSE) build --build-arg TARGETARCH=$(shell uname -m | sed s/x86_64/amd64/) koku-base
+
 
 docker-up: docker-build
 	$(DOCKER_COMPOSE) up -d --scale koku-worker=$(scale)
@@ -347,8 +350,15 @@ docker-up-no-build: docker-up-db
 # basic dev environment targets
 docker-up-min: docker-build docker-up-min-no-build
 
-docker-up-min-no-build: docker-up-db
-	$(DOCKER_COMPOSE) up -d --scale koku-worker=$(scale) redis koku-server masu-server koku-worker trino hive-metastore
+docker-up-min-no-build: docker-host-dir-setup docker-up-db
+	$(DOCKER_COMPOSE) up -d --scale koku-worker=$(scale) koku-server masu-server koku-worker trino hive-metastore
+
+# basic dev environment targets
+docker-up-min-with-subs: docker-up-min
+	$(DOCKER_COMPOSE) up -d --scale subs-worker=$(scale) subs-worker
+
+docker-up-min-no-build-with-subs: docker-up-min-no-build
+	$(DOCKER_COMPOSE) up -d --scale subs-worker=$(scale) subs-worker
 
 # basic dev environment targets with koku-listener for local Sources Kafka testing
 docker-up-min-with-listener: docker-up-min
@@ -359,12 +369,8 @@ docker-up-min-no-build-with-listener: docker-up-min-no-build
 
 docker-up-db:
 	$(DOCKER_COMPOSE) up -d db
-	@until pg_isready -h $${POSTGRES_SQL_SERVICE_HOST:-localhost} -p $${POSTGRES_SQL_SERVICE_PORT:-15432} >/dev/null ; do \
-	    printf '.'; \
-	    sleep 0.5 ; \
-    done
-	@echo ' PostgreSQL is available!'
 	$(DOCKER_COMPOSE) up -d unleash
+	$(PYTHON) dev/scripts/setup_unleash.py
 
 docker-up-db-monitor:
 	$(DOCKER_COMPOSE) up --build -d grafana
@@ -374,24 +380,28 @@ _set-test-dir-permissions:
 	@$(PREFIX) chmod -R o+rw,g+rw ./testing
 	@$(PREFIX) find ./testing -type d -exec chmod o+x,g+x {} \;
 
-docker-iqe-local-hccm: docker-reinitdb _set-test-dir-permissions clear-testing
+docker-iqe-local-hccm: docker-reinitdb _set-test-dir-permissions delete-testing
 	./testing/run_local_hccm.sh $(iqe_cmd)
 
-docker-iqe-smoke-tests: docker-reinitdb _set-test-dir-permissions clear-testing
+docker-iqe-smoke-tests: docker-reinitdb _set-test-dir-permissions delete-testing
 	./testing/run_smoke_tests.sh
 
 docker-iqe-smoke-tests-trino:
 	./testing/run_smoke_tests.sh
 
-docker-iqe-api-tests: docker-reinitdb _set-test-dir-permissions clear-testing
+docker-iqe-api-tests: docker-reinitdb _set-test-dir-permissions delete-testing
 	./testing/run_api_tests.sh
 
-docker-iqe-vortex-tests: docker-reinitdb _set-test-dir-permissions clear-testing
+docker-iqe-vortex-tests: docker-reinitdb _set-test-dir-permissions delete-testing
 	./testing/run_vortex_api_tests.sh
 
-docker-trino-setup: clear-trino
-	mkdir -p -m a+rwx ./.trino
-	@[[ ! -d ./.trino/parquet_data ]] && mkdir -p -m a+rwx ./.trino/parquet_data || chmod a+rwx ./.trino/parquet_data
+CONTAINER_DIRS = $(TOPDIR)/dev/containers/postgresql/data $(TOPDIR)/dev/containers/minio $(TOPDIR)/dev/containers/trino/{data,logs}
+docker-host-dir-setup:
+	@mkdir -p -m 0755 $(CONTAINER_DIRS) 2>&1 > /dev/null
+	@chown $(USER_ID):$(GROUP_ID) $(CONTAINER_DIRS)
+	@chmod 0755 $(CONTAINER_DIRS)
+
+docker-trino-setup: delete-trino docker-host-dir-setup
 
 docker-trino-up: docker-trino-setup
 	$(DOCKER_COMPOSE) up --build -d trino hive-metastore
@@ -404,7 +414,7 @@ docker-trino-ps:
 
 docker-trino-down:
 	$(DOCKER_COMPOSE) down -v --remove-orphans
-	make clear-trino
+	$(MAKE) delete-trino
 
 docker-trino-down-all: docker-trino-down docker-down
 
@@ -452,26 +462,6 @@ endif
 	(printenv GCP_PROJECT_ID > /dev/null 2>&1) || (echo 'GCP_PROJECT_ID is not set in .env' && exit 1)
 	curl -d '{"name": "$(gcp_name)", "source_type": "GCP", "authentication": {"credentials": {"project_id":"${GCP_PROJECT_ID}"}}, "billing_source": {"data_source": {"table_id": "${GCP_TABLE_ID}", "dataset": "${GCP_DATASET}"}}}' -H "Content-Type: application/json" -X POST http://0.0.0.0:8000/api/cost-management/v1/sources/
 
-oci-source:
-ifndef oci_name
-	$(error param oci_name is not set)
-endif
-ifndef bucket
-	$(error param bucket is not set)
-endif
-ifndef namespace
-	$(error param namespace is not set)
-endif
-ifndef region
-	$(error param region is not set)
-endif
-# Required environment variables: [OCI_CLI_USER, OCI_CLI_KEY_FILE, OCI_CLI_FINGERPRINT, OCI_CLI_TENANCY]
-	(printenv OCI_CLI_USER > /dev/null 2>&1) || (echo 'OCI_CLI_USER is not set in .env' && exit 1)
-	(printenv OCI_CLI_KEY_FILE > /dev/null 2>&1) || (echo 'OCI_CLI_KEY_FILE is not set in .env' && exit 1)
-	(printenv OCI_CLI_FINGERPRINT > /dev/null 2>&1) || (echo 'OCI_CLI_FINGERPRINT is not set in .env' && exit 1)
-	(printenv OCI_CLI_TENANCY > /dev/null 2>&1) || (echo 'OCI_CLI_TENANCY is not set in .env' && exit 1)
-	curl -d '{"name": "$(oci_name)", "source_type": "OCI", "authentication": {"credentials": []}, "billing_source": {"data_source": {"bucket": "$(bucket)", "bucket_namespace": "$(namespace)", "bucket_region": "$(region)"}}}' -H "Content-Type: application/json" -X POST http://0.0.0.0:8000/api/cost-management/v1/sources/
-
 
 ###################################################
 #  This section is for larger data volume testing
@@ -492,10 +482,10 @@ create-large-ocp-source-testing-files:
 ifndef nise_config_dir
 	$(error param nise_config_dir is not set)
 endif
-	make purge-large-testing-ocp-files
+	$(MAKE) purge-large-testing-ocp-files
 	@for FILE in $(foreach f, $(wildcard $(nise_config_dir)/*.yml), $(f)) ; \
     do \
-        make ocp-source-from-yaml cluster_id=large_ocp_1 srf_yaml=$$FILE ocp_name=large_ocp_1 ; \
+        $(MAKE) ocp-source-from-yaml cluster_id=large_ocp_1 srf_yaml=$$FILE ocp_name=large_ocp_1 ; \
 	done
 
 import-large-ocp-source-testing-costmodel:
@@ -513,9 +503,9 @@ large-ocp-source-testing:
 ifndef nise_config_dir
 	$(error param nise_config_dir is not set)
 endif
-	make create-large-ocp-source-testing-files nise_config_dir="$(nise_config_dir)"
-	make import-large-ocp-source-testing-costmodel
-	make import-large-ocp-source-testing-data
+	$(MAKE) create-large-ocp-source-testing-files nise_config_dir="$(nise_config_dir)"
+	$(MAKE) import-large-ocp-source-testing-costmodel
+	$(MAKE) import-large-ocp-source-testing-data
 
 # Delete the testing large ocp source local files
 purge-large-testing-ocp-files:
@@ -569,7 +559,7 @@ backup-local-db-dir:
 	$(DOCKER_COMPOSE) stop db
 	@cd $(TOPDIR)
 	@echo "Copying pg_data to pg_data.bak..."
-	@$(PREFIX) cp -rp ./pg_data ./pg_data.bak
+	@$(PREFIX) cp -rp ./dev/containers/postgresql/data ./dev/containers/postgresql/data.bak
 	@cd - >/dev/null
 	$(DOCKER_COMPOSE) start db
 
@@ -582,15 +572,23 @@ local-upload-data:
 
 restore-local-db-dir:
 	@cd $(TOPDIR)
-	@if [ -d ./pg_data.bak ] ; then \
+	@if [ -d ./dev/containers/postgresql/data.bak ] ; then \
 	    $(DOCKER_COMPOSE) stop db ; \
 	    echo "Removing pg_data..." ; \
-	    $(PREFIX) rm -rf ./pg_data ; \
+	    $(PREFIX) rm -rf ./dev/containers/postgresql/data ; \
 	    echo "Renaming pg_data.bak to pg_data..." ; \
-	    $(PREFIX) mv -f ./pg_data.bak ./pg_data ; \
+	    $(PREFIX) mv -f ./dev/containers/postgresql/data.bak ./dev/containers/postgresql/data ; \
 	    $(DOCKER_COMPOSE) start db ; \
 	    echo "NOTE :: Migrations may need to be run." ; \
 	else \
 	    echo "NOTE :: There is no pg_data.bak dir to restore from." ; \
 	fi
 	@cd - >/dev/null
+
+
+get-release-commit:
+	@$(PYTHON) $(SCRIPTDIR)/get-release-commit.py
+
+.PHONY: scan-project
+scan-project:
+	@$(PYTHON) $(SCRIPTDIR)/snyk-scan.py $(path)

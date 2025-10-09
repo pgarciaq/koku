@@ -1,14 +1,15 @@
 import json
 import logging
 from json.decoder import JSONDecodeError
+from uuid import uuid4
 
 import ciso8601
 import pandas as pd
 
-from masu.util.common import create_enabled_keys
+from api.models import Provider
+from masu.util.common import populate_enabled_tag_rows_with_false
 from masu.util.common import safe_float
 from masu.util.common import strip_characters_from_column_name
-from reporting.provider.gcp.models import GCPEnabledTagKeys
 
 LOG = logging.getLogger(__name__)
 
@@ -34,21 +35,30 @@ def process_gcp_labels(label_string):
     return json.dumps(label_dict)
 
 
-def process_gcp_credits(credit_string):
-    """Process the credits column, which is non-standard JSON."""
+def process_gcp_credits(credit_string: str) -> str:
+    """Process the credits column
+
+    This should be a valid JSON string that can be deserialized.
+
+    """
     credit_dict = {}
+    gcp_credits = None
     try:
-        gcp_credits = json.loads(credit_string.replace("'", '"').replace("None", '"None"'))
-        if gcp_credits:
-            credit_dict = gcp_credits[0]
+        gcp_credits = json.loads(credit_string)
     except JSONDecodeError:
-        LOG.warning("Unable to process GCP credits.")
+        # Fall back in case the string is a struct and not valid JSON
+        try:
+            gcp_credits = json.loads(credit_string.replace("'", '"').replace("None", '"None"'))
+        except JSONDecodeError as err:
+            LOG.warning(f"Unable to process GCP credits: {err}")
+
+    if gcp_credits:
+        credit_dict = gcp_credits[0]
 
     return json.dumps(credit_dict)
 
 
 class GCPPostProcessor:
-
     INGRESS_REQUIRED_COLUMNS = {
         "billing_account_id",
         "service.id",
@@ -114,30 +124,21 @@ class GCPPostProcessor:
         csv_converters.update({col: str for col in col_names if col not in csv_converters})
         return csv_converters, panda_kwargs
 
-    def _generate_daily_data(self, data_frame):
+    def _generate_daily_data(self, df: pd.DataFrame) -> pd.DataFrame:
         """
         Generate daily data.
         """
         """Given a dataframe, return the data frame if its empty, group the data to create daily data."""
-        if data_frame.empty:
-            return data_frame
+        if df.empty:
+            return df
 
         # this parses the credits column into just the dollar amount so we can sum it up for daily rollups
-        rollup_frame = data_frame.copy()
-        rollup_frame["credits"] = rollup_frame["credits"].apply(json.loads)
-        rollup_frame["daily_credits"] = 0.0
-        for i, credit_dict in enumerate(rollup_frame["credits"]):
-            rollup_frame["daily_credits"][i] = credit_dict.get("amount", 0.0)
-        resource_df = rollup_frame.get("resource_name")
-        try:
-            if not resource_df:
-                rollup_frame["resource_name"] = ""
-                rollup_frame["resource_global_name"] = ""
-        except Exception:
-            if not resource_df.any():
-                rollup_frame["resource_name"] = ""
-                rollup_frame["resource_global_name"] = ""
-        daily_data_frame = rollup_frame.groupby(
+        daily_df = df.copy()
+        daily_df["daily_credits"] = daily_df["credits"].apply(lambda x: json.loads(x).get("amount") or 0.0)
+        if "resource_name" not in daily_df.columns:
+            daily_df["resource_name"] = ""
+            daily_df["resource_global_name"] = ""
+        daily_df = daily_df.groupby(
             [
                 "invoice_month",
                 "billing_account_id",
@@ -165,13 +166,15 @@ class GCPPostProcessor:
                 "resource_global_name": ["max"],
             }
         )
-        columns = daily_data_frame.columns.droplevel(1)
-        daily_data_frame.columns = columns
-        daily_data_frame.reset_index(inplace=True)
+        columns = daily_df.columns.droplevel(1)
+        daily_df.columns = columns
+        daily_df = daily_df.reset_index()
 
-        return daily_data_frame
+        # Add a unique identifer that we can use for deduplicating
+        daily_df["row_uuid"] = daily_df.apply(lambda _: str(uuid4()), axis=1)
+        return daily_df
 
-    def process_dataframe(self, data_frame):
+    def process_dataframe(self, data_frame, filename=None):
         """Guarantee column order for GCP parquet files"""
         columns = list(data_frame)
         column_name_map = {}
@@ -191,4 +194,4 @@ class GCPPostProcessor:
         """
         Uses information gather in the post processing to update the cost models.
         """
-        create_enabled_keys(self.schema, GCPEnabledTagKeys, self.enabled_tag_keys)
+        populate_enabled_tag_rows_with_false(self.schema, self.enabled_tag_keys, Provider.PROVIDER_GCP)

@@ -23,6 +23,14 @@ class StandardResultsSetPagination(LimitOffsetPagination):
     default_limit = 10
     max_limit = 1000
 
+    @property
+    def _default_meta(self) -> dict[str, int]:
+        return {
+            "count": self.count,
+            "limit": self.limit,
+            "offset": self.offset,
+        }
+
     @staticmethod
     def link_rewrite(request, link):
         """Rewrite the link based on the path header to only provide partial url."""
@@ -73,7 +81,7 @@ class StandardResultsSetPagination(LimitOffsetPagination):
         """Override pagination output."""
         return Response(
             {
-                "meta": {"count": self.count},
+                "meta": self._default_meta,
                 "links": {
                     "first": self.get_first_link(),
                     "next": self.get_next_link(),
@@ -131,6 +139,12 @@ class ReportPagination(StandardResultsSetPagination):
             return int(request.query_params.get(self.limit_query_param))
         return None
 
+    def get_paginated_data(self, queryset):
+        """Shared logic for paginating the data list."""
+        if self.limit:
+            return queryset.get("data", [])[self.offset : self.offset + self.limit]
+        return queryset.get("data", [])
+
     def paginate_queryset(self, queryset, request, view=None):
         """Override queryset pagination."""
         self.count = self.get_count(queryset)
@@ -149,12 +163,7 @@ class ReportPagination(StandardResultsSetPagination):
             queryset["data"] = []
             return queryset
 
-        if self.limit:
-            query_data = queryset.get("data", [])[self.offset : self.offset + self.limit]  # noqa
-        else:
-            query_data = queryset.get("data", [])
-
-        queryset["data"] = query_data
+        queryset["data"] = self.get_paginated_data(queryset)
 
         return queryset
 
@@ -162,7 +171,7 @@ class ReportPagination(StandardResultsSetPagination):
         """Override pagination output."""
         paginated_data = data.pop("data", [])
         filter_limit = data.get("filter", {}).get("limit", 0)
-        meta = {"count": self.count}
+        meta = self._default_meta
         if self.others:
             others = 0
             if self.others > filter_limit:
@@ -187,13 +196,7 @@ class ForecastListPaginator(ListPaginator):
 
     default_limit = DateHelper().this_month_end.day
 
-
-class AWSForecastListPaginator(ListPaginator):
-    """A paginator that applies a default limit based on days in month."""
-
-    default_limit = DateHelper().this_month_end.day
-
-    def __init__(self, data_set, request, cost_type):
+    def __init__(self, data_set, request, cost_type=None):
         """Initialize the paginator."""
         self.cost_type = cost_type
         self.data_set = data_set
@@ -204,21 +207,12 @@ class AWSForecastListPaginator(ListPaginator):
 
     def get_paginated_response(self, data):
         """Override pagination output."""
-        meta = {"count": self.count}
+        response = super().get_paginated_response(data)
+
         if self.cost_type:
-            meta["cost_type"] = self.cost_type
-        return Response(
-            {
-                "meta": meta,
-                "links": {
-                    "first": self.get_first_link(),
-                    "next": self.get_next_link(),
-                    "previous": self.get_previous_link(),
-                    "last": self.get_last_link(),
-                },
-                "data": data,
-            }
-        )
+            response.data["meta"]["cost_type"] = self.cost_type
+
+        return response
 
 
 class ReportRankedPagination(ReportPagination):
@@ -302,3 +296,47 @@ class EmptyResultsSetPagination(StandardResultsSetPagination):
                 "data": self.data_set,
             }
         )
+
+
+class MonthlyPagination(ReportPagination):
+    """Paginator for monthly grouped report data."""
+
+    def __init__(self, pagination_key):
+        self.pagination_key = pagination_key
+
+    def get_count(self, queryset):
+        """Count resources for the pagination key"""
+        return len(queryset.get("data", [{}])[0].get(self.pagination_key, []))
+
+    def get_paginated_data(self, queryset):
+        """
+        Paginate monthly views based on the request type.
+
+        Args:
+        queryset (dict): The data containing pagination key to be paginated.
+
+        Returns:
+        paginated_data (list): If the request expects CSV data, returns a slice of pagination key.
+                                Otherwise, list containing a single dictionary with paginated key.
+        """
+        paginated_data = []
+
+        data = (
+            queryset_data[0] if (queryset_data := queryset.get("data", [])) else {}
+        )  # only single month data expected
+        resource_ids = data.get(self.pagination_key, [])
+        resource_count = len(resource_ids)
+
+        if self.offset < resource_count:
+            # paginate resource IDs from current_offset to the limit
+            # limit=0 param is a special case that returns all data
+            paginated_ids = resource_ids if self.limit == 0 else resource_ids[self.offset : self.offset + self.limit]
+
+            if self.request.accepted_media_type and "text/csv" in self.request.accepted_media_type:
+                paginated_data = paginated_ids
+            else:
+                paginated_item = data.copy()
+                paginated_item[self.pagination_key] = paginated_ids
+                paginated_data.append(paginated_item)
+
+        return paginated_data

@@ -15,6 +15,7 @@ from django.db.models.expressions import ExpressionWrapper
 from django.db.models.functions import Coalesce
 
 from api.models import Provider
+from api.report.gcp.filter_collection import gcp_storage_conditional_filter_collection
 from api.report.provider_map import ProviderMap
 from reporting.provider.gcp.models import GCPComputeSummaryByAccountP
 from reporting.provider.gcp.models import GCPComputeSummaryP
@@ -36,7 +37,7 @@ from reporting.provider.gcp.models import GCPStorageSummaryP
 class GCPProviderMap(ProviderMap):
     """GCP Provider Map."""
 
-    def __init__(self, provider, report_type):
+    def __init__(self, provider, report_type, schema_name):
         """Constructor."""
         # group_by_annotations, filters, group_by_options, self.views
         self._mapping = [
@@ -435,13 +436,7 @@ class GCPProviderMap(ProviderMap):
                         "filter": [{"field": "unit", "operation": "exact", "parameter": "gibibyte month"}],
                         "conditionals": {
                             GCPCostEntryLineItemDailySummary: {
-                                "filter": [
-                                    {
-                                        "field": "service_alias",
-                                        "operation": "in",
-                                        "parameter": ["Filestore", "Data Transfer", "Storage", "Cloud Storage"],
-                                    },
-                                ],
+                                "filter_collection": gcp_storage_conditional_filter_collection(schema_name),
                             },
                         },
                         "cost_units_key": "currency",
@@ -497,4 +492,4 @@ class GCPProviderMap(ProviderMap):
         # way we could filter off of invoice month instead of usage dates for
         # monthly time scope values.
         self.gcp_filters = True
-        super().__init__(provider, report_type)
+        super().__init__(provider, report_type, schema_name)

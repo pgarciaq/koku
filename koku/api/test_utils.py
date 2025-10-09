@@ -16,7 +16,7 @@ from django.utils import timezone
 from django_tenants.utils import schema_context
 
 from api.iam.test.iam_test_case import IamTestCase
-from api.user_settings.settings import USER_SETTINGS
+from api.settings.settings import USER_SETTINGS
 from api.utils import DateHelper
 from api.utils import get_account_settings
 from api.utils import get_cost_type
@@ -24,6 +24,7 @@ from api.utils import get_currency
 from api.utils import get_months_in_date_range
 from api.utils import materialized_view_month_start
 from api.utils import merge_dicts
+from api.utils import to_date
 from koku.settings import KOKU_DEFAULT_COST_TYPE
 from koku.settings import KOKU_DEFAULT_CURRENCY
 from masu.config import Config
@@ -171,7 +172,7 @@ class DateHelperTest(TestCase):
 
     def test_list_days(self):
         """Test the list_days method."""
-        first = datetime.datetime.now().replace(microsecond=0, second=0, minute=0, hour=0, day=1)
+        first = datetime.datetime.now().date().replace(day=1)
         second = first.replace(day=2)
         third = first.replace(day=3)
         expected = [first, second, third]
@@ -191,6 +192,19 @@ class DateHelperTest(TestCase):
         today = timezone.now().replace(microsecond=0, second=0, minute=0, hour=0)
         two_days_ago = (today - delta_day) - delta_day
         self.assertEqual(self.date_helper.n_days_ago(today, 2), two_days_ago)
+
+    def test_set_datetime_utc(self):
+        """Test set_datetime_utc."""
+        # Test with datetime
+        start_date = datetime.datetime(2024, 7, 5, 0, 0, 0, 0)
+        expected_date = start_date
+        # self.assertEqual(self.date_helper.set_datetime_utc(start_date), expected_date)
+
+        # Test with date
+        self.assertEqual(self.date_helper.set_datetime_utc(start_date.date()), expected_date)
+
+        # Test with str
+        self.assertEqual(self.date_helper.set_datetime_utc("2024-07-05"), expected_date)
 
     def test_month_start(self):
         """Test month start method."""
@@ -220,6 +234,19 @@ class DateHelperTest(TestCase):
         expected = datetime.date(1970, 1, 31)
         self.assertEqual(self.date_helper.month_end(today_str), expected)
 
+    def test_parse_to_date(self):
+        """test datetime.date returned from given objects"""
+        today = self.date_helper.today
+        expected = datetime.date(1970, 1, 10)
+        self.assertEqual(self.date_helper.parse_to_date(today), expected)
+
+        today = self.date_helper.today.date()
+        self.assertEqual(self.date_helper.parse_to_date(today), expected)
+
+        today = self.date_helper.today
+        today_str = today.strftime("%Y-%m-%d")
+        self.assertEqual(self.date_helper.parse_to_date(today_str), expected)
+
     def test_midnight(self):
         """Test midnight property."""
         expected = datetime.time(0, 0, 0, 0)
@@ -227,7 +254,7 @@ class DateHelperTest(TestCase):
 
     def test_list_days_params_as_strings(self):
         """Test the list_days method."""
-        first = datetime.datetime.now().replace(microsecond=0, second=0, minute=0, hour=0, day=1)
+        first = datetime.datetime.now().date().replace(day=1)
         second = first.replace(day=2)
         third = first.replace(day=3)
         expected = [first, second, third]
@@ -239,6 +266,60 @@ class DateHelperTest(TestCase):
         bill_date_str = "2022-08-01"
         result_invoice_month = self.date_helper.invoice_month_from_bill_date(bill_date_str)
         self.assertEqual(str(result_invoice_month), "202208")
+
+    def test_list_month_tuples_single_month(self):
+        """Test list_month_tuples with dates within the same month."""
+        start = datetime.datetime(2023, 5, 15, 10, 30)
+        end = datetime.datetime(2023, 5, 20, 14, 45)
+        expected = [(datetime.date(2023, 5, 15), datetime.date(2023, 5, 20))]
+        result = self.date_helper.list_month_tuples(start, end)
+        self.assertEqual(result, expected)
+
+    def test_list_month_tuples_multiple_months(self):
+        """Test list_month_tuples spanning multiple months."""
+        start = datetime.datetime(2023, 4, 15, 10, 30)
+        end = datetime.datetime(2023, 6, 10, 14, 45)
+        result = self.date_helper.list_month_tuples(start, end)
+
+        self.assertEqual(len(result), 3)
+        # First month: use actual start date, end at month end
+        self.assertEqual(result[0][0], datetime.date(2023, 4, 15))
+        self.assertEqual(result[0][1], datetime.date(2023, 4, 30))
+        # Middle month: full month
+        self.assertEqual(result[1][0], datetime.date(2023, 5, 1))
+        self.assertEqual(result[1][1], datetime.date(2023, 5, 31))
+        # Last month: start at month beginning, end at actual end date
+        self.assertEqual(result[2][0], datetime.date(2023, 6, 1))
+        self.assertEqual(result[2][1], datetime.date(2023, 6, 10))
+
+    def test_list_month_tuples_full_months(self):
+        """Test list_month_tuples with exact month boundaries."""
+        start = datetime.datetime(2023, 4, 1, 0, 0, 0, 0)
+        end = datetime.datetime(2023, 6, 30, 0, 0, 0, 0)
+        result = self.date_helper.list_month_tuples(start, end)
+
+        self.assertEqual(len(result), 3)
+        expected = [
+            (datetime.date(2023, 4, 1), datetime.date(2023, 4, 30)),
+            (datetime.date(2023, 5, 1), datetime.date(2023, 5, 31)),
+            (datetime.date(2023, 6, 1), datetime.date(2023, 6, 30)),
+        ]
+        self.assertEqual(result, expected)
+
+    def test_list_month_tuples_empty_range(self):
+        """Test list_month_tuples with end date before start date."""
+        start = datetime.datetime(2023, 5, 20)
+        end = datetime.datetime(2023, 5, 10)
+        result = self.date_helper.list_month_tuples(start, end)
+        self.assertEqual(result, [])
+
+    def test_list_month_tuples_same_day(self):
+        """Test list_month_tuples with start and end on the same day."""
+        start = datetime.datetime(2023, 5, 15, 9, 0)
+        end = datetime.datetime(2023, 5, 15, 17, 0)
+        expected = [(datetime.date(2023, 5, 15), datetime.date(2023, 5, 15))]
+        result = self.date_helper.list_month_tuples(start, end)
+        self.assertEqual(result, expected)
 
 
 class GeneralUtilsTest(IamTestCase):
@@ -275,6 +356,154 @@ class GeneralUtilsTest(IamTestCase):
                 self.assertEqual(get_account_settings(self.request_context["request"]), settings)
 
 
+class ToDateTest(unittest.TestCase):
+    """Test the to_date util function."""
+
+    def test_to_date_with_none(self):
+        """Test to_date with None input returns None."""
+        result = to_date(None)
+        self.assertIsNone(result)
+
+    def test_to_date_with_string_iso_format(self):
+        """Test to_date with ISO format string."""
+        date_string = "2023-05-15T14:30:00+00:00"
+        result = to_date(date_string)
+
+        self.assertIsInstance(result, datetime.date)
+        self.assertEqual(result.year, 2023)
+        self.assertEqual(result.month, 5)
+        self.assertEqual(result.day, 15)
+
+    def test_to_date_with_string_simple_date(self):
+        """Test to_date with simple date string."""
+        date_string = "2023-05-15"
+        result = to_date(date_string)
+
+        self.assertIsInstance(result, datetime.date)
+        self.assertEqual(result.year, 2023)
+        self.assertEqual(result.month, 5)
+        self.assertEqual(result.day, 15)
+
+    def test_to_date_with_string_different_timezone(self):
+        """Test to_date with string in different timezone returns correct date."""
+        date_string = "2023-05-15T14:30:00-05:00"
+        result = to_date(date_string)
+
+        self.assertIsInstance(result, datetime.date)
+        self.assertEqual(result.year, 2023)
+        self.assertEqual(result.month, 5)
+        self.assertEqual(result.day, 15)
+
+    def test_to_date_with_timezone_aware_datetime(self):
+        """Test to_date with timezone-aware datetime object."""
+        import pytz
+
+        eastern = pytz.timezone("US/Eastern")
+        dt = datetime.datetime(2023, 5, 15, 14, 30, 0, tzinfo=eastern)
+        result = to_date(dt)
+
+        self.assertIsInstance(result, datetime.date)
+        self.assertEqual(result.year, 2023)
+        self.assertEqual(result.month, 5)
+        self.assertEqual(result.day, 15)
+
+    def test_to_date_with_timezone_naive_datetime(self):
+        """Test to_date with timezone-naive datetime object."""
+        dt = datetime.datetime(2023, 5, 15, 14, 30, 0)
+        result = to_date(dt)
+
+        self.assertIsInstance(result, datetime.date)
+        self.assertEqual(result.year, 2023)
+        self.assertEqual(result.month, 5)
+        self.assertEqual(result.day, 15)
+
+    def test_to_date_with_utc_datetime(self):
+        """Test to_date with UTC datetime object."""
+        dt = datetime.datetime(2023, 5, 15, 14, 30, 0, tzinfo=settings.UTC)
+        result = to_date(dt)
+
+        self.assertIsInstance(result, datetime.date)
+        self.assertEqual(result.year, 2023)
+        self.assertEqual(result.month, 5)
+        self.assertEqual(result.day, 15)
+
+    def test_to_date_with_invalid_string(self):
+        """Test to_date with invalid date string raises ValueError."""
+        with self.assertRaises(ValueError):
+            to_date("invalid-date-string")
+
+    def test_to_date_with_invalid_type(self):
+        """Test to_date with invalid type raises TypeError."""
+        with self.assertRaises(TypeError):
+            to_date(12345)
+
+        with self.assertRaises(TypeError):
+            to_date([])
+
+        with self.assertRaises(TypeError):
+            to_date({})
+
+        with self.assertRaises(TypeError):
+            to_date(123.45)
+
+    def test_to_date_with_date_object(self):
+        """Test to_date with date object returns the same date object."""
+        date_obj = datetime.date(2023, 5, 15)
+        result = to_date(date_obj)
+
+        self.assertIsInstance(result, datetime.date)
+        self.assertEqual(result, date_obj)
+        self.assertEqual(result.year, 2023)
+        self.assertEqual(result.month, 5)
+        self.assertEqual(result.day, 15)
+
+    def test_to_date_preserves_date_ignores_time(self):
+        """Test to_date ignores time components and only returns date."""
+        test_cases = [
+            (datetime.datetime(2023, 5, 15, 23, 59, 59), datetime.date(2023, 5, 15)),
+            (datetime.datetime(2023, 5, 15, 0, 0, 0), datetime.date(2023, 5, 15)),
+            (datetime.datetime(2023, 5, 15, 12, 30, 45), datetime.date(2023, 5, 15)),
+        ]
+
+        for dt_input, expected_date in test_cases:
+            with self.subTest(dt_input=dt_input):
+                result = to_date(dt_input)
+                self.assertEqual(result, expected_date)
+
+    def test_to_date_with_various_string_formats(self):
+        """Test to_date with various string formats."""
+        test_cases = [
+            "2023-05-15T14:30:00Z",
+            "2023-05-15 14:30:00",
+            "2023/05/15 14:30:00",
+            "May 15, 2023 2:30 PM",
+            "2023-05-15T14:30:00.123456Z",
+            "2023-05-15",
+            "05/15/2023",
+        ]
+
+        for date_string in test_cases:
+            with self.subTest(date_string=date_string):
+                result = to_date(date_string)
+                self.assertIsInstance(result, datetime.date)
+                self.assertEqual(result.year, 2023)
+                self.assertEqual(result.month, 5)
+                self.assertEqual(result.day, 15)
+
+    def test_to_date_with_edge_dates(self):
+        """Test to_date with edge case dates like leap years and year boundaries."""
+        test_cases = [
+            ("2024-02-29", datetime.date(2024, 2, 29)),  # Leap year
+            ("2023-12-31", datetime.date(2023, 12, 31)),  # End of year
+            ("2024-01-01", datetime.date(2024, 1, 1)),  # Start of year
+        ]
+
+        for date_string, expected_date in test_cases:
+            with self.subTest(date_string=date_string):
+                result = to_date(date_string)
+                self.assertEqual(result, expected_date)
+
+
 class GetMonthsInDateRangeTest(unittest.TestCase):
     """Test the get_months_in_date_range util."""
 
@@ -294,17 +523,21 @@ class GetMonthsInDateRangeTest(unittest.TestCase):
         """Test that calling get_months_in_date_range with report only returns list of month tuples"""
 
         mock_dh_today.return_value = self.start_date
-        expected_start = self.start_date.strftime("%Y-%m-%d")
-        expected_end = self.end_date.strftime("%Y-%m-%d")
+        expected_start = self.start_date
+        expected_end = self.end_date
         test_report = {
             "schema": "org1234567",
             "start": expected_start,
             "end": expected_end,
             "provider_uuid": "f3da28f7-00c7-43ba-a1de-f0be0b9d6060",
         }
-        expected_months = [(expected_start, expected_end, None)]
+        expected_months = [(expected_start.date(), expected_end.date())]
 
-        returned_months = get_months_in_date_range(test_report)
+        returned_months = get_months_in_date_range(
+            start=test_report.get("start"),
+            end=test_report.get("end"),
+            report=True,
+        )
 
         mock_dh_today.assert_called()
         self.assertEqual(returned_months, expected_months)
@@ -322,11 +555,15 @@ class GetMonthsInDateRangeTest(unittest.TestCase):
             "schema": "org1234567",
             "provider_uuid": "f3da28f7-00c7-43ba-a1de-f0be0b9d6060",
         }
-        expected_start = (self.start_date - datetime.timedelta(days=2)).strftime("%Y-%m-%d")
-        expected_end = self.start_date.strftime("%Y-%m-%d")
-        expected_months = [(expected_start, expected_end, None)]
+        expected_start = self.start_date - datetime.timedelta(days=2)
+        expected_end = self.start_date
+        expected_months = [(expected_start.date(), expected_end.date())]
 
-        returned_months = get_months_in_date_range(test_report)
+        returned_months = get_months_in_date_range(
+            start=test_report.get("start"),
+            end=test_report.get("end"),
+            report=True,
+        )
 
         mock_dh_today.assert_called()
         self.assertEqual(returned_months, expected_months)
@@ -344,14 +581,14 @@ class GetMonthsInDateRangeTest(unittest.TestCase):
             "schema": "org1234567",
             "provider_uuid": "f3da28f7-00c7-43ba-a1de-f0be0b9d6060",
         }
-        _start_date_1 = self.first_of_year - datetime.timedelta(days=2)
-        expected_start_1 = _start_date_1.strftime("%Y-%m-%d")
-        _end_date_1 = _start_date_1 + relativedelta(day=31)
-        expected_end_1 = _end_date_1.date().strftime("%Y-%m-%d")
-        expected_date_2 = self.first_of_year.strftime("%Y-%m-%d")
-        expected_months = [(expected_start_1, expected_end_1, None), (expected_date_2, expected_date_2, None)]
+        expected_date_2 = self.first_of_year
+        expected_months = [(expected_date_2.date(), expected_date_2.date())]
 
-        returned_months = get_months_in_date_range(test_report)
+        returned_months = get_months_in_date_range(
+            start=test_report.get("start"),
+            end=test_report.get("end"),
+            report=True,
+        )
 
         mock_dh_today.assert_called()
         self.assertEqual(returned_months, expected_months)
@@ -363,63 +600,22 @@ class GetMonthsInDateRangeTest(unittest.TestCase):
         with a report missing start, end or both dates
         returns list of month tuples during first of a month
         """
-
-        mock_dh_today.return_value = self.first_of_month
+        end_date = self.first_of_month.replace(day=3)
+        mock_dh_today.return_value = end_date
         test_report = {
             "schema": "org1234567",
             "provider_uuid": "f3da28f7-00c7-43ba-a1de-f0be0b9d6060",
         }
-        _start_date_1 = self.first_of_month - datetime.timedelta(days=2)
-        expected_start_1 = _start_date_1.strftime("%Y-%m-%d")
-        _end_date_1 = _start_date_1 + relativedelta(day=31)
-        expected_end_1 = _end_date_1.date().strftime("%Y-%m-%d")
-        expected_date_2 = self.first_of_month.strftime("%Y-%m-%d")
-        expected_months = [(expected_start_1, expected_end_1, None), (expected_date_2, expected_date_2, None)]
-
-        returned_months = get_months_in_date_range(test_report)
-
-        mock_dh_today.assert_called()
-        self.assertEqual(returned_months, expected_months)
-
-    @patch("api.utils.DateHelper.today", new_callable=PropertyMock)
-    def test_get_months_in_date_range__start_invoice_month_only(self, mock_dh_today):
-        """
-        Test that calling get_months_in_date_range
-        with invoice_month and start_date only
-        returns list of month tuples.
-        """
-
-        mock_dh_today.return_value = self.start_date
-        invoice_month = self.start_date.strftime("%Y%m")
-        expected_date = self.start_date.strftime("%Y-%m-%d")
-        expected_months = [(expected_date, expected_date, invoice_month)]
+        expected_date = self.first_of_month
+        expected_months = [(expected_date.date(), end_date.date())]
 
         returned_months = get_months_in_date_range(
-            report=None, start=expected_date, end=None, invoice_month=invoice_month
+            start=test_report.get("start"),
+            end=test_report.get("end"),
+            report=True,
         )
 
         mock_dh_today.assert_called()
-        self.assertEqual(returned_months, expected_months)
-
-    def test_get_months_in_date_range__start_end_invoice_month(self):
-        """
-        Test that calling get_months_in_date_range
-        with start and end dates, and invoice_month only
-        returns list of month tuples.
-        """
-
-        invoice_month = self.start_date.strftime("%Y%m")
-        expected_start = self.start_date.strftime("%Y-%m-%d")
-        expected_end = self.end_date.strftime("%Y-%m-%d")
-        expected_months = [(expected_start, expected_end, invoice_month)]
-
-        returned_months = get_months_in_date_range(
-            report=None,
-            start=expected_start,
-            end=expected_end,
-            invoice_month=invoice_month,
-        )
-
         self.assertEqual(returned_months, expected_months)
 
     @patch("api.utils.DateHelper.today", new_callable=PropertyMock)
@@ -431,11 +627,14 @@ class GetMonthsInDateRangeTest(unittest.TestCase):
         """
 
         mock_dh_today.return_value = self.start_date
-        expected_start = self.start_date.strftime("%Y-%m-%d")
-        expected_end = self.end_date.strftime("%Y-%m-%d")
-        expected_months = [(expected_start, expected_end, None)]
+        expected_start = self.start_date
+        expected_end = self.end_date
+        expected_months = [(expected_start.date(), expected_end.date())]
 
-        returned_months = get_months_in_date_range(report=None, start=expected_start, end=expected_end)
+        returned_months = get_months_in_date_range(
+            start=expected_start.strftime("%Y-%m-%d"),
+            end=expected_end.strftime("%Y-%m-%d"),
+        )
 
         mock_dh_today.assert_called()
         self.assertEqual(returned_months, expected_months)
@@ -451,13 +650,11 @@ class GetMonthsInDateRangeTest(unittest.TestCase):
         initial_month_qty = Config.INITIAL_INGEST_NUM_MONTHS
         Config.INITIAL_INGEST_NUM_MONTHS = 0
         mock_dh_today.return_value = self.start_date
-        expected_start = self.start_date.strftime("%Y-%m-01")
-        expected_end = self.end_date.strftime("%Y-%m-%d")
-        expected_months = [(expected_start, expected_end, None)]
+        expected_start = self.start_date.replace(day=1)
+        expected_end = self.end_date
+        expected_months = [(expected_start.date(), expected_end.date())]
 
-        returned_months = get_months_in_date_range(
-            report=None, start=self.early_start_date.strftime("%Y-%m-%d"), end=self.end_date.strftime("%Y-%m-%d")
-        )
+        returned_months = get_months_in_date_range(start=self.early_start_date.strftime("%Y-%m-%d"), end=self.end_date)
 
         Config.INITIAL_INGEST_NUM_MONTHS = initial_month_qty
 
@@ -475,12 +672,12 @@ class GetMonthsInDateRangeTest(unittest.TestCase):
         initial_month_qty = Config.INITIAL_INGEST_NUM_MONTHS
         Config.INITIAL_INGEST_NUM_MONTHS = 0
         mock_dh_today.return_value = self.start_date
-        expected_start = self.start_date.strftime("%Y-%m-01")
-        expected_end = self.start_date.strftime("%Y-%m-%d")
-        expected_months = [(expected_start, expected_end, None)]
+        expected_start = self.start_date.replace(day=1)
+        expected_end = self.start_date
+        expected_months = [(expected_start.date(), expected_end.date())]
 
         returned_months = get_months_in_date_range(
-            report=None, start=self.early_start_date.strftime("%Y-%m-%d"), end=self.early_end_date.strftime("%Y-%m-%d")
+            start=self.early_start_date.strftime("%Y-%m-%d"), end=self.early_end_date.strftime("%Y-%m-%d")
         )
 
         Config.INITIAL_INGEST_NUM_MONTHS = initial_month_qty

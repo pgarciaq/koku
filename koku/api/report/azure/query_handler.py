@@ -9,6 +9,7 @@ from django.db.models import ExpressionWrapper
 from django.db.models import F
 from django.db.models import Value
 from django.db.models.fields import CharField
+from django.db.models.fields.json import KT
 from django.db.models.functions import Coalesce
 from django.db.models.functions import Concat
 from django_tenants.utils import tenant_context
@@ -44,7 +45,9 @@ class AzureReportQueryHandler(ReportQueryHandler):
         try:
             getattr(self, "_mapper")
         except AttributeError:
-            self._mapper = AzureProviderMap(provider=self.provider, report_type=parameters.report_type)
+            self._mapper = AzureProviderMap(
+                provider=self.provider, report_type=parameters.report_type, schema_name=parameters.tenant.schema_name
+            )
 
         self.group_by_options = self._mapper.provider_map.get("group_by_options")
         self._limit = parameters.get_filter("limit")
@@ -77,6 +80,10 @@ class AzureReportQueryHandler(ReportQueryHandler):
         fields = self._mapper.provider_map.get("annotations")
         for q_param, db_field in fields.items():
             annotations[q_param] = Concat(db_field, Value(""))
+
+        for tag_db_name, _, original_tag in self._tag_group_by:
+            annotations[tag_db_name] = KT(f"{self._mapper.tag_column}__{original_tag}")
+
         return annotations
 
     def _format_query_response(self):
@@ -150,6 +157,15 @@ class AzureReportQueryHandler(ReportQueryHandler):
             annotations = self._mapper.report_type_map.get("annotations")
             query_data = query.values(*query_group_by).annotate(**annotations)
             query_sum = self._build_sum(query)
+
+            if (
+                "subscription_guid" in query_group_by
+                and "subscription_name" not in query_order_by
+                and "-subscription_name" not in query_order_by
+            ):
+                query_data = query_data.annotate(
+                    subscription_name=Coalesce(F(self._mapper.provider_map.get("alias")), "subscription_guid")
+                )
 
             if self._limit and query_data:
                 query_data = self._group_by_ranks(query, query_data)

@@ -3,7 +3,6 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 """Database accessor for GCP report data."""
-import datetime
 import json
 import logging
 import pkgutil
@@ -11,25 +10,29 @@ import uuid
 from os import path
 
 from dateutil.parser import parse
-from dateutil.relativedelta import relativedelta
-from django.conf import settings
 from django.db import connection
 from django.db.models import F
+from django.db.models import Q
 from django_tenants.utils import schema_context
-from trino.exceptions import TrinoExternalError
 
 from api.common import log_json
+from api.provider.models import Provider
+from api.utils import DateHelper
 from koku.database import SQLScriptAtomicExecutorMixin
 from masu.database import GCP_REPORT_TABLE_MAP
 from masu.database import OCP_REPORT_TABLE_MAP
-from masu.database.koku_database_access import mini_transaction_delete
 from masu.database.report_db_accessor_base import ReportDBAccessorBase
-from masu.util.gcp.common import check_resource_level
-from masu.util.ocp.common import get_cluster_alias_from_cluster_id
+from masu.processor import GCP_UNATTRIBUTED_STORAGE_UNLEASH_FLAG
+from masu.processor import is_feature_flag_enabled_by_account
+from masu.processor import is_tag_processing_disabled
+from masu.processor.parquet.summary_sql_metadata import SummarySqlMetadata
+from reporting.provider.all.models import EnabledTagKeys
+from reporting.provider.all.models import TagMapping
 from reporting.provider.gcp.models import GCPCostEntryBill
 from reporting.provider.gcp.models import GCPCostEntryLineItemDailySummary
 from reporting.provider.gcp.models import GCPTopology
 from reporting.provider.gcp.models import TRINO_LINE_ITEM_TABLE
+from reporting.provider.gcp.models import TRINO_OCP_GCP_DAILY_SUMMARY_TABLE
 from reporting.provider.gcp.models import UI_SUMMARY_TABLES
 from reporting.provider.gcp.openshift.models import UI_SUMMARY_TABLES as OCPGCP_UI_SUMMARY_TABLES
 from reporting_common.models import CostUsageReportStatus
@@ -53,41 +56,29 @@ class GCPReportDBAccessor(SQLScriptAtomicExecutorMixin, ReportDBAccessorBase):
     def line_item_daily_summary_table(self):
         return GCPCostEntryLineItemDailySummary
 
-    def populate_ui_summary_tables(self, start_date, end_date, source_uuid, tables=UI_SUMMARY_TABLES):
+    def populate_ui_summary_tables(self, start_date, end_date, source_uuid, invoice_month, tables=UI_SUMMARY_TABLES):
         """Populate our UI summary tables (formerly materialized views)."""
-        invoice_month_list = self.date_helper.gcp_find_invoice_months_in_date_range(start_date, end_date)
-        for invoice_month in invoice_month_list:
-            for table_name in tables:
-                summary_sql = pkgutil.get_data("masu.database", f"sql/gcp/{table_name}.sql")
-                summary_sql = summary_sql.decode("utf-8")
-                # Extend the end date past the end of the month & add the invoice month
-                # in order to include cross over data.
-                extended_end_date = end_date + relativedelta(days=2)
-                summary_sql_params = {
-                    "start_date": start_date,
-                    "end_date": extended_end_date,
-                    "schema": self.schema,
-                    "source_uuid": source_uuid,
-                    "invoice_month": invoice_month,
-                }
-                summary_sql, summary_sql_params = self.jinja_sql.prepare_query(summary_sql, summary_sql_params)
-                self._execute_raw_sql_query(
-                    table_name,
-                    summary_sql,
-                    start_date,
-                    extended_end_date,
-                    bind_params=list(summary_sql_params),
-                    operation="DELETE/INSERT",
-                )
+        for table_name in tables:
+            sql = pkgutil.get_data("masu.database", f"sql/gcp/{table_name}.sql")
+            sql = sql.decode("utf-8")
+            sql_params = {
+                "start_date": start_date,
+                "end_date": end_date,
+                "schema": self.schema,
+                "source_uuid": source_uuid,
+                "invoice_month": invoice_month,
+            }
+
+            self._prepare_and_execute_raw_sql_query(table_name, sql, sql_params, operation="DELETE/INSERT")
 
     def get_cost_entry_bills_query_by_provider(self, provider_uuid):
         """Return all cost entry bills for the specified provider."""
-        table_name = GCPCostEntryBill
-        with schema_context(self.schema):
-            return self._get_db_obj_query(table_name).filter(provider_id=provider_uuid)
+        return GCPCostEntryBill.objects.filter(provider_id=provider_uuid)
 
-    def bills_for_provider_uuid(self, provider_uuid, start_date=None):
+    def bills_for_provider_uuid(self, provider_uuid, start_date=None, invoice_month=None):
         """Return all cost entry bills for provider_uuid on date."""
+        if invoice_month:
+            start_date = DateHelper().invoice_month_start(invoice_month).date()
         bills = self.get_cost_entry_bills_query_by_provider(provider_uuid)
         if start_date:
             if isinstance(start_date, str):
@@ -96,19 +87,12 @@ class GCPReportDBAccessor(SQLScriptAtomicExecutorMixin, ReportDBAccessorBase):
             bills = bills.filter(billing_period_start=bill_date)
         return bills
 
-    def get_bill_query_before_date(self, date, provider_uuid=None):
+    def get_bill_query_before_date(self, date):
         """Get the cost entry bill objects with billing period before provided date."""
-        table_name = GCPCostEntryBill
-        with schema_context(self.schema):
-            base_query = self._get_db_obj_query(table_name)
-            if provider_uuid:
-                cost_entry_bill_query = base_query.filter(billing_period_start__lte=date, provider_id=provider_uuid)
-            else:
-                cost_entry_bill_query = base_query.filter(billing_period_start__lte=date)
-            return cost_entry_bill_query
+        return GCPCostEntryBill.objects.filter(billing_period_start__lte=date)
 
     def populate_line_item_daily_summary_table_trino(
-        self, start_date, end_date, source_uuid, bill_id, markup_value, invoice_month_date
+        self, start_date, end_date, source_uuid, bill_id, markup_value, invoice_month
     ):
         """Populate the daily aggregated summary of line items table.
 
@@ -120,45 +104,47 @@ class GCPReportDBAccessor(SQLScriptAtomicExecutorMixin, ReportDBAccessorBase):
             (None)
 
         """
-        last_month_end = datetime.date.today().replace(day=1) - datetime.timedelta(days=1)
-        if end_date == last_month_end:
 
-            # For gcp in order to catch what we are calling cross over data
-            # we need to extend the end date by a couple of days. For more
-            # information see: https://issues.redhat.com/browse/COST-1771
-            new_end_date = end_date + relativedelta(days=2)
-            self.delete_line_item_daily_summary_entries_for_date_range(source_uuid, end_date, new_end_date)
-            end_date = new_end_date
-
-        summary_sql = pkgutil.get_data("masu.database", "trino_sql/reporting_gcpcostentrylineitem_daily_summary.sql")
-        summary_sql = summary_sql.decode("utf-8")
+        sql = pkgutil.get_data("masu.database", "trino_sql/reporting_gcpcostentrylineitem_daily_summary.sql")
+        sql = sql.decode("utf-8")
         uuid_str = str(uuid.uuid4()).replace("-", "_")
-        summary_sql_params = {
+        sql_params = {
             "uuid": uuid_str,
             "start_date": start_date,
             "end_date": end_date,
             "schema": self.schema,
             "table": TRINO_LINE_ITEM_TABLE,
             "source_uuid": source_uuid,
-            "year": invoice_month_date.strftime("%Y"),
-            "month": invoice_month_date.strftime("%m"),
+            "invoice_month": invoice_month,
             "markup": markup_value or 0,
             "bill_id": bill_id,
         }
 
         self._execute_trino_raw_sql_query(
-            summary_sql, sql_params=summary_sql_params, log_ref="reporting_gcpcostentrylineitem_daily_summary.sql"
+            sql, sql_params=sql_params, log_ref="reporting_gcpcostentrylineitem_daily_summary.sql"
         )
+
+    def fetch_invoice_month_dates(self, start_date, end_date, invoice_month, source_uuid):
+        """Get extended valid date range for given invoice_month and start/end."""
+        sql = pkgutil.get_data("masu.database", "trino_sql/gcp/get_invoice_month_dates.sql")
+        sql = sql.decode("utf-8")
+        sql_params = {
+            "schema": self.schema,
+            "start_date": start_date,
+            "end_date": end_date,
+            "invoice_month": invoice_month,
+            "source_uuid": str(source_uuid),
+        }
+        return self._execute_trino_raw_sql_query(sql, sql_params=sql_params, log_ref="get_invoice_month_dates")
 
     def populate_tags_summary_table(self, bill_ids, start_date, end_date):
         """Populate the line item aggregated totals data table."""
         table_name = self._table_map["tags_summary"]
 
-        agg_sql = pkgutil.get_data("masu.database", "sql/reporting_gcptags_summary.sql")
-        agg_sql = agg_sql.decode("utf-8")
-        agg_sql_params = {"schema": self.schema, "bill_ids": bill_ids, "start_date": start_date, "end_date": end_date}
-        agg_sql, agg_sql_params = self.jinja_sql.prepare_query(agg_sql, agg_sql_params)
-        self._execute_raw_sql_query(table_name, agg_sql, bind_params=list(agg_sql_params))
+        sql = pkgutil.get_data("masu.database", "sql/reporting_gcptags_summary.sql")
+        sql = sql.decode("utf-8")
+        sql_params = {"schema": self.schema, "bill_ids": bill_ids, "start_date": start_date, "end_date": end_date}
+        self._prepare_and_execute_raw_sql_query(table_name, sql, sql_params)
 
     def populate_markup_cost(self, markup, start_date, end_date, bill_ids=None):
         """Set markup costs in the database."""
@@ -212,59 +198,7 @@ class GCPReportDBAccessor(SQLScriptAtomicExecutorMixin, ReportDBAccessorBase):
             scan_range["end"] = max(end_dates)
             return scan_range
 
-    def populate_enabled_tag_keys(self, start_date, end_date, bill_ids):
-        """Populate the enabled tag key table.
-
-        Args:
-            start_date (datetime.date) The date to start populating the table.
-            end_date (datetime.date) The date to end on.
-            bill_ids (list) A list of bill IDs.
-
-        Returns
-            (None)
-        """
-        table_name = self._table_map["enabled_tag_keys"]
-        summary_sql = pkgutil.get_data("masu.database", "sql/reporting_gcpenabledtagkeys.sql")
-        summary_sql = summary_sql.decode("utf-8")
-        summary_sql_params = {
-            "start_date": start_date,
-            "end_date": end_date,
-            "bill_ids": bill_ids,
-            "schema": self.schema,
-        }
-        summary_sql, summary_sql_params = self.jinja_sql.prepare_query(summary_sql, summary_sql_params)
-        self._execute_raw_sql_query(
-            table_name, summary_sql, start_date, end_date, bind_params=list(summary_sql_params)
-        )
-
-    def update_line_item_daily_summary_with_enabled_tags(self, start_date, end_date, bill_ids):
-        """Populate the enabled tag key table.
-
-        Args:
-            start_date (datetime.date) The date to start populating the table.
-            end_date (datetime.date) The date to end on.
-            bill_ids (list) A list of bill IDs.
-
-        Returns
-            (None)
-        """
-        table_name = self._table_map["line_item_daily_summary"]
-        summary_sql = pkgutil.get_data(
-            "masu.database", "sql/reporting_gcpcostentryline_item_daily_summary_update_enabled_tags.sql"
-        )
-        summary_sql = summary_sql.decode("utf-8")
-        summary_sql_params = {
-            "start_date": start_date,
-            "end_date": end_date,
-            "bill_ids": bill_ids,
-            "schema": self.schema,
-        }
-        summary_sql, summary_sql_params = self.jinja_sql.prepare_query(summary_sql, summary_sql_params)
-        self._execute_raw_sql_query(
-            table_name, summary_sql, start_date, end_date, bind_params=list(summary_sql_params)
-        )
-
-    def populate_gcp_topology_information_tables(self, provider, start_date, end_date, invoice_month_date):
+    def populate_gcp_topology_information_tables(self, provider, start_date, end_date, invoice_month):
         """Populate the GCP topology table."""
         ctx = {
             "schema": self.schema,
@@ -273,7 +207,7 @@ class GCPReportDBAccessor(SQLScriptAtomicExecutorMixin, ReportDBAccessorBase):
             "end_date": end_date,
         }
         LOG.info(log_json(msg="populating GCP topology table", context=ctx))
-        topology = self.get_gcp_topology_trino(provider.uuid, start_date, end_date, invoice_month_date)
+        topology = self.get_gcp_topology_trino(provider.uuid, start_date, end_date, invoice_month)
 
         with schema_context(self.schema):
             for record in topology:
@@ -298,7 +232,7 @@ class GCPReportDBAccessor(SQLScriptAtomicExecutorMixin, ReportDBAccessorBase):
                     )
         LOG.info(log_json(msg="finished populating GCP topology table", context=ctx))
 
-    def get_gcp_topology_trino(self, source_uuid, start_date, end_date, invoice_month_date):
+    def get_gcp_topology_trino(self, source_uuid, start_date, end_date, invoice_month):
         """Get the account topology for a GCP source."""
         sql = f"""
             SELECT source,
@@ -310,8 +244,8 @@ class GCPReportDBAccessor(SQLScriptAtomicExecutorMixin, ReportDBAccessorBase):
                 location_region
             FROM hive.{self.schema}.gcp_line_items as gcp
             WHERE gcp.source = '{source_uuid}'
-                AND gcp.year = '{invoice_month_date.strftime("%Y")}'
-                AND gcp.month = '{invoice_month_date.strftime("%m")}'
+                AND gcp.year = '{invoice_month[:4]}'
+                AND gcp.month = '{invoice_month[4:]}'
                 AND gcp.usage_start_time >= TIMESTAMP '{start_date}'
                 AND gcp.usage_start_time < date_add('day', 1, TIMESTAMP '{end_date}')
             GROUP BY source,
@@ -322,131 +256,51 @@ class GCPReportDBAccessor(SQLScriptAtomicExecutorMixin, ReportDBAccessorBase):
                 service_description,
                 location_region
         """
+        context = {
+            "schema": self.schema,
+            "start": start_date,
+            "end": end_date,
+            "provider_uuid": source_uuid,
+            "invoice_id": invoice_month,
+        }
+        return self._execute_trino_raw_sql_query(sql, context=context, log_ref="get_gcp_topology_trino")
 
-        return self._execute_trino_raw_sql_query(sql, log_ref="get_gcp_topology_trino")
-
-    def delete_line_item_daily_summary_entries_for_date_range(self, source_uuid, start_date, end_date, table=None):
-        """Overwrite the parent class to include invoice month for gcp.
-
-        Args:
-            source_uuid (uuid): uuid of a given source
-            start_date (datetime): start range date
-            end_date (datetime): end range date
-            table (string): table name
-        """
-        # We want to include the invoice month in the delete to make sure we
-        # don't accidentially delete last month's data that flows into the
-        # next month
-        invoice_month = start_date.strftime("%Y%m")
-        if table is None:
-            table = self.line_item_daily_summary_table
+    def _get_matched_tags_strings(self, bill_id, gcp_provider_uuid, ocp_provider_uuid, start_date, end_date):
+        """Returns the matched tags"""
         ctx = {
             "schema": self.schema,
-            "provider_uuid": source_uuid,
-            "start_date": start_date,
-            "end_date": end_date,
-            "table": table,
-            "invoice_month": invoice_month,
-        }
-        LOG.info(log_json(msg="deleting records", context=ctx))
-        select_query = table.objects.filter(
-            source_uuid=source_uuid,
-            usage_start__gte=start_date,
-            usage_start__lte=end_date,
-            invoice_month=invoice_month,
-        )
-        with schema_context(self.schema):
-            count, _ = mini_transaction_delete(select_query)
-        LOG.info(log_json(msg=f"deleted {count} records", context=ctx))
-
-    def populate_ocp_on_gcp_cost_daily_summary_trino_by_node(
-        self,
-        start_date,
-        end_date,
-        openshift_provider_uuid,
-        cluster_id,
-        gcp_provider_uuid,
-        report_period_id,
-        bill_id,
-        markup_value,
-        distribution,
-        node,
-        node_count=None,
-    ):
-        """Populate the daily cost aggregated summary for OCP on GCP.
-
-        This method is called for each node in the update_gcp_summary_tables
-        if an unleash flag is enabled.
-
-        Args:
-            start_date (datetime.date) The date to start populating the table.
-            end_date (datetime.date) The date to end on.
-
-        Returns
-            (None)
-
-        """
-        year = start_date.strftime("%Y")
-        month = start_date.strftime("%m")
-        tables = [
-            "reporting_ocpgcpcostlineitem_project_daily_summary_temp",
-            "gcp_openshift_daily_resource_matched_temp",
-            "gcp_openshift_daily_tag_matched_temp",
-        ]
-        for table in tables:
-            self.delete_hive_partition_by_month(table, openshift_provider_uuid, year, month)
-
-        days = self.date_helper.list_days(start_date, end_date)
-        days_tup = tuple(str(day.day) for day in days)
-        self.delete_ocp_on_gcp_hive_partition_by_day(days_tup, gcp_provider_uuid, openshift_provider_uuid, year, month)
-
-        cluster_alias = get_cluster_alias_from_cluster_id(cluster_id)
-
-        # Default to cpu distribution
-        pod_column = "pod_effective_usage_cpu_core_hours"
-        cluster_column = "cluster_capacity_cpu_core_hours"
-        if distribution == "memory":
-            pod_column = "pod_effective_usage_memory_gigabyte_hours"
-            cluster_column = "cluster_capacity_memory_gigabyte_hours"
-
-        summary_sql = pkgutil.get_data(
-            "masu.database", "trino_sql/gcp/openshift/reporting_ocpgcpcostlineitem_daily_summary_by_node.sql"
-        )
-        summary_sql = summary_sql.decode("utf-8")
-        summary_sql_params = {
-            "schema": self.schema,
-            "start_date": start_date,
-            "year": year,
-            "month": month,
-            "days": days_tup,
-            "end_date": end_date,
-            "gcp_source_uuid": gcp_provider_uuid,
-            "ocp_source_uuid": openshift_provider_uuid,
             "bill_id": bill_id,
-            "report_period_id": report_period_id,
-            "markup": markup_value or 0,
-            "pod_column": pod_column,
-            "cluster_column": cluster_column,
-            "cluster_id": cluster_id,
-            "cluster_alias": cluster_alias,
-            "node": node,
-            "node_count": node_count,
+            "gcp_provider_uuid": gcp_provider_uuid,
+            "ocp_provider_uuid": ocp_provider_uuid,
+            "start_date": start_date,
+            "end_date": end_date,
         }
-
-        LOG.info(log_json(msg="running OCP on GCP SQL (by node)", **summary_sql_params))
-        self._execute_trino_multipart_sql_query(summary_sql, bind_params=summary_sql_params)
+        matched_tags = []
+        with schema_context(self.schema):
+            enabled_tags = self.check_for_matching_enabled_keys()
+            if EnabledTagKeys.objects.filter(provider_type=Provider.PROVIDER_OCP).exists() and enabled_tags:
+                matched_tags = self.get_openshift_on_cloud_matched_tags(bill_id)
+        if not matched_tags and enabled_tags:
+            LOG.info(log_json(msg="matched tags not available via Postgres", context=ctx))
+            if is_tag_processing_disabled(self.schema):
+                LOG.info(log_json(msg="trino tag matching disabled for customer", context=ctx))
+                return []
+            LOG.info(log_json(msg="getting matching tags from Trino", context=ctx))
+            matched_tags = self.get_openshift_on_cloud_matched_tags_trino(
+                gcp_provider_uuid, [ocp_provider_uuid], start_date, end_date, invoice_month_date=start_date
+            )
+        if matched_tags:
+            return [json.dumps(match).replace("{", "").replace("}", "") for match in matched_tags]
+        return matched_tags
 
     def populate_ocp_on_gcp_cost_daily_summary_trino(
         self,
         start_date,
         end_date,
         openshift_provider_uuid,
-        cluster_id,
         gcp_provider_uuid,
         report_period_id,
         bill_id,
-        markup_value,
-        distribution,
     ):
         """Populate the daily cost aggregated summary for OCP on GCP.
 
@@ -458,64 +312,58 @@ class GCPReportDBAccessor(SQLScriptAtomicExecutorMixin, ReportDBAccessorBase):
             (None)
 
         """
-        # Check for GCP resource level data
-        resource_level = check_resource_level(gcp_provider_uuid)
-
-        year = start_date.strftime("%Y")
-        month = start_date.strftime("%m")
-        tables = [
-            "reporting_ocpgcpcostlineitem_project_daily_summary_temp",
-            "gcp_openshift_daily_resource_matched_temp",
-            "gcp_openshift_daily_tag_matched_temp",
-        ]
-        for table in tables:
-            self.delete_hive_partition_by_month(table, openshift_provider_uuid, year, month)
-
-        days = self.date_helper.list_days(start_date, end_date)
-        days_tup = tuple(str(day.day) for day in days)
-        self.delete_ocp_on_gcp_hive_partition_by_day(days_tup, gcp_provider_uuid, openshift_provider_uuid, year, month)
-
-        cluster_alias = get_cluster_alias_from_cluster_id(cluster_id)
-
-        # Default to cpu distribution
-        pod_column = "pod_effective_usage_cpu_core_hours"
-        cluster_column = "cluster_capacity_cpu_core_hours"
-        node_column = "node_capacity_cpu_core_hours"
-        if distribution == "memory":
-            pod_column = "pod_effective_usage_memory_gigabyte_hours"
-            cluster_column = "cluster_capacity_memory_gigabyte_hours"
-            node_column = "node_capacity_memory_gigabyte_hours"
-
-        if resource_level:
-            sql_level = "reporting_ocpgcpcostlineitem_daily_summary_resource_id"
-            matching_type = "resource"
-        else:
-            sql_level = "reporting_ocpgcpcostlineitem_daily_summary"
-            matching_type = "tag"
-
-        summary_sql = pkgutil.get_data("masu.database", f"trino_sql/gcp/openshift/{sql_level}.sql")
-        summary_sql = summary_sql.decode("utf-8")
-        summary_sql_params = {
-            "schema": self.schema,
-            "start_date": start_date,
-            "year": year,
-            "month": month,
-            "days": days_tup,
-            "end_date": end_date,
-            "gcp_source_uuid": gcp_provider_uuid,
-            "ocp_source_uuid": openshift_provider_uuid,
-            "bill_id": bill_id,
-            "report_period_id": report_period_id,
-            "markup": markup_value or 0,
-            "pod_column": pod_column,
-            "cluster_column": cluster_column,
-            "node_column": node_column,
-            "cluster_id": cluster_id,
-            "cluster_alias": cluster_alias,
-            "matching_type": matching_type,
-        }
-        LOG.info(log_json(msg="running OCP on GCP SQL (not by node)", **summary_sql_params))
-        self._execute_trino_multipart_sql_query(summary_sql, bind_params=summary_sql_params)
+        enable_unattributed_storage = is_feature_flag_enabled_by_account(
+            self.schema, GCP_UNATTRIBUTED_STORAGE_UNLEASH_FLAG, dev_fallback=True
+        )
+        sql_metadata = SummarySqlMetadata(
+            self.schema,
+            openshift_provider_uuid,
+            gcp_provider_uuid,
+            start_date,
+            end_date,
+            self._get_matched_tags_strings(bill_id, gcp_provider_uuid, openshift_provider_uuid, start_date, end_date),
+            bill_id,
+            report_period_id,
+        )
+        managed_path = "trino_sql/gcp/openshift/populate_daily_summary/"
+        prepare_sql, prepare_params = sql_metadata.prepare_template(
+            f"{managed_path}/0_prepare_daily_summary_tables.sql", {"unattributed_storage": enable_unattributed_storage}
+        )
+        LOG.info(log_json(msg="Preparing tables for OCP on GCP flow", **prepare_params))
+        self._execute_trino_multipart_sql_query(prepare_sql, bind_params=prepare_params)
+        self.delete_ocp_on_gcp_hive_partition_by_day(
+            sql_metadata.days_tup,
+            sql_metadata.cloud_provider_uuid,
+            sql_metadata.ocp_provider_uuid,
+            sql_metadata.year,
+            sql_metadata.month,
+        )
+        # Resource Matching
+        resource_matching_sql, resource_matching_params = sql_metadata.prepare_template(
+            f"{managed_path}/1_resource_matching_by_cluster.sql",
+            {
+                "matched_tag_array": self.find_openshift_keys_expected_values(sql_metadata),
+                "unattributed_storage": enable_unattributed_storage,
+            },
+        )
+        LOG.info(log_json(msg="Resource matching for OCP on GCP flow", **resource_matching_params))
+        self._execute_trino_multipart_sql_query(resource_matching_sql, bind_params=resource_matching_params)
+        # Data Transformation for Daily Summary
+        daily_summary_sql, daily_summary_params = sql_metadata.prepare_template(
+            f"{managed_path}/2_summarize_data_by_cluster.sql",
+            {
+                **sql_metadata.build_cost_model_params(),
+                "unattributed_storage": enable_unattributed_storage,
+            },
+        )
+        LOG.info(log_json(msg="executing data transformations for ocp on gcp daily summary", **daily_summary_params))
+        self._execute_trino_multipart_sql_query(daily_summary_sql, bind_params=daily_summary_params)
+        # Insert into postgresql
+        psql_insert, psql_params = sql_metadata.prepare_template(
+            f"{managed_path}/3_reporting_ocpgcpcostlineitem_project_daily_summary_p.sql",
+        )
+        LOG.info(log_json(msg="running OCP on GCP SQL managed flow", **psql_params))
+        self._execute_trino_multipart_sql_query(psql_insert, bind_params=psql_params)
 
     def populate_ocp_on_gcp_ui_summary_tables(self, sql_params, tables=OCPGCP_UI_SUMMARY_TABLES):
         """Populate our UI summary tables (formerly materialized views)."""
@@ -525,12 +373,9 @@ class GCPReportDBAccessor(SQLScriptAtomicExecutorMixin, ReportDBAccessorBase):
         for invoice_month in invoice_month_list:
             for table_name in tables:
                 sql_params["invoice_month"] = invoice_month
-                summary_sql = pkgutil.get_data("masu.database", f"sql/gcp/openshift/{table_name}.sql")
-                summary_sql = summary_sql.decode("utf-8")
-                summary_sql, summary_sql_params = self.jinja_sql.prepare_query(summary_sql, sql_params)
-                self._execute_raw_sql_query(
-                    table_name, summary_sql, bind_params=list(summary_sql_params), operation="DELETE/INSERT"
-                )
+                sql = pkgutil.get_data("masu.database", f"sql/gcp/openshift/{table_name}.sql")
+                sql = sql.decode("utf-8")
+                self._prepare_and_execute_raw_sql_query(table_name, sql, sql_params, operation="DELETE/INSERT")
 
     def populate_ocp_on_gcp_ui_summary_tables_trino(
         self, start_date, end_date, openshift_provider_uuid, gcp_provider_uuid, tables=OCPGCP_UI_SUMMARY_TABLES
@@ -540,70 +385,56 @@ class GCPReportDBAccessor(SQLScriptAtomicExecutorMixin, ReportDBAccessorBase):
         month = start_date.strftime("%m")
         days = self.date_helper.list_days(start_date, end_date)
         days_tup = tuple(str(day.day) for day in days)
-        invoice_month_list = self.date_helper.gcp_find_invoice_months_in_date_range(start_date, end_date)
-        for invoice_month in invoice_month_list:
-            for table_name in tables:
-                summary_sql_params = {
-                    "schema_name": self.schema,
-                    "start_date": start_date,
-                    "end_date": end_date,
-                    "year": year,
-                    "month": month,
-                    "days": days_tup,
-                    "invoice_month": invoice_month,
-                    "gcp_source_uuid": gcp_provider_uuid,
-                    "ocp_source_uuid": openshift_provider_uuid,
-                }
-                summary_sql = pkgutil.get_data("masu.database", f"trino_sql/gcp/openshift/{table_name}.sql")
-                summary_sql = summary_sql.decode("utf-8")
-                self._execute_trino_raw_sql_query(
-                    summary_sql, sql_params=summary_sql_params, log_ref=f"{table_name}.sql"
-                )
+
+        for table_name in tables:
+            sql = pkgutil.get_data("masu.database", f"trino_sql/gcp/openshift/{table_name}.sql")
+            sql = sql.decode("utf-8")
+            sql_params = {
+                "schema": self.schema,
+                "start_date": start_date,
+                "end_date": end_date,
+                "year": year,
+                "month": month,
+                "days": days_tup,
+                "gcp_source_uuid": gcp_provider_uuid,
+                "ocp_source_uuid": openshift_provider_uuid,
+            }
+            self._execute_trino_raw_sql_query(sql, sql_params=sql_params, log_ref=f"{table_name}.sql")
 
     def delete_ocp_on_gcp_hive_partition_by_day(self, days, gcp_source, ocp_source, year, month):
         """Deletes partitions individually for each day in days list."""
-        table = "reporting_ocpgcpcostlineitem_project_daily_summary"
-        retries = settings.HIVE_PARTITION_DELETE_RETRIES
-        if self.schema_exists_trino() and self.table_exists_trino(table):
+        if self.schema_exists_trino() and self.table_exists_trino(TRINO_OCP_GCP_DAILY_SUMMARY_TABLE):
             LOG.info(
                 log_json(
                     msg="deleting Hive partitions by day",
                     schema=self.schema,
                     ocp_source=ocp_source,
                     gcp_source=gcp_source,
-                    table=table,
+                    table=TRINO_OCP_GCP_DAILY_SUMMARY_TABLE,
                     year=year,
                     month=month,
                     days=days,
                 )
             )
             for day in days:
-                for i in range(retries):
-                    try:
-                        sql = f"""
-                            DELETE FROM hive.{self.schema}.{table}
-                                WHERE gcp_source = '{gcp_source}'
-                                AND ocp_source = '{ocp_source}'
-                                AND year = '{year}'
-                                AND (month = replace(ltrim(replace('{month}', '0', ' ')),' ', '0') OR month = '{month}')
-                                AND day = '{day}'"""
-                        self._execute_trino_raw_sql_query(
-                            sql,
-                            log_ref=f"delete_ocp_on_gcp_hive_partition_by_day for {year}-{month}-{day}",
-                            attempts_left=(retries - 1) - i,
-                        )
-                        break
-                    except TrinoExternalError as err:
-                        if err.error_name == "HIVE_METASTORE_ERROR" and i < (retries - 1):
-                            continue
-                        else:
-                            raise err
+                sql = f"""
+                    DELETE FROM hive.{self.schema}.{TRINO_OCP_GCP_DAILY_SUMMARY_TABLE}
+                        WHERE source = '{gcp_source}'
+                        AND ocp_source = '{ocp_source}'
+                        AND year = '{year}'
+                        AND (month = replace(ltrim(replace('{month}', '0', ' ')),' ', '0') OR month = '{month}')
+                        AND day = '{day}'"""
+                self._execute_trino_raw_sql_query(
+                    sql,
+                    context={"year": year, "month": month, "day": day, "table": TRINO_OCP_GCP_DAILY_SUMMARY_TABLE},
+                    log_ref="delete_ocp_on_gcp_hive_partition_by_day",
+                )
 
     def get_openshift_on_cloud_matched_tags(self, gcp_bill_id):
         sql = pkgutil.get_data("masu.database", "sql/reporting_ocpgcp_matched_tags.sql")
         sql = sql.decode("utf-8")
         sql_params = {"bill_id": gcp_bill_id, "schema": self.schema}
-        sql, bind_params = self.jinja_sql.prepare_query(sql, sql_params)
+        sql, bind_params = self.prepare_query(sql, sql_params)
         with connection.cursor() as cursor:
             cursor.db.set_schema(self.schema)
             cursor.execute(sql, params=bind_params)
@@ -637,20 +468,58 @@ class GCPReportDBAccessor(SQLScriptAtomicExecutorMixin, ReportDBAccessorBase):
         )
         return [json.loads(result[0]) for result in results]
 
-    def populate_ocp_on_gcp_tags_summary_table(self, gcp_bill_ids, start_date, end_date):
+    def populate_ocp_on_gcp_tag_information(self, gcp_bill_ids, start_date, end_date, report_period_id):
         """Populate the line item aggregated totals data table."""
-        table_name = self._table_map["ocp_on_gcp_tags_summary"]
-
-        agg_sql = pkgutil.get_data("masu.database", "sql/gcp/openshift/reporting_ocpgcptags_summary.sql")
-        agg_sql = agg_sql.decode("utf-8")
-        agg_sql_params = {
+        sql_params = {
             "schema": self.schema,
             "gcp_bill_ids": gcp_bill_ids,
             "start_date": start_date,
             "end_date": end_date,
+            "report_period_id": report_period_id,
         }
-        agg_sql, agg_sql_params = self.jinja_sql.prepare_query(agg_sql, agg_sql_params)
-        self._execute_raw_sql_query(table_name, agg_sql, bind_params=list(agg_sql_params))
+        # Tag Summary
+        sql = pkgutil.get_data("masu.database", "sql/gcp/openshift/reporting_ocpgcptags_summary.sql")
+        sql = sql.decode("utf-8")
+        self._prepare_and_execute_raw_sql_query(self._table_map["ocp_on_gcp_tags_summary"], sql, sql_params)
+        # Tag Mapping
+        with schema_context(self.schema):
+            # Early return check to see if they have any tag mappings set.
+            if not TagMapping.objects.filter(
+                Q(child__provider_type=Provider.PROVIDER_GCP) | Q(child__provider_type=Provider.PROVIDER_OCP)
+            ).exists():
+                LOG.debug("No tag mappings for GCP.")
+                return
+        sql = pkgutil.get_data("masu.database", "sql/gcp/openshift/ocpgcp_tag_mapping_update_daily_summary.sql")
+        sql = sql.decode("utf-8")
+        self._prepare_and_execute_raw_sql_query(self._table_map["ocp_on_gcp_project_daily_summary"], sql, sql_params)
+
+    def update_line_item_daily_summary_with_tag_mapping(self, start_date, end_date, bill_ids=None):
+        """
+        Updates the line item daily summary table with tag mapping pieces.
+
+        Args:
+            start_date (datetime.date) The date to start populating the table.
+            end_date (datetime.date) The date to end on.
+            bill_ids (list) A list of bill IDs.
+        Returns:
+            (None)
+        """
+        with schema_context(self.schema):
+            # Early return check to see if they have any tag mappings set.
+            if not TagMapping.objects.filter(child__provider_type=Provider.PROVIDER_GCP).exists():
+                LOG.debug("No tag mappings for GCP.")
+                return
+
+        table_name = self._table_map["line_item_daily_summary"]
+        sql = pkgutil.get_data("masu.database", "sql/gcp/gcp_tag_mapping_update_daily_summary.sql")
+        sql = sql.decode("utf-8")
+        sql_params = {
+            "start_date": start_date,
+            "end_date": end_date,
+            "bill_ids": bill_ids,
+            "schema": self.schema,
+        }
+        self._prepare_and_execute_raw_sql_query(table_name, sql, sql_params)
 
     def back_populate_ocp_infrastructure_costs(self, start_date, end_date, report_period_id):
         """Populate the OCP on GCP and OCP daily summary tables. after populating the project table."""
@@ -667,17 +536,16 @@ class GCPReportDBAccessor(SQLScriptAtomicExecutorMixin, ReportDBAccessorBase):
             "end_date": end_date,
             "report_period_id": report_period_id,
         }
-        sql, sql_params = self.jinja_sql.prepare_query(sql, sql_params)
-        self._execute_raw_sql_query(table_name, sql, bind_params=sql_params)
+        self._prepare_and_execute_raw_sql_query(table_name, sql, sql_params)
 
     def check_for_matching_enabled_keys(self):
         """
         Checks the enabled tag keys for matching keys.
         """
         match_sql = f"""
-            SELECT COUNT(*) FROM {self.schema}.reporting_gcpenabledtagkeys as gcp
-                INNER JOIN {self.schema}.reporting_ocpenabledtagkeys as ocp ON gcp.key = ocp.key
-                WHERE gcp.enabled = true AND ocp.enabled = true;
+            SELECT COUNT(*) FROM (SELECT COUNT(provider_type) AS p_count FROM
+                {self.schema}.reporting_enabledtagkeys WHERE enabled=True AND provider_type IN ('GCP', 'OCP')
+                GROUP BY key) AS c WHERE c.p_count > 1;
         """
         with connection.cursor() as cursor:
             cursor.db.set_schema(self.schema)

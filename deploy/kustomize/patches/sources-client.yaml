@@ -2,6 +2,9 @@
   path: /objects/0/spec/deployments/-
   value:
     name: clowder-sources-client
+    metadata:
+      annotations:
+        ignore-check.kube-linter.io/minimum-three-replicas: This deployment uses 1 pod at times for cost saving purposes
     replicas: ${{SOURCES_CLIENT_REPLICAS}}
     webServices:
       public:
@@ -16,6 +19,12 @@
       env:
         - name: CLOWDER_ENABLED
           value: ${CLOWDER_ENABLED}
+        - name: REDEPLOY_HASH
+          value: ${REDEPLOY_HASH_ALL}_${REDEPLOY_HASH_SOURCES_CLIENT}
+        - name: SCHEMA_SUFFIX
+          value: ${SCHEMA_SUFFIX}
+        - name: TRINO_S3A_OR_S3
+          value: ${TRINO_S3A_OR_S3}
         - name: SOURCES
           value: "true"
         - name: SOURCES_PROBE_HEADER
@@ -35,13 +44,13 @@
         - name: AWS_ACCESS_KEY_ID
           valueFrom:
             secretKeyRef:
-              key: aws-access-key-id
+              key: aws_access_key_id
               name: koku-aws
               optional: false
         - name: AWS_SECRET_ACCESS_KEY
           valueFrom:
             secretKeyRef:
-              key: aws-secret-access-key
+              key: aws_secret_access_key
               name: koku-aws
               optional: false
         - name: GOOGLE_APPLICATION_CREDENTIALS
@@ -58,6 +67,8 @@
           value: ${DEVELOPMENT}
         - name: GUNICORN_LOG_LEVEL
           value: ${GUNICORN_LOG_LEVEL}
+        - name: GUNICORN_WORKERS
+          value: ${GUNICORN_WORKERS}
         - name: KOKU_LOG_LEVEL
           value: ${SOURCES_CLIENT_KOKU_LOG_LEVEL}
         - name: UNLEASH_LOG_LEVEL
@@ -80,15 +91,15 @@
           value: ${RBAC_CACHE_TTL}
         - name: PROMETHEUS_MULTIPROC_DIR
           value: ${PROMETHEUS_DIR}
-        - name: KOKU_API_ENABLE_SENTRY
-          value: ${ENABLE_API_SENTRY}
+        - name: KOKU_ENABLE_SENTRY
+          value: ${KOKU_ENABLE_SENTRY}
         - name: KOKU_SENTRY_ENVIRONMENT
           value: ${KOKU_SENTRY_ENV}
         - name: KOKU_SENTRY_DSN
           valueFrom:
             secretKeyRef:
-              key: sources-sentry-dsn
-              name: koku-sentry
+              key: ${GLITCHTIP_KEY_NAME}
+              name: ${GLITCHTIP_SECRET_NAME}
               optional: true
         - name: DEMO_ACCOUNTS
           value: ${DEMO_ACCOUNTS}
@@ -96,25 +107,6 @@
           value: ${UNLEASH_CACHE_DIR}
         - name: QE_SCHEMA
           value: ${QE_SCHEMA}
-        - name: OCI_CLI_USER
-          valueFrom:
-            secretKeyRef:
-              key: oci-cli-user
-              name: koku-oci
-        - name: OCI_CLI_FINGERPRINT
-          valueFrom:
-            secretKeyRef:
-              key: oci-cli-fingerprint
-              name: koku-oci
-        - name: OCI_CLI_TENANCY
-          valueFrom:
-            secretKeyRef:
-              key: oci-cli-tenancy
-              name: koku-oci
-        - name: OCI_CLI_KEY_FILE
-          value: ${OCI_CLI_KEY_FILE}
-        - name: OCI_PYTHON_SDK_NO_SERVICE_IMPORTS
-          value: 'true'
         - name: ENHANCED_ORG_ADMIN
           value: ${ENHANCED_ORG_ADMIN}
       livenessProbe:
@@ -139,17 +131,14 @@
         timeoutSeconds: 10
       resources:
         requests:
-          cpu: ${SOURCES_CLIENT_CPU_REQUEST}
-          memory: ${SOURCES_CLIENT_MEMORY_REQUEST}
+          cpu: ${CPU_REQUEST_SOURCES_CLIENT}
+          memory: ${MEMORY_REQUEST_SOURCES_CLIENT}
         limits:
-          cpu: ${SOURCES_CLIENT_CPU_LIMIT}
-          memory: ${SOURCES_CLIENT_MEMORY_LIMIT}
+          cpu: ${CPU_LIMIT_SOURCES_CLIENT}
+          memory: ${MEMORY_LIMIT_SOURCES_CLIENT}
       volumeMounts:
       - name: gcp-credentials
         mountPath: /etc/gcp
-        readOnly: true
-      - name: oci-credentials
-        mountPath: /etc/oci
         readOnly: true
       - name: tmp-data
         mountPath: ${TMP_DIR}
@@ -162,12 +151,6 @@
           items:
             - key: gcp-credentials
               path: gcp-credentials.json
-      - name: oci-credentials
-        secret:
-          secretName: koku-oci
-          items:
-            - key: oci-credentials
-              path: oci-credentials.pem
 
 - op: add
   path: /parameters/-
@@ -180,28 +163,28 @@
   path: /parameters/-
   value:
     displayName: Memory Request
-    name: SOURCES_CLIENT_MEMORY_REQUEST
+    name: MEMORY_REQUEST_SOURCES_CLIENT
     required: true
-    value: 200Mi
+    value: 650Mi
 - op: add
   path: /parameters/-
   value:
     displayName: Memory Limit
-    name: SOURCES_CLIENT_MEMORY_LIMIT
+    name: MEMORY_LIMIT_SOURCES_CLIENT
     required: true
-    value: 400Mi
+    value: 768Mi
 - op: add
   path: /parameters/-
   value:
     displayName: CPU Request
-    name: SOURCES_CLIENT_CPU_REQUEST
+    name: CPU_REQUEST_SOURCES_CLIENT
     required: true
     value: 50m
 - op: add
   path: /parameters/-
   value:
     displayName: CPU Limit
-    name: SOURCES_CLIENT_CPU_LIMIT
+    name: CPU_LIMIT_SOURCES_CLIENT
     required: true
     value: 100m
 - op: add
@@ -211,3 +194,9 @@
     name: SOURCES_CLIENT_KOKU_LOG_LEVEL
     required: true
     value: INFO
+- op: add
+  path: /parameters/-
+  value:
+    description: change this value to restart sources-client
+    name: REDEPLOY_HASH_SOURCES_CLIENT
+    value: "000000"

@@ -18,7 +18,7 @@ generators:
                   cpu_limit: 1
                   mem_limit_gig: 4
                   pod_seconds: 3600
-                  labels: label_environment:ruby|label_app:fall|label_version:red
+                  labels: label_environment:ruby|label_app:fall|label_version:red|label_vm_kubevirt_io_name:pod_name1a_vm
                 - pod:
                   pod_name: pod_name1b
                   cpu_request: 1
@@ -30,12 +30,13 @@ generators:
               volumes:
                 - volume:
                   volume_name: pvc-volume_1
-                  storage_class: gp2
+                  storage_class: pd-standard
                   volume_request_gig: 20
                   labels: label_environment:ruby|label_app:fall|label_version:red|label_storageclass:banana
+                  csi_volume_handle: projects/billion-sandwich-555777888/zones/us-central1/disk/test_40_capacity
                   volume_claims:
                   - volume_claim:
-                    volume_claim_name: pod_name1_data
+                    volume_claim_name: fall_pod_name1_data
                     pod_name: pod_name1a
                     labels: label_environment:ruby|label_app:fall|label_version:red|label_storageclass:banana
                     capacity_gig: 20
@@ -56,17 +57,18 @@ generators:
                   cpu_limit: 1
                   mem_limit_gig: 4
                   pod_seconds: 3600
-                  labels: label_environment:ruby|label_app:snowdown|label_version:red|label_qa:checked
+                  labels: label_environment:ruby|label_app:snowdown|label_version:red|label_qa:checked|label_vm_kubevirt_io_name:pod_name2b_vm
               volumes:
                 - volume:
                   volume_name: pvc-volume_2
-                  storage_class: gp2
+                  storage_class: pd-standard
                   volume_request_gig: 20
+                  csi_volume_handle: projects/billion-sandwich-555777888/zones/us-central1/disk/test_50_capacity
                   labels: label_environment:ruby|label_app:snowdown|label_version:red|label_storageclass:watermelon
                   volume_claims:
                   - volume_claim:
-                    volume_claim_name: pod_name2_data
-                    pod_name: pod_name2a
+                    volume_claim_name: snowdown_pod_name2_data
+                    pod_name: pod_name2b
                     labels: label_environment:ruby|label_app:snowdown|label_version:red|label_storageclass:watermelon
                     capacity_gig: 20
         - node:
@@ -83,7 +85,7 @@ generators:
                   cpu_limit: 1
                   mem_limit_gig: 4
                   pod_seconds: 3600
-                  labels: label_environment:clyde|label_app:winter|label_version:green
+                  labels: label_environment:clyde|label_app:winter|label_version:green|label_vm_kubevirt_io_name:pod_name3a_vm
                 - pod:
                   pod_name: pod_name3b
                   cpu_request: 1
@@ -95,12 +97,12 @@ generators:
               volumes:
                 - volume:
                   volume_name: pvc-volume_3
-                  storage_class: gp2
+                  storage_class: pd-standard
                   volume_request_gig: 20
                   labels: label_environment:clyde|label_app:winter|label_version:green|label_storageclass:apple
                   volume_claims:
                   - volume_claim:
-                    volume_claim_name: pod_name3_data
+                    volume_claim_name: cost_management_pod_name3_data
                     pod_name: pod_name3a
                     labels: label_environment:clyde|label_app:winter|label_version:green|label_storageclass:apple
                     capacity_gig: 20
@@ -131,7 +133,7 @@ generators:
               volumes:
                 - volume:
                   volume_name: pvc-volume_4
-                  storage_class: gp2
+                  storage_class: pd-standard
                   volume_request_gig: 20
                   labels: label_environment:murphy|label_app:spring|label_version:blue|label_storageclass:orange
                   volume_claims:

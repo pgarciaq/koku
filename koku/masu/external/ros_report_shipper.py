@@ -16,11 +16,10 @@ from api.common import log_json
 from api.utils import DateHelper
 from kafka_utils.utils import delivery_callback
 from kafka_utils.utils import get_producer
-from koku.feature_flags import UNLEASH_CLIENT
+from kafka_utils.utils import ROS_TOPIC
 from masu.config import Config as masu_config
-from masu.database.provider_db_accessor import ProviderDBAccessor
 from masu.prometheus_stats import KAFKA_CONNECTION_ERRORS_COUNTER
-
+from masu.util.ocp import common as utils
 
 LOG = logging.getLogger(__name__)
 
@@ -33,13 +32,15 @@ def get_ros_s3_client():  # pragma: no cover
         aws_secret_access_key=settings.S3_ROS_SECRET,
         region_name=settings.S3_ROS_REGION,
     )
-    return s3_session.client("s3", endpoint_url=settings.S3_ENDPOINT, config=config)
+    return s3_session.client("s3", endpoint_url=settings.S3_ROS_ENDPOINT, config=config)
 
 
 def generate_s3_object_url(client, upload_key):  # pragma: no cover
     """Generate an accessible URL for an S3 object with an expiration time of 48 hours"""
     return client.generate_presigned_url(
-        ClientMethod="get_object", Params={"Bucket": settings.S3_ROS_BUCKET_NAME, "Key": upload_key}, ExpiresIn=172800
+        ClientMethod="get_object",
+        Params={"Bucket": settings.S3_ROS_BUCKET_NAME, "Key": upload_key},
+        ExpiresIn=masu_config.ROS_URL_EXPIRATION,
     )
 
 
@@ -48,21 +49,26 @@ class ROSReportShipper:
 
     def __init__(
         self,
-        report_meta,
-        b64_identity,
-        context,
+        payload_info: utils.PayloadInfo,
+        b64_identity: str,
+        context: dict,
     ):
         self.b64_identity = b64_identity
-        self.manifest_id = report_meta["manifest_id"]
+        self.manifest_id = payload_info.manifest.manifest_id
         self.context = context | {"manifest_id": self.manifest_id}
-        self.provider_uuid = str(report_meta["provider_uuid"])
-        self.request_id = report_meta["request_id"]
-        self.schema_name = report_meta["schema_name"]
+        self.source_id = str(payload_info.source_id)
+        self.provider_uuid = str(payload_info.provider_uuid)
+        self.cluster_alias = payload_info.cluster_alias
+        self.request_id = payload_info.request_id
+        self.schema_name = payload_info.schema_name
+
         self.metadata = {
-            "account": context["account"],
-            "org_id": context["org_id"],
-            "source_id": self.provider_uuid,
-            "cluster_uuid": report_meta["cluster_id"],
+            "account": payload_info.account_id,
+            "org_id": payload_info.org_id,
+            "source_id": self.source_id,
+            "provider_uuid": self.provider_uuid,
+            "cluster_uuid": payload_info.manifest.cluster_id,
+            "operator_version": payload_info.manifest.operator_version,
         }
         self.s3_client = get_ros_s3_client()
         self.dh = DateHelper()
@@ -94,8 +100,8 @@ class ROSReportShipper:
             LOG.info(log_json(self.request_id, msg=msg, context=self.context))
             return
 
-        if not UNLEASH_CLIENT.is_enabled("cost-management.backend.ros-data-processing", self.context):
-            msg = "ROS report handling gated by unleash - not sending kafka msg"
+        if settings.DISABLE_ROS_MSG:
+            msg = "ROS report handling disabled - not sending kafka msg"
             LOG.info(log_json(self.request_id, msg=msg, context=self.context))
             return
 
@@ -127,17 +133,15 @@ class ROSReportShipper:
     def send_kafka_message(self, msg):
         """Sends a kafka message to the ROS topic with the S3 keys for the uploaded reports."""
         producer = get_producer()
-        producer.produce(masu_config.ROS_TOPIC, value=msg, callback=delivery_callback)
+        producer.produce(ROS_TOPIC, value=msg, callback=delivery_callback)
         producer.poll(0)
 
     def build_ros_msg(self, presigned_urls, upload_keys):
         """Gathers the relevant information for the kafka message and returns the message to be delivered."""
-        with ProviderDBAccessor(self.provider_uuid) as provider_accessor:
-            cluster_alias = provider_accessor.get_provider_name()
         ros_json = {
             "request_id": self.request_id,
             "b64_identity": self.b64_identity,
-            "metadata": self.metadata | {"cluster_alias": cluster_alias},
+            "metadata": self.metadata | {"cluster_alias": self.cluster_alias},
             "files": presigned_urls,
             "object_keys": upload_keys,
         }

@@ -21,6 +21,9 @@ from django.db.models.functions import TruncMonth
 from api.currency.models import ExchangeRateDictionary
 from api.query_filter import QueryFilter
 from api.query_filter import QueryFilterCollection
+from api.report.constants import RESOLUTION_DAILY
+from api.report.constants import TIME_SCOPE_UNITS_DAILY
+from api.report.constants import TIME_SCOPE_VALUES_DAILY
 from api.utils import DateHelper
 
 LOG = logging.getLogger(__name__)
@@ -67,9 +70,9 @@ class QueryHandler:
         self._max_rank = 0
 
         self.time_scope_units = self.parameters.get_filter("time_scope_units")
-        if self.parameters.get_filter("time_scope_value"):
-            self.time_scope_value = int(self.parameters.get_filter("time_scope_value"))
-        # self.time_order = parameters["date"]
+        self.time_scope_value = (
+            int(time_scope_value) if (time_scope_value := self.parameters.get_filter("time_scope_value")) else None
+        )
 
         # self.start_datetime = parameters["start_date"]
         # self.end_datetime = parameters["end_date"]
@@ -187,7 +190,7 @@ class QueryHandler:
             (String): The value of how data will be sliced.
 
         """
-        return self.parameters.get_filter("resolution", default="daily")
+        return self.parameters.get_filter("resolution", default=RESOLUTION_DAILY)
 
     def check_query_params(self, key, in_key):
         """Test if query parameters has a given key and key within it.
@@ -209,11 +212,9 @@ class QueryHandler:
             (String): The value of how data will be sliced.
 
         """
-        if self.time_scope_units:
-            return self.time_scope_units
-
-        time_scope_units = self.parameters.get_filter("time_scope_units", default="day")
-        self.time_scope_units = time_scope_units
+        if not self.time_scope_units:
+            time_scope_units = self.parameters.get_filter("time_scope_units", default=TIME_SCOPE_UNITS_DAILY)
+            self.time_scope_units = time_scope_units
         return self.time_scope_units
 
     def get_time_scope_value(self):
@@ -223,11 +224,9 @@ class QueryHandler:
             (Integer): time relative value providing query scope
 
         """
-        if self.time_scope_value:
-            return self.time_scope_value
-
-        time_scope_value = self.parameters.get_filter("time_scope_value", default=-10)
-        self.time_scope_value = int(time_scope_value)
+        if not self.time_scope_value:
+            time_scope_value = self.parameters.get_filter("time_scope_value", default=TIME_SCOPE_VALUES_DAILY[0])
+            self.time_scope_value = int(time_scope_value)
         return self.time_scope_value
 
     def _get_timeframe(self):
@@ -284,7 +283,7 @@ class QueryHandler:
     def _get_date_delta(self):
         """Return a time delta."""
         if self.time_scope_value in [-1, -2, -3]:
-            date_delta = relativedelta.relativedelta(months=abs(self.time_scope_value))
+            date_delta = relativedelta.relativedelta(months=1)
         elif self.time_scope_value in (-90, -30, -10):
             date_delta = datetime.timedelta(days=abs(self.time_scope_value))
         else:
@@ -356,10 +355,6 @@ class QueryHandler:
         end_filter = QueryFilter(field="usage_start", operation="lte", parameter=end.date())
         filters.add(query_filter=start_filter)
         filters.add(query_filter=end_filter)
-        # COST-3043
-        filter_list = self._mapper.report_type_map.get("conditionals", {}).get(self.query_table, {}).get("filter", [])
-        for conditional_filter in filter_list:
-            filters.add(**conditional_filter)
         return filters
 
     def filter_to_order_by(self, parameters):  # noqa: C901
@@ -408,7 +403,9 @@ class QueryHandler:
         returns:
             None
         """
-        for _filt in filt if isinstance(filt, list) else [filt]:
+        if not isinstance(filt, list):
+            filt = [filt]
+        for _filt in filt:
             check_field_type = None
             try:
                 if hasattr(self, "query_table"):

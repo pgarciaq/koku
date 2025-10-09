@@ -5,7 +5,7 @@
 """Views for CostModelMetricsMap."""
 import copy
 
-from django.utils.encoding import force_text
+from django.utils.encoding import force_str
 from django.views.decorators.vary import vary_on_headers
 from rest_framework import permissions
 from rest_framework import status
@@ -31,7 +31,7 @@ def metrics(request):
     source_type = request.query_params.get("source_type")
     serializer = QueryParamsSerializer(data=request.query_params)
     serializer.is_valid(raise_exception=True)
-    cost_model_metric_map_copy = copy.deepcopy(metric_constants.COST_MODEL_METRIC_MAP)
+    cost_model_metric_map_copy = list(metric_constants.get_cost_model_metrics_map().values())
     if source_type:
         # Filter on source type
         cost_model_metric_map_copy = list(
@@ -55,4 +55,4 @@ class CostModelMetricMapJSONException(APIException):
     def __init__(self, message):
         """Initialize with status code 500."""
         self.status_code = status.HTTP_500_INTERNAL_SERVER_ERROR
-        self.detail = {"detail": force_text(message)}
+        self.detail = {"detail": force_str(message)}

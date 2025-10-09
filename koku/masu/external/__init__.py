@@ -3,10 +3,6 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 """Initializer for external module."""
-# Ingest Methods
-POLL_INGEST = "poll-ingest"
-LISTEN_INGEST = "listen-ingest"
-
 # Compression formats
 UNCOMPRESSED = "PLAIN"
 GZIP_COMPRESSED = "GZIP"
@@ -31,9 +27,4 @@ AWS_REGIONS = [
     "eu-west-2",
     "eu-west-3",
     "sa-east-1",
-]
-
-OCI_REGIONS = [
-    "us-ashburn-1",
-    "uk-london-1",
 ]

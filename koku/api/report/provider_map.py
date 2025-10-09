@@ -54,10 +54,11 @@ class ProviderMap:
         prov = self.provider_data(provider)
         return prov.get("report_type").get(report_type)
 
-    def __init__(self, provider, report_type):
+    def __init__(self, provider, report_type, schema_name):
         """Constructor."""
         self._provider = provider
         self._report_type = report_type
+        self._schema_name = schema_name
         self._provider_map = self.provider_data(provider)
         self._report_type_map = self.report_type_data(report_type, provider)
 
@@ -76,7 +77,7 @@ class ProviderMap:
         """Return the appropriate query table for the report type."""
         report_table = self._report_type_map.get("tables", {}).get("query")
         default = self._provider_map.get("tables").get("query")
-        return report_table if report_table else default
+        return report_table or default
 
     @property
     def report_type_map(self):
@@ -93,7 +94,7 @@ class ProviderMap:
         """Return the appropriate query table for the report type."""
         report_specific_column = self._report_type_map.get("tag_column")
         default = self._provider_map.get("tag_column")
-        return report_specific_column if report_specific_column else default
+        return report_specific_column or default
 
     @property
     def cost_units_key(self):

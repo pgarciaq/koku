@@ -11,13 +11,11 @@ from django.db import transaction
 
 from api.provider.models import Provider
 from api.utils import DateHelper
+from common.queues import get_customer_queue
+from common.queues import PriorityQueue
 from cost_models.models import CostModel
 from cost_models.models import CostModelMap
-from masu.processor import is_customer_large
-from masu.processor.tasks import PRIORITY_QUEUE
-from masu.processor.tasks import PRIORITY_QUEUE_XL
 from masu.processor.tasks import update_cost_model_costs
-
 
 LOG = logging.getLogger(__name__)
 
@@ -35,8 +33,11 @@ class CostModelManager:
         self._cost_model_uuid = None
 
         if cost_model_uuid:
-            self._model = CostModel.objects.get(uuid=cost_model_uuid)
-            self._cost_model_uuid = cost_model_uuid
+            try:
+                self._model = CostModel.objects.get(uuid=cost_model_uuid)
+                self._cost_model_uuid = cost_model_uuid
+            except CostModel.DoesNotExist:
+                LOG.warning(f"CostModel with UUID {cost_model_uuid} does not exist.")
 
     @property
     def instance(self):
@@ -88,9 +89,7 @@ class CostModelManager:
             else:
                 if provider.active:
                     schema_name = provider.customer.schema_name
-                    fallback_queue = PRIORITY_QUEUE
-                    if is_customer_large(schema_name):
-                        fallback_queue = PRIORITY_QUEUE_XL
+                    fallback_queue = get_customer_queue(schema_name, PriorityQueue)
                     # Because this is triggered from the UI, we use the priority queue
                     LOG.info(
                         f"provider {provider_uuid} update for cost model {self._cost_model_uuid} "
@@ -122,5 +121,8 @@ class CostModelManager:
         providers_query = CostModelMap.objects.filter(cost_model=self._model)
         provider_uuids = [provider.provider_uuid for provider in providers_query]
         providers_qs_list = Provider.objects.filter(uuid__in=provider_uuids)
-        provider_names_uuids = [{"uuid": str(provider.uuid), "name": provider.name} for provider in providers_qs_list]
+        provider_names_uuids = [
+            {"uuid": str(provider.uuid), "name": provider.name, "last_processed": provider.data_updated_timestamp}
+            for provider in providers_qs_list
+        ]
         return provider_names_uuids

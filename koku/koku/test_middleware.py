@@ -4,6 +4,7 @@
 #
 """Test the project middleware."""
 import base64
+import copy
 import json
 import logging
 import time
@@ -14,6 +15,7 @@ from unittest.mock import patch
 from cachetools import TTLCache
 from django.core.cache import caches
 from django.core.exceptions import PermissionDenied
+from django.db.utils import IntegrityError
 from django.db.utils import OperationalError
 from django.http import JsonResponse
 from django.test.utils import modify_settings
@@ -26,19 +28,33 @@ from rest_framework import status
 from rest_framework.test import APIClient
 
 from api.common import RH_IDENTITY_HEADER
-from api.common.pagination import EmptyResultsSetPagination
 from api.iam.models import Customer
 from api.iam.models import Tenant
 from api.iam.models import User
 from api.iam.test.iam_test_case import IamTestCase
-from api.user_access.view import UserAccessView
 from koku import middleware as MD
+from koku.cache import CacheEnum
 from koku.middleware import EXTENDED_METRICS
 from koku.middleware import HttpResponseUnauthorizedRequest
 from koku.middleware import IdentityHeaderMiddleware
 from koku.middleware import KokuTenantMiddleware
+from koku.middleware import KokuTenantSchemaExistsMiddleware
 from koku.middleware import RequestTimingMiddleware
 from koku.test_rbac import mocked_requests_get_500_text
+
+
+class KokuTenantSchemaExistsMiddlewareTest(IamTestCase):
+    def test_process_exception_empty_response(self):
+        """Assert that an exception raised for a non-existent Tenant returns empty result set."""
+        mock_request = MagicMock(user=Mock(customer=Mock(schema_name="nope")))
+        result = KokuTenantSchemaExistsMiddleware(Mock()).process_exception(mock_request, Exception())
+        self.assertIsInstance(result, JsonResponse)
+
+    def test_process_exception_not_empty_response(self):
+        """Assert that an exception raised for a valid tenant does not return emtpy result set."""
+        mock_request = self.request_context["request"]
+        result = KokuTenantSchemaExistsMiddleware(Mock()).process_exception(mock_request, Exception())
+        self.assertIsNone(result)
 
 
 class KokuTenantMiddlewareTest(IamTestCase):
@@ -47,25 +63,13 @@ class KokuTenantMiddlewareTest(IamTestCase):
     def setUp(self):
         """Set up middleware tests."""
         super().setUp()
-        self.request = self.request_context["request"]
+        self.request = copy.deepcopy(self.request_context["request"])
         self.request.path = "/api/v1/tags/aws/"
-        self.middleware = KokuTenantMiddleware()
+        mock_get_response = Mock()
+        self.middleware = KokuTenantMiddleware(mock_get_response)
 
-    def test_create_tenant(self):
-        """Test that a tenant is created if does not exist in database"""
-
-        mock_tenant_objects = MagicMock()
-        mock_tenant_objects.get_or_create.return_value = (self.tenant, True)
-
-        with patch("koku.middleware.Tenant.objects", mock_tenant_objects):
-            result = self.middleware._create_tenant()
-        self.assertIsNotNone(result)
-        self.assertEqual(result, self.tenant)
-        self.assertEqual(result.schema_name, self.schema_name)
-
-    def test_get_tenant_from_tenant_cache(self):
+    def test_get_tenant_from_cache(self):
         """Test that a tenant is returned when exists in tenant_cache"""
-
         tenant = MagicMock()
         tenant.schema_name = self.schema_name
         mock_request = self.request
@@ -74,23 +78,20 @@ class KokuTenantMiddlewareTest(IamTestCase):
 
         with patch("koku.middleware.KokuTenantMiddleware.tenant_cache.get") as mock_cache_get:
             mock_cache_get.return_value = tenant
-            result = self.middleware._get_tenant_from_tenant_cache(mock_request)
+            result = self.middleware._get_tenant(mock_request)
 
         self.assertEqual(result, tenant)
         self.assertEqual(result.schema_name, tenant.schema_name)
 
     def test_get_tenant_from_db(self):
         """Test that a tenant is returned when exists in Tenant database"""
-
-        mock_request = self.request_context["request"]
-        tenant_username = mock_request.user.username
-        result = self.middleware._get_tenant_from_db(tenant_username, self.schema_name)
+        mock_request = self.request
+        result = self.middleware._get_tenant(mock_request)
         self.assertIsNotNone(result)
         self.assertEqual(result.schema_name, self.schema_name)
 
     def test_get_tenant_with_no_user(self):
         """Test that a 401 is returned."""
-
         mock_request = self.request
         mock_request.user = None
         result = self.middleware.process_request(mock_request)
@@ -98,89 +99,41 @@ class KokuTenantMiddlewareTest(IamTestCase):
 
     def test_get_tenant_user_not_found(self):
         """Test that a 401 is returned."""
-
         mock_user = Mock(spec=["not-username"])
         mock_request = Mock(path="/api/v1/tags/aws/", user=mock_user)
         result = self.middleware.process_request(mock_request)
         self.assertIsInstance(result, HttpResponseUnauthorizedRequest)
 
-    @patch("koku.middleware.KokuTenantMiddleware._get_or_create_tenant")
     @patch("koku.rbac.RbacService.get_access_for_user")
-    def test_process_request_user_access_no_permissions(self, get_access_mock, mock_get_tenant):
+    def test_process_request_user_access_no_permissions(self, get_access_mock):
         """Test PermissionDenied is not raised for user-access calls"""
-
-        mock_access = {}
-        username = "mockuser"
-        get_access_mock.return_value = mock_access
-        mock_get_tenant.return_value = self.tenant
-
-        user_data = self._create_user_data()
-        customer = self._create_customer_data()
-        request_context = self._create_request_context(
-            customer, user_data, create_customer=True, create_tenant=True, is_admin=False
-        )
-        mock_request = request_context["request"]
-        mock_request.path = "/api/v1/user-access/"
-        mock_request.META["QUERY_STRING"] = ""
-        mock_user = Mock(username=username, admin=False, access=None)
-        mock_request = Mock(path="/api/v1/user-access/", user=mock_user)
-        IdentityHeaderMiddleware.create_user(
-            username=username,
-            email=self.user_data["email"],
-            customer=Customer.objects.get(account_id=customer.get("account_id")),
-            request=mock_request,
-        )
-
-        _ = self.middleware.process_request(mock_request)
-        mock_get_tenant.assert_called()
+        get_access_mock.return_value = {}
+        mock_request = self.request
+        mock_request.path = reverse("user-access")
+        try:
+            self.middleware.process_request(mock_request)
+        except PermissionDenied:
+            self.fail("test raised PermissionDenied")
 
     @patch("koku.rbac.RbacService.get_access_for_user")
     def test_process_request_denied(self, get_access_mock):
         """Test PermissionDenied is raised for non-user-access calls"""
-
-        mock_access = {}
-        username = "mockuser"
-        get_access_mock.return_value = mock_access
-
-        user_data = self._create_user_data()
-        customer = self._create_customer_data()
-        self._create_request_context(customer, user_data, create_customer=True, create_tenant=True, is_admin=False)
+        get_access_mock.return_value = {}
         mock_request = self.request
-        mock_request.path = "/api/v1/tags/aws/"
-        mock_request.META["QUERY_STRING"] = ""
-        mock_user = Mock(username=username, admin=False, access=None)
-        mock_request = Mock(path="/api/v1/tags/aws/", user=mock_user)
-        IdentityHeaderMiddleware.create_user(
-            username=username,
-            email=self.user_data["email"],
-            customer=Customer.objects.get(account_id=customer.get("account_id")),
-            request=mock_request,
-        )
-
         with self.assertRaises(PermissionDenied):
             _ = self.middleware.process_request(mock_request)
 
-    @patch("koku.middleware.KokuTenantMiddleware.tenant_cache", TTLCache(5, 3))
+    @patch("koku.middleware.KokuTenantMiddleware.tenant_cache", TTLCache(5, 1))
     def test_tenant_caching(self):
         """Test that the tenant cache is successfully storing and expiring."""
-
-        mock_request = self.request_context["request"]
-        # Add user to the mock_request
-        mock_user = Mock(username="testuser")
-        mock_request.user = mock_user
-        tenant_username = mock_request.user.username
-
         # Check that the cache is initially empty
         self.assertEqual(KokuTenantMiddleware.tenant_cache.currsize, 0)
 
-        with patch("koku.middleware.KokuTenantMiddleware.tenant_cache.get") as mock_cache_get:
-            # Add one item to the cache
-            KokuTenantMiddleware.tenant_cache[tenant_username] = self.tenant
-            mock_cache_get.return_value = self.tenant
-            self.middleware._get_tenant_from_tenant_cache(mock_request)
+        mock_request = self.request
+        self.middleware._get_tenant(mock_request)
 
         self.assertEqual(KokuTenantMiddleware.tenant_cache.currsize, 1)
-        time.sleep(4)  # Wait more than the ttl
+        time.sleep(1.1)  # Wait more than the ttl
         self.assertEqual(KokuTenantMiddleware.tenant_cache.currsize, 0)
 
 
@@ -193,18 +146,19 @@ class IdentityHeaderMiddlewareTest(IamTestCase):
         self.request = self.request_context["request"]
         self.request.path = "/api/v1/tags/aws/"
         self.request.META["QUERY_STRING"] = ""
+        self.mock_get_response = Mock()
 
     def test_process_status(self):
         """Test that the request gets a user."""
         mock_request = Mock(path="/api/v1/status/")
-        middleware = IdentityHeaderMiddleware()
+        middleware = IdentityHeaderMiddleware(self.mock_get_response)
         middleware.process_request(mock_request)
         self.assertTrue(hasattr(mock_request, "user"))
 
     def test_process_not_status(self):
         """Test that the customer, tenant and user are created."""
         mock_request = self.request
-        middleware = IdentityHeaderMiddleware()
+        middleware = IdentityHeaderMiddleware(self.mock_get_response)
         middleware.process_request(mock_request)
         self.assertTrue(hasattr(mock_request, "user"))
         customer = Customer.objects.get(account_id=self.customer.account_id)
@@ -214,12 +168,12 @@ class IdentityHeaderMiddlewareTest(IamTestCase):
         tenant = Tenant.objects.get(schema_name=self.schema_name)
         self.assertIsNotNone(tenant)
 
-    @patch("koku.middleware.IdentityHeaderMiddleware.customer_cache", TTLCache(5, 3))
-    @patch("koku.middleware.USER_CACHE", TTLCache(5, 3))
+    @patch("koku.middleware.IdentityHeaderMiddleware.customer_cache", TTLCache(5, 0.1))
+    @patch("koku.middleware.USER_CACHE", TTLCache(5, 0.1))
     def test_process_not_status_caching(self):
         """Test that the customer, tenant and user are created and cached"""
         mock_request = self.request
-        middleware = IdentityHeaderMiddleware()
+        middleware = IdentityHeaderMiddleware(self.mock_get_response)
         self.assertEqual(MD.USER_CACHE.currsize, 0)
         self.assertEqual(MD.USER_CACHE.maxsize, 5)  # Confirm that the size of the mocked user cache has been updated
         self.assertEqual(IdentityHeaderMiddleware.customer_cache.currsize, 0)
@@ -234,7 +188,7 @@ class IdentityHeaderMiddlewareTest(IamTestCase):
         self.assertIsNotNone(customer)
         user = User.objects.get(username=self.user_data["username"])
         self.assertIsNotNone(user)
-        time.sleep(4)  # Wait for the ttl
+        time.sleep(0.2)  # Wait for the ttl
         self.assertEqual(IdentityHeaderMiddleware.customer_cache.currsize, 0)
         self.assertEqual(MD.USER_CACHE.currsize, 0)
 
@@ -248,7 +202,7 @@ class IdentityHeaderMiddlewareTest(IamTestCase):
         request_context = self._create_request_context(customer, user_data, create_customer=False, create_user=False)
         mock_request = request_context["request"]
         mock_request.path = "/api/v1/tags/aws/"
-        middleware = IdentityHeaderMiddleware()
+        middleware = IdentityHeaderMiddleware(self.mock_get_response)
         middleware.process_request(mock_request)
         self.assertTrue(hasattr(mock_request, "user"))
         with self.assertRaises(Customer.DoesNotExist):
@@ -268,7 +222,7 @@ class IdentityHeaderMiddlewareTest(IamTestCase):
         mock_request = request_context["request"]
         mock_request.META["QUERY_STRING"] = ""
         mock_request.path = "/api/v1/tags/aws/"
-        middleware = IdentityHeaderMiddleware()
+        middleware = IdentityHeaderMiddleware(self.mock_get_response)
         middleware.process_request(mock_request)
         self.assertTrue(hasattr(mock_request, "user"))
         customer = Customer.objects.get(org_id=org_id)
@@ -280,7 +234,7 @@ class IdentityHeaderMiddlewareTest(IamTestCase):
         mock_request = request_context["request"]
         mock_request.META["QUERY_STRING"] = ""
         mock_request.path = "/api/v1/tags/aws/"
-        middleware = IdentityHeaderMiddleware()
+        middleware = IdentityHeaderMiddleware(self.mock_get_response)
         middleware.process_request(mock_request)
         customer = Customer.objects.get(org_id=org_id)
         self.assertEqual(customer.account_id, account_id)
@@ -290,48 +244,11 @@ class IdentityHeaderMiddlewareTest(IamTestCase):
         customer = self._create_customer_data()
         account_id = customer["account_id"]
         org_id = customer["org_id"]
-        orig_cust = IdentityHeaderMiddleware.create_customer(account_id, org_id)
-        dup_cust = IdentityHeaderMiddleware.create_customer(account_id, org_id)
+        orig_cust = IdentityHeaderMiddleware.create_customer(account_id, org_id, "POST")
+        dup_cust = IdentityHeaderMiddleware.create_customer(account_id, org_id, "POST")
         self.assertEqual(orig_cust, dup_cust)
 
-    def test_race_condition_user(self):
-        """Test case where another request may create the user in a race condition."""
-        mock_request = self.request
-        middleware = IdentityHeaderMiddleware()
-        middleware.process_request(mock_request)
-        self.assertTrue(hasattr(mock_request, "user"))
-        customer = Customer.objects.get(account_id=self.customer.account_id)
-        self.assertIsNotNone(customer)
-        user = User.objects.get(username=self.user_data["username"])
-        self.assertIsNotNone(user)
-        IdentityHeaderMiddleware.create_user(
-            username=self.user_data["username"], email=self.user_data["email"], customer=customer, request=mock_request
-        )
-
-    @patch("koku.middleware.USER_CACHE", TTLCache(5, 3))
-    def test_race_condition_user_caching(self):
-        """Test case for caching where another request may create the user in a race condition."""
-        mock_request = self.request
-        middleware = IdentityHeaderMiddleware()
-        self.assertEqual(MD.USER_CACHE.maxsize, 5)  # Confirm that the size of the user cache has changed
-        self.assertEqual(MD.USER_CACHE.currsize, 0)  # Confirm that the user cache is empty
-        middleware.process_request(mock_request)
-        self.assertEqual(MD.USER_CACHE.currsize, 1)
-        self.assertTrue(hasattr(mock_request, "user"))
-        customer = Customer.objects.get(account_id=self.customer.account_id)
-        self.assertIsNotNone(customer)
-        user = User.objects.get(username=self.user_data["username"])
-        self.assertEqual(MD.USER_CACHE.currsize, 1)
-        self.assertIsNotNone(user)
-        IdentityHeaderMiddleware.create_user(
-            username=self.user_data["username"],  # pylint: disable=W0212
-            email=self.user_data["email"],
-            customer=customer,
-            request=mock_request,
-        )
-        self.assertEqual(MD.USER_CACHE.currsize, 1)
-
-    @override_settings(CACHES={"rbac": {"BACKEND": "django.core.cache.backends.locmem.LocMemCache"}})
+    @override_settings(CACHES={CacheEnum.rbac: {"BACKEND": "django.core.cache.backends.locmem.LocMemCache"}})
     @patch("koku.rbac.RbacService.get_access_for_user")
     def test_process_non_admin(self, get_access_mock):
         """Test case for process_request as a non-admin user."""
@@ -356,16 +273,18 @@ class IdentityHeaderMiddlewareTest(IamTestCase):
         mock_request.path = "/api/v1/tags/aws/"
         mock_request.META["QUERY_STRING"] = ""
 
-        middleware = IdentityHeaderMiddleware()
+        middleware = IdentityHeaderMiddleware(self.mock_get_response)
         middleware.process_request(mock_request)
 
         user_uuid = mock_request.user.uuid
-        cache = caches["rbac"]
-        self.assertEqual(cache.get(user_uuid), mock_access)
+        org_id = customer.get("org_id")
+        cache = caches[CacheEnum.rbac]
+        cache_key = f"{user_uuid}_{org_id}"
+        self.assertEqual(cache.get(cache_key), mock_access)
 
         middleware.process_request(mock_request)
-        cache = caches["rbac"]
-        self.assertEqual(cache.get(user_uuid), mock_access)
+        cache = caches[CacheEnum.rbac]
+        self.assertEqual(cache.get(cache_key), mock_access)
 
     def test_process_not_entitled(self):
         """Test that the a request cannot be made if not entitled."""
@@ -378,7 +297,7 @@ class IdentityHeaderMiddlewareTest(IamTestCase):
         mock_request.path = "/api/v1/tags/aws/"
         mock_request.META["QUERY_STRING"] = ""
 
-        middleware = IdentityHeaderMiddleware()
+        middleware = IdentityHeaderMiddleware(self.mock_get_response)
         with self.assertRaises(PermissionDenied):
             middleware.process_request(mock_request)
 
@@ -393,7 +312,7 @@ class IdentityHeaderMiddlewareTest(IamTestCase):
         mock_request.path = "/api/v1/tags/aws/"
         mock_request.META["HTTP_X_RH_IDENTITY"] = "not a header"
 
-        middleware = IdentityHeaderMiddleware()
+        middleware = IdentityHeaderMiddleware(self.mock_get_response)
         with self.assertRaises(PermissionDenied):
             middleware.process_request(mock_request)
 
@@ -409,7 +328,7 @@ class IdentityHeaderMiddlewareTest(IamTestCase):
         mock_request.META["QUERY_STRING"] = ""
         mock_request.META["HTTP_REFERER"] = "http://cost.com/beta/report"
 
-        middleware = IdentityHeaderMiddleware()
+        middleware = IdentityHeaderMiddleware(self.mock_get_response)
         middleware.process_request(mock_request)
         self.assertTrue(mock_request.user.beta)
 
@@ -425,7 +344,7 @@ class IdentityHeaderMiddlewareTest(IamTestCase):
         mock_request.META["QUERY_STRING"] = ""
         mock_request.META["HTTP_REFERER"] = "http://cost.com/report"
 
-        middleware = IdentityHeaderMiddleware()
+        middleware = IdentityHeaderMiddleware(self.mock_get_response)
         middleware.process_request(mock_request)
         self.assertFalse(mock_request.user.beta)
 
@@ -444,7 +363,7 @@ class IdentityHeaderMiddlewareTest(IamTestCase):
         with patch("koku.middleware.Customer.objects") as mock_customer:
             mock_customer.filter.side_effect = OperationalError
 
-            middleware = IdentityHeaderMiddleware()
+            middleware = IdentityHeaderMiddleware(self.mock_get_response)
             response = middleware.process_request(mock_request)
             self.assertEqual(response.status_code, status.HTTP_424_FAILED_DEPENDENCY)
 
@@ -460,7 +379,7 @@ class IdentityHeaderMiddlewareTest(IamTestCase):
         mock_request.path = "/api/v1/tags/aws/"
         mock_request.META["QUERY_STRING"] = ""
 
-        middleware = IdentityHeaderMiddleware()
+        middleware = IdentityHeaderMiddleware(self.mock_get_response)
         response = middleware.process_request(mock_request)
         self.assertEqual(response.status_code, status.HTTP_424_FAILED_DEPENDENCY)
         mocked_get.assert_called()
@@ -477,7 +396,7 @@ class IdentityHeaderMiddlewareTest(IamTestCase):
         mock_request.path = "/api/v1/tags/aws/"
         mock_request.META["QUERY_STRING"] = ""
 
-        middleware = IdentityHeaderMiddleware()
+        middleware = IdentityHeaderMiddleware(self.mock_get_response)
 
         response = middleware.process_request(mock_request)
         self.assertEqual(response.status_code, status.HTTP_424_FAILED_DEPENDENCY)
@@ -525,8 +444,72 @@ class IdentityHeaderMiddlewareTest(IamTestCase):
 
         logging.disable(logging.NOTSET)
         with self.assertLogs(logger="koku.middleware", level=logging.WARNING):
-            middleware = IdentityHeaderMiddleware()
+            middleware = IdentityHeaderMiddleware(self.mock_get_response)
             middleware.process_request(mock_request)
+
+    @override_settings(DEVELOPMENT=True)
+    def test_process_service_account_identity(self):
+        """Test that process_request() passes-through a custom identity."""
+        fake = Faker()
+
+        identity = {
+            "identity": {
+                "account_number": str(fake.pyint()),
+                "org_id": str(fake.pyint()),
+                "type": "ServiceAccount",
+                "service_account": {
+                    "username": fake.word(),
+                    "client_id": fake.word(),
+                },
+            },
+            "entitlements": {"cost_management": {"is_entitled": True}},
+        }
+
+        mock_request = Mock(path="/api/v1/reports/azure/costs/", META={"QUERY_STRING": ""})
+
+        user = Mock(
+            access={
+                "aws.account": {"read": ["1234567890AB", "234567890AB1"]},
+                "azure.subscription_guid": {"read": ["*"]},
+            },
+            username=fake.word(),
+            email="",
+            admin=False,
+            customer=Mock(account_id=fake.pyint()),
+            req_id="DEVELOPMENT",
+        )
+
+        mock_request.user = user
+        mock_request.META[RH_IDENTITY_HEADER] = base64.b64encode(json.dumps(identity).encode("utf-8"))
+        middleware = IdentityHeaderMiddleware(self.mock_get_response)
+        middleware.process_request(mock_request)
+
+    @patch("api.iam.models.Customer.save")
+    def test_create_customer(self, mock_save):
+        """Test creating a customer."""
+
+        mock_save.return_value = None
+        customer = IdentityHeaderMiddleware.create_customer("test_account", "test_org", "POST")
+
+        self.assertIsNotNone(customer)
+        self.assertEqual(customer.account_id, "test_account")
+        mock_save.assert_called_once()
+
+    @patch("api.iam.models.Customer.objects.filter")
+    @patch("api.iam.models.Customer.save", side_effect=IntegrityError)
+    def test_create_customer_integrity_error_existing_customer(self, mock_save, mock_filter):
+        """Test fetching an  existing customer when an IntegrityError occurs."""
+
+        mock_query_set = MagicMock()
+        mock_filter.return_value = mock_query_set
+        mock_query_set.get.return_value = MagicMock(account_id="test_account", org_id="test_org")
+
+        customer = IdentityHeaderMiddleware.create_customer("test_account", "test_org", "POST")
+
+        self.assertIsNotNone(customer)
+        mock_save.assert_called_once()
+        self.assertEqual(customer.org_id, "test_org")
+        mock_filter.assert_called_once_with(org_id="test_org")
 
 
 class RequestTimingMiddlewareTest(IamTestCase):
@@ -541,12 +524,12 @@ class RequestTimingMiddlewareTest(IamTestCase):
 
     def test_process_request(self):
         """Test that the request gets a user."""
-
-        middleware = RequestTimingMiddleware()
+        mock_get_response = Mock()
+        middleware = RequestTimingMiddleware(mock_get_response)
         middleware.process_request(self.request)
         self.assertTrue(hasattr(self.request, "start_time"))
 
-    @patch("koku.middleware.KokuTenantMiddleware._get_or_create_tenant")
+    @patch("koku.middleware.KokuTenantMiddleware._get_tenant")
     def test_process_response(self, mock_get_tenant):
         """Test that the request gets a user."""
 
@@ -587,36 +570,3 @@ class AccountEnhancedMiddlewareTest(IamTestCase):
         for metric in registry:
             if metric.name in EXTENDED_METRICS:
                 self.assertIn("account", metric.samples[0].labels)
-
-
-class KokuTenantSchemaExistsMiddlewareTest(IamTestCase):
-    def setUp(self):
-        """Set up middleware tests."""
-        super().setUp()
-        self.request = self.request_context["request"]
-        self.request.path = "/api/v1/tags/aws/"
-        self.request.META["QUERY_STRING"] = ""
-
-    def test_tenant_without_schema(self):
-        test_schema = "acct00000"
-        customer = {"account_id": "00000", "org_id": "0000000", "schema_name": test_schema}
-        user_data = self._create_user_data()
-        request_context = self._create_request_context(customer, user_data, create_customer=True, create_tenant=False)
-
-        client = APIClient()
-        url = reverse("aws-tags")
-        result = client.get(url, **request_context["request"].META)
-        expected = EmptyResultsSetPagination([], request_context.get("request")).get_paginated_response()
-        self.assertEqual(result.get("data"), expected.get("data"))
-        self.assertIsInstance(result, JsonResponse)
-
-    def test_tenant_without_schema_user_access(self):
-        test_schema = "acct00000"
-        customer = {"account_id": "00000", "org_id": "0000000", "schema_name": test_schema}
-        user_data = self._create_user_data()
-        request_context = self._create_request_context(customer, user_data, create_customer=True, create_tenant=False)
-
-        client = APIClient()
-        url = reverse("user-access")
-        result = client.get(url, **request_context["request"].META)
-        self.assertEqual(len(result.json().get("data")), len(UserAccessView._source_types))

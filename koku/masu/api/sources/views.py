@@ -9,6 +9,7 @@ from django_filters import BooleanFilter
 from django_filters import FilterSet
 from django_filters import UUIDFilter
 from django_filters.rest_framework import DjangoFilterBackend
+from django_tenants.utils import schema_context
 from rest_framework import mixins
 from rest_framework import viewsets
 from rest_framework.permissions import AllowAny
@@ -17,6 +18,7 @@ from rest_framework.serializers import ValidationError
 
 from api.common.filters import CharListFilter
 from api.provider.models import Sources
+from cost_models.models import CostModelMap
 from masu.api.sources.serializers import SourceSerializer
 
 MIXIN_LIST = [mixins.ListModelMixin, mixins.RetrieveModelMixin, mixins.UpdateModelMixin, viewsets.GenericViewSet]
@@ -97,3 +99,30 @@ class SourcesViewSet(*MIXIN_LIST):
             raise Http404
 
         return obj
+
+    def list(self, request, *args, **kwargs):
+        """Obtain the list of sources."""
+        response = super().list(request=request, args=args, kwargs=kwargs)
+        for obj in response.data["data"]:
+            obj["cost_models"] = self.get_cost_models(obj)
+        return response
+
+    def retrieve(self, request, *args, **kwargs):
+        """Get a source."""
+        response = super().retrieve(request=request, args=args, kwargs=kwargs)
+        response.data["cost_models"] = self.get_cost_models(response.data)
+        return response
+
+    def get_cost_models(self, obj):
+        """Get the cost models associated with this provider."""
+        try:
+            # The key value may be None, so 'or' is used instead of a default value for get()
+            provider = obj.get("provider") or {}
+            customer = provider.get("customer") or {}
+            schema = customer["schema_name"]
+        except (AttributeError, KeyError):
+            return []
+
+        with schema_context(schema):
+            cost_models_map = CostModelMap.objects.filter(provider_uuid=obj["source_uuid"])
+            return [{"name": m.cost_model.name, "uuid": m.cost_model.uuid} for m in cost_models_map]

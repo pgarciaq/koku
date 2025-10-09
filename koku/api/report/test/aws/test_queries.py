@@ -14,6 +14,7 @@ from unittest.mock import patch
 from unittest.mock import PropertyMock
 
 from dateutil.relativedelta import relativedelta
+from django.conf import settings
 from django.db.models import Count
 from django.db.models import DecimalField
 from django.db.models import F
@@ -29,6 +30,7 @@ from api.iam.test.iam_test_case import IamTestCase
 from api.report.aws.query_handler import AWSReportQueryHandler
 from api.report.aws.serializers import AWSExcludeSerializer
 from api.report.aws.view import AWSCostView
+from api.report.aws.view import AWSEC2ComputeView
 from api.report.aws.view import AWSInstanceTypeView
 from api.report.aws.view import AWSStorageView
 from api.report.constants import AWS_CATEGORY_PREFIX
@@ -274,6 +276,12 @@ class AWSReportQueryTest(IamTestCase):
         handler = AWSReportQueryHandler(query_params)
         self.assertEqual(handler.get_time_scope_units(), "day")
 
+    def test_get_time_scope_units_empty_report_default(self):
+        """Test get_time_scope_units returns report default value when query params are empty."""
+        query_params = self.mocked_query_params("", AWSEC2ComputeView)
+        handler = AWSReportQueryHandler(query_params)
+        self.assertEqual(handler.get_time_scope_units(), "month")
+
     def test_get_time_scope_units_existing_value(self):
         """Test get_time_scope_units returns month when time_scope is month."""
         url = "?filter[time_scope_units]=month"
@@ -287,6 +295,12 @@ class AWSReportQueryTest(IamTestCase):
         query_params = self.mocked_query_params(url, AWSCostView)
         handler = AWSReportQueryHandler(query_params)
         self.assertEqual(handler.get_time_scope_value(), -10)
+
+    def test_get_time_scope_value_empty_report_default(self):
+        """Test get_time_scope_value returns report default value when query params are empty."""
+        query_params = self.mocked_query_params("", AWSEC2ComputeView)
+        handler = AWSReportQueryHandler(query_params)
+        self.assertEqual(handler.get_time_scope_value(), -1)
 
     def test_get_time_scope_value_existing_value(self):
         """Test validationerror for invalid time_scope_value."""
@@ -2262,7 +2276,7 @@ class AWSReportQueryTest(IamTestCase):
 
     def test_order_by(self):
         """Test that order_by returns properly sorted data."""
-        today = datetime.utcnow()
+        today = datetime.now(tz=settings.UTC)
         yesterday = today - timedelta(days=1)
         url = "?filter[time_scope_units]=month&filter[time_scope_value]=-1&filter[resolution]=monthly"  # noqa: E501
         query_params = self.mocked_query_params(url, AWSCostView)
@@ -3328,3 +3342,70 @@ class AWSQueryHandlerTest(IamTestCase):
                         self.assertIsNotNone(grouping_list)
                         for group_dict in grouping_list:
                             self.assertNotIn(group_dict.get(ex_opt), [exclude_one, exclude_two])
+
+    def test_format_ec2_response_not_csv(self):
+        query_params = self.mocked_query_params("", AWSEC2ComputeView)
+        handler = AWSReportQueryHandler(query_params)
+
+        # Input data
+        query_data = [
+            {
+                "resource_ids": [
+                    {
+                        "values": [
+                            {
+                                "tags": [
+                                    {"Map": "c2"},
+                                    {"Name": "instance_name_3"},
+                                ]
+                            }
+                        ]
+                    }
+                ]
+            }
+        ]
+
+        # Expected output
+        expected_output = [
+            {
+                "resource_ids": [
+                    {
+                        "values": [
+                            {
+                                "tags": [
+                                    {"key": "Map", "values": ["c2"]},
+                                    {"key": "Name", "values": ["instance_name_3"]},
+                                ]
+                            }
+                        ]
+                    }
+                ]
+            }
+        ]
+
+        result = handler.format_ec2_response(query_data)
+        self.assertEqual(result, expected_output)
+
+    def test_format_ec2_response_csv(self):
+        query_params = self.mocked_query_params("", AWSEC2ComputeView)
+        handler = AWSReportQueryHandler(query_params)
+        handler.is_csv_output = True
+        handler.time_interval = [self.dh.this_month_start]
+
+        # Input data
+        query_data = [
+            {
+                "resource_id": "i-55555559",
+                "tags": [
+                    {"Map": "c2"},
+                    {"Name": "instance_name_3"},
+                ],
+            }
+        ]
+
+        # Expected output
+        expected_date_str = self.dh.this_month_start.strftime("%Y-%m")
+        expected_output = [{"date": expected_date_str, "resource_ids": [{"resource_id": "i-55555559"}]}]
+
+        result = handler.format_ec2_response(query_data)
+        self.assertEqual(result, expected_output)

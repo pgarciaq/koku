@@ -67,12 +67,6 @@ class AWSAuthenticationSerializer(ProviderAuthenticationSerializer):
         return validate_field(creds, fields, key)
 
 
-class OCIAuthenticationSerializer(ProviderAuthenticationSerializer):
-    """OCI auth serializer."""
-
-    credentials = serializers.JSONField(required=False, default={})
-
-
 class AzureAuthenticationSerializer(ProviderAuthenticationSerializer):
     """Azure auth serializer."""
 
@@ -97,16 +91,6 @@ class GCPAuthenticationSerializer(ProviderAuthenticationSerializer):
         """Validate credentials field."""
         key = "project_id"
         fields = ["project_id"]
-        return validate_field(creds, fields, key)
-
-
-class IBMAuthenticationSerializer(ProviderAuthenticationSerializer):
-    """IBM auth serializer."""
-
-    def validate_credentials(self, creds):
-        """Validate credentials field."""
-        key = "iam_token"
-        fields = ["iam_token"]
         return validate_field(creds, fields, key)
 
 
@@ -143,16 +127,6 @@ class AWSBillingSourceSerializer(ProviderBillingSourceSerializer):
         return validate_field(data_source, fields, key)
 
 
-class OCIBillingSourceSerializer(ProviderBillingSourceSerializer):
-    """OCI billing source serializer."""
-
-    def validate_data_source(self, data_source):
-        """Validate data_source field."""
-        key = "provider.data_source"
-        fields = ["bucket", "bucket_namespace", "bucket_region"]
-        return validate_field(data_source, fields, key)
-
-
 class AzureBillingSourceSerializer(ProviderBillingSourceSerializer):
     """Azure billing source serializer."""
 
@@ -184,16 +158,6 @@ class GCPBillingSourceSerializer(ProviderBillingSourceSerializer):
         return data
 
 
-class IBMBillingSourceSerializer(ProviderBillingSourceSerializer):
-    """IBM billing source serializer."""
-
-    def validate_data_source(self, data_source):
-        """Validate data_source field."""
-        key = "provider.data_source"
-        fields = ["enterprise_id"]
-        return validate_field(data_source, fields, key)
-
-
 class OCPBillingSourceSerializer(ProviderBillingSourceSerializer):
     """OCP billing source serializer."""
 
@@ -204,32 +168,23 @@ class OCPBillingSourceSerializer(ProviderBillingSourceSerializer):
 AUTHENTICATION_SERIALIZERS = {
     Provider.PROVIDER_AWS: AWSAuthenticationSerializer,
     Provider.PROVIDER_AWS_LOCAL: AWSAuthenticationSerializer,
-    Provider.PROVIDER_OCI: OCIAuthenticationSerializer,
-    Provider.PROVIDER_OCI_LOCAL: OCIAuthenticationSerializer,
     Provider.PROVIDER_AZURE: AzureAuthenticationSerializer,
     Provider.PROVIDER_AZURE_LOCAL: AzureAuthenticationSerializer,
     Provider.PROVIDER_GCP: GCPAuthenticationSerializer,
     Provider.PROVIDER_GCP_LOCAL: GCPAuthenticationSerializer,
-    Provider.PROVIDER_IBM: IBMAuthenticationSerializer,
-    Provider.PROVIDER_IBM_LOCAL: IBMAuthenticationSerializer,
     Provider.PROVIDER_OCP: OCPAuthenticationSerializer,
     Provider.OCP_AWS: AWSAuthenticationSerializer,
     Provider.OCP_AZURE: AzureAuthenticationSerializer,
 }
 
-
 # Registry of billing_source serializers.
 BILLING_SOURCE_SERIALIZERS = {
     Provider.PROVIDER_AWS: AWSBillingSourceSerializer,
     Provider.PROVIDER_AWS_LOCAL: AWSBillingSourceSerializer,
-    Provider.PROVIDER_OCI: OCIBillingSourceSerializer,
-    Provider.PROVIDER_OCI_LOCAL: OCIBillingSourceSerializer,
     Provider.PROVIDER_AZURE: AzureBillingSourceSerializer,
     Provider.PROVIDER_AZURE_LOCAL: AzureBillingSourceSerializer,
     Provider.PROVIDER_GCP: GCPBillingSourceSerializer,
     Provider.PROVIDER_GCP_LOCAL: GCPBillingSourceSerializer,
-    Provider.PROVIDER_IBM: IBMBillingSourceSerializer,
-    Provider.PROVIDER_IBM_LOCAL: IBMBillingSourceSerializer,
     Provider.PROVIDER_OCP: OCPBillingSourceSerializer,
     Provider.OCP_AWS: AWSBillingSourceSerializer,
     Provider.OCP_AZURE: AzureBillingSourceSerializer,
@@ -358,14 +313,14 @@ class ProviderSerializer(serializers.ModelSerializer):
         if dup_queryset.count() != 0:
             message = (
                 "Cost management does not allow duplicate accounts. "
-                "A source already exists with these details. Edit source settings to configure a new source."
+                "An integration already exists with these details. "
+                "Edit integration settings to configure a new integration."
             )
-            LOG.warn(message)
+            LOG.warning(message)
             raise serializers.ValidationError(error_obj(ProviderErrors.DUPLICATE_AUTH, message))
 
         provider = Provider.objects.create(**validated_data)
         provider.customer = customer
-        provider.created_by = user
         provider.authentication = auth
         provider.billing_source = bill
         provider.active = True
@@ -420,9 +375,10 @@ class ProviderSerializer(serializers.ModelSerializer):
                 if dup_queryset.count() != 0:
                     message = (
                         "Cost management does not allow duplicate accounts. "
-                        "A source already exists with these details. Edit source settings to configure a new source."
+                        "An integration already exists with these details. "
+                        "Edit integration settings to configure a new integration."
                     )
-                    LOG.warn(message)
+                    LOG.warning(message)
                     raise serializers.ValidationError(error_obj(ProviderErrors.DUPLICATE_AUTH, message))
 
             for key in validated_data.keys():

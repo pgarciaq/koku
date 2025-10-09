@@ -4,11 +4,13 @@
 #
 """Processor for OCP Parquet files."""
 import datetime
+import logging
 
 import ciso8601
 from django.conf import settings
 from django_tenants.utils import schema_context
 
+from api.common import log_json
 from masu.processor.report_parquet_processor_base import ReportParquetProcessorBase
 from masu.util.common import month_date_range
 from masu.util.ocp import common as utils
@@ -16,6 +18,8 @@ from reporting.provider.ocp.models import OCPUsageLineItemDailySummary
 from reporting.provider.ocp.models import OCPUsageReportPeriod
 from reporting.provider.ocp.models import TRINO_LINE_ITEM_TABLE_DAILY_MAP
 from reporting.provider.ocp.models import TRINO_LINE_ITEM_TABLE_MAP
+
+LOG = logging.getLogger(__name__)
 
 
 class OCPReportParquetProcessor(ReportParquetProcessorBase):
@@ -41,6 +45,22 @@ class OCPReportParquetProcessor(ReportParquetProcessorBase):
             "volume_request_storage_byte_seconds",
             "persistentvolumeclaim_capacity_byte_seconds",
             "persistentvolumeclaim_capacity_bytes",
+            "vm_uptime_total_seconds",
+            "vm_cpu_limit_cores",
+            "vm_cpu_limit_core_seconds",
+            "vm_cpu_request_cores",
+            "vm_cpu_request_core_seconds",
+            "vm_cpu_request_sockets",
+            "vm_cpu_request_socket_seconds",
+            "vm_cpu_request_threads",
+            "vm_cpu_request_thread_seconds",
+            "vm_cpu_usage_total_seconds",
+            "vm_memory_limit_bytes",
+            "vm_memory_limit_byte_seconds",
+            "vm_memory_request_bytes",
+            "vm_memory_request_byte_seconds",
+            "vm_memory_usage_byte_seconds",
+            "vm_disk_allocated_size_byte_seconds",
         ]
         date_columns = ["report_period_start", "report_period_end", "interval_start", "interval_end"]
         column_types = {"numeric_columns": numeric_columns, "date_columns": date_columns, "boolean_columns": []}
@@ -76,11 +96,24 @@ class OCPReportParquetProcessor(ReportParquetProcessorBase):
         cluster_id = utils.get_cluster_id_from_provider(provider.uuid)
         cluster_alias = utils.get_cluster_alias_from_cluster_id(cluster_id)
 
-        with schema_context(self._schema_name):
-            OCPUsageReportPeriod.objects.get_or_create(
+        LOG.info(
+            log_json(
+                msg="getting or creating bill",
                 cluster_id=cluster_id,
                 cluster_alias=cluster_alias,
+                provider_uuid=provider.uuid,
+                provider_name=provider.name,
+                provider_type=provider.type,
+                schema=self._schema_name,
+            )
+        )
+        with schema_context(self._schema_name):
+            bill, _ = OCPUsageReportPeriod.objects.get_or_create(
+                cluster_id=cluster_id,
                 report_period_start=report_period_start,
                 report_period_end=report_period_end,
                 provider_id=provider.uuid,
             )
+            if bill.cluster_alias != cluster_alias:
+                bill.cluster_alias = cluster_alias
+                bill.save(update_fields=["cluster_alias"])

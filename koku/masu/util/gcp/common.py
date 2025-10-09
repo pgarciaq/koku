@@ -5,20 +5,49 @@
 """GCP utility functions and vars."""
 import datetime
 import logging
-import uuid
 
-import pandas as pd
 from django_tenants.utils import schema_context
 
 from api.models import Provider
-from masu.database.provider_db_accessor import ProviderDBAccessor
-from masu.external.accounts_accessor import AccountsAccessor
-from masu.processor import is_gcp_resource_matching_disabled
-from masu.util.ocp.common import match_openshift_labels
 from reporting.provider.gcp.models import GCPCostEntryBill
 
 LOG = logging.getLogger(__name__)
-pd.options.mode.chained_assignment = None
+
+
+RESOURCE_LEVEL_EXPORT_NAME = "gcp_billing_export_resource"
+
+GCP_COLUMN_LIST = [
+    "billing_account_id",
+    "service.id",
+    "service.description",
+    "sku.id",
+    "sku.description",
+    "usage_start_time",
+    "usage_end_time",
+    "project.id",
+    "project.name",
+    "project.labels",
+    "project.ancestry_numbers",
+    "labels",
+    "system_labels",
+    "location.location",
+    "location.country",
+    "location.region",
+    "location.zone",
+    "export_time",
+    "cost",
+    "currency",
+    "currency_conversion_rate",
+    "usage.amount",
+    "usage.unit",
+    "usage.amount_in_pricing_units",
+    "usage.pricing_unit",
+    "credits",
+    "invoice.month",
+    "cost_type",
+    "resource.name",
+    "resource.global_name",
+]
 
 
 def get_bills_from_provider(provider_uuid, schema, start_date=None, end_date=None):
@@ -42,9 +71,7 @@ def get_bills_from_provider(provider_uuid, schema, start_date=None, end_date=Non
     if isinstance(end_date, (datetime.datetime, datetime.date)):
         end_date = end_date.strftime("%Y-%m-%d")
 
-    with ProviderDBAccessor(provider_uuid) as provider_accessor:
-        provider = provider_accessor.get_provider()
-
+    provider = Provider.objects.filter(uuid=provider_uuid).first()
     if not provider:
         err_msg = "Provider UUID is not associated with a given provider."
         LOG.warning(err_msg)
@@ -61,163 +88,11 @@ def get_bills_from_provider(provider_uuid, schema, start_date=None, end_date=Non
             bills = bills.filter(billing_period_start__gte=start_date)
         if end_date:
             bills = bills.filter(billing_period_start__lte=end_date)
-        bills = bills.all()
+        # postgres doesn't always return this query in the same order, ordering by ID (PK) will
+        # ensure that any list iteration or indexing is always done in the same order
+        bills = list(bills.order_by("id").all())
 
     return bills
-
-
-def match_openshift_resources_and_labels(data_frame, cluster_topologies, matched_tags):
-    """Filter a dataframe to the subset that matches an OpenShift source."""
-    tags = data_frame["labels"]
-    tags = tags.str.lower()
-    resource_id_df = data_frame.get("resource_name")
-    match_columns = []
-
-    for i, cluster_topology in enumerate(cluster_topologies):
-        match_col_name = f"ocp_matched_{i}"
-        cluster_id = cluster_topology.get("cluster_id", "")
-        cluster_alias = cluster_topology.get("cluster_alias", "")
-        nodes = cluster_topology.get("nodes", [])
-        volumes = cluster_topology.get("persistent_volumes", [])
-        matchable_resources = nodes + volumes
-
-        if resource_id_df.any():
-            LOG.info("Matching OpenShift on GCP by resource ID.")
-            ocp_matched = resource_id_df.str.contains("|".join(matchable_resources))
-        else:
-            LOG.info("Matching OpenShift on GCP by labels.")
-            cluster_strings = [
-                f"kubernetes-io-cluster-{cluster_identifier}" for cluster_identifier in (cluster_id, cluster_alias)
-            ]
-            ocp_matched = tags.str.contains("|".join(cluster_strings))
-
-        # Add in OCP Cluster these resources matched to
-        data_frame[match_col_name] = ocp_matched
-        data_frame.loc[data_frame[match_col_name] == True, "ocp_source_uuid"] = cluster_topology.get(  # noqa: E712
-            "provider_uuid"
-        )
-        match_columns.append(match_col_name)
-
-    # Consildate the columns per cluster into a single column
-    data_frame.loc[data_frame["ocp_source_uuid"].notnull(), "ocp_matched"] = True
-    data_frame = data_frame.drop(columns=match_columns)
-    data_frame["ocp_source_uuid"].fillna(value="", inplace=True)
-
-    special_case_tag_matched = tags.str.contains(
-        "|".join(
-            [
-                "openshift_cluster",
-                "openshift_project",
-                "openshift_node",
-            ]
-        )
-    )
-    data_frame["special_case_tag_matched"] = special_case_tag_matched
-    if matched_tags:
-        tag_keys = []
-        tag_values = []
-        for tag in matched_tags:
-            tag_keys.extend(list(tag.keys()))
-            tag_values.extend(list(tag.values()))
-
-        tag_matched = tags.str.contains("|".join(tag_keys)) & tags.str.contains("|".join(tag_values))
-        data_frame["tag_matched"] = tag_matched
-        any_tag_matched = tag_matched.any()
-
-        if any_tag_matched:
-            tag_df = pd.concat([tags, tag_matched], axis=1)
-            tag_df.columns = ("tags", "tag_matched")
-            tag_subset = tag_df[tag_df.tag_matched == True].tags  # noqa: E712
-
-            LOG.info("Matching OpenShift on GCP tags.")
-
-            matched_tag = tag_subset.apply(match_openshift_labels, args=(matched_tags,))
-            data_frame["matched_tag"] = matched_tag
-            data_frame["matched_tag"].fillna(value="", inplace=True)
-        else:
-            data_frame["matched_tag"] = ""
-    else:
-        data_frame["tag_matched"] = False
-        data_frame["matched_tag"] = ""
-    openshift_matched_data_frame = data_frame[
-        (data_frame["ocp_matched"] == True)  # noqa: E712
-        | (data_frame["special_case_tag_matched"] == True)  # noqa: E712
-        | (data_frame["matched_tag"] != "")  # noqa: E712
-    ]
-
-    openshift_matched_data_frame["uuid"] = openshift_matched_data_frame.apply(lambda _: str(uuid.uuid4()), axis=1)
-    openshift_matched_data_frame = openshift_matched_data_frame.drop(
-        columns=["special_case_tag_matched", "tag_matched"]
-    )
-
-    return openshift_matched_data_frame
-
-
-def deduplicate_reports_for_gcp(report_list):
-    """Deduplicate the reports using the invoice."""
-    invoice_dict = {}
-    for report in report_list:
-        invoice = report.get("invoice_month")
-        start_key = invoice + "_start"
-        end_key = invoice + "_end"
-        if not invoice_dict.get(start_key) or not invoice_dict.get(end_key):
-            invoice_dict[start_key] = [report.get("start")]
-            invoice_dict[end_key] = [report.get("end")]
-        else:
-            invoice_dict[start_key].append(report.get("start"))
-            invoice_dict[end_key].append(report.get("end"))
-
-    restructure_dict = {}
-    reports_deduplicated = []
-    for invoice_key, date_list in invoice_dict.items():
-        invoice_month, date_term = invoice_key.split("_")
-        if date_term == "start":
-            date_agg = min(date_list)
-        else:
-            date_agg = max(date_list)
-        if restructure_dict.get(invoice_month):
-            restructure_dict[invoice_month][date_term] = date_agg
-        else:
-            restructure_dict[invoice_month] = {date_term: date_agg}
-
-    for invoice_month, date_dict in restructure_dict.items():
-        reports_deduplicated.append(
-            {
-                "manifest_id": report.get("manifest_id"),
-                "tracing_id": report.get("tracing_id"),
-                "schema_name": report.get("schema_name"),
-                "provider_type": report.get("provider_type"),
-                "provider_uuid": report.get("provider_uuid"),
-                "start": date_dict.get("start"),
-                "end": date_dict.get("end"),
-                "invoice_month": invoice_month,
-            }
-        )
-    return reports_deduplicated
-
-
-def check_resource_level(gcp_provider_uuid):
-    LOG.info("Fetching account for checking unleash resource level")
-    account = AccountsAccessor().get_accounts(gcp_provider_uuid)
-    if account != []:
-        if is_gcp_resource_matching_disabled(account[0].get("schema_name")):
-            LOG.info(f"GCP resource matching disabled for {account[0].get('schema_name')}")
-            return False
-    else:
-        LOG.info("Account not returned, source likely has processing suspended.")
-        return False
-    with ProviderDBAccessor(gcp_provider_uuid) as provider_accessor:
-        source = provider_accessor.get_data_source()
-        if source:
-            if not source.get("storage_only"):
-                if "resource" in source.get("table_id"):
-                    LOG.info("OCP GCP matching set to resource level")
-                    return True
-            else:
-                LOG.info("Storage only source defaults to resource level only")
-                return True
-        LOG.info("Defaulting to GCP tag matching")
-        return False
 
 
 def add_label_columns(data_frame):

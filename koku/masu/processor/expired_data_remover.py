@@ -9,14 +9,14 @@ from datetime import timedelta
 
 from django.conf import settings
 
+from api.common import log_json
 from api.models import Provider
+from api.utils import DateHelper
 from masu.config import Config
 from masu.database.report_manifest_db_accessor import ReportManifestDBAccessor
-from masu.external.date_accessor import DateAccessor
 from masu.processor.aws.aws_report_db_cleaner import AWSReportDBCleaner
 from masu.processor.azure.azure_report_db_cleaner import AzureReportDBCleaner
 from masu.processor.gcp.gcp_report_db_cleaner import GCPReportDBCleaner
-from masu.processor.oci.oci_report_db_cleaner import OCIReportDBCleaner
 from masu.processor.ocp.ocp_report_db_cleaner import OCPReportDBCleaner
 
 LOG = logging.getLogger(__name__)
@@ -82,8 +82,6 @@ class ExpiredDataRemover:
             return OCPReportDBCleaner(self._schema)
         if self._provider in (Provider.PROVIDER_GCP, Provider.PROVIDER_GCP_LOCAL):
             return GCPReportDBCleaner(self._schema)
-        if self._provider in (Provider.PROVIDER_OCI, Provider.PROVIDER_OCI_LOCAL):
-            return OCIReportDBCleaner(self._schema)
 
         return None
 
@@ -100,7 +98,7 @@ class ExpiredDataRemover:
         """
         months = self._months_to_keep
         expiration_msg = "Report data expiration is {} for a {} month retention policy"
-        today = DateAccessor().today()
+        today = DateHelper().today
         LOG.info("Current date time is %s", today)
 
         middle_of_current_month = today.replace(day=15)
@@ -138,10 +136,11 @@ class ExpiredDataRemover:
                 if not simulate:
                     manifest_accessor.purge_expired_report_manifest_provider_uuid(provider_uuid, expiration_date)
                 LOG.info(
-                    """Removed CostUsageReportManifest for
-                    provider uuid: %s before billing period: %s""",
-                    provider_uuid,
-                    expiration_date,
+                    log_json(
+                        msg="Removed CostUsageReportManifest",
+                        provider_uuid=provider_uuid,
+                        expiration_date=expiration_date,
+                    )
                 )
         else:
             expiration_date = self._calculate_expiration_date()
@@ -151,10 +150,22 @@ class ExpiredDataRemover:
                 if not simulate:
                     manifest_accessor.purge_expired_report_manifest(self._provider, expiration_date)
                 LOG.info(
-                    """Removed CostUsageReportManifest for
-                    provider type: %s before billing period: %s""",
-                    self._provider,
-                    expiration_date,
+                    log_json(
+                        msg="Removed CostUsageReportManifest", provider=self._provider, expiration_date=expiration_date
+                    )
                 )
-
         return removed_data
+
+    def remove_expired_trino_partitions(self, simulate=False):
+        """
+        Removes expired trino partitions based on the retention policy.
+        """
+        if self._provider != Provider.PROVIDER_OCP:
+            LOG.info(f"{Provider.PROVIDER_OCP} is the only supported type for removing trino partitions.")
+            return
+        removed_partitions = []
+        expiration_date = self._calculate_expiration_date()
+        removed_partitions = self._cleaner.purge_expired_trino_partitions(
+            expired_date=expiration_date, simulate=simulate
+        )
+        return removed_partitions

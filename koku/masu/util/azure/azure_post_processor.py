@@ -1,13 +1,19 @@
 import json
+import logging
+from uuid import uuid4
 
 import ciso8601
-from numpy import nan
+import pandas as pd
 
-from masu.util.common import create_enabled_keys
+from api.models import Provider
+from masu.util.azure.common import INGRESS_REQUIRED_ALT_COLUMNS
+from masu.util.azure.common import INGRESS_REQUIRED_COLUMNS
+from masu.util.common import populate_enabled_tag_rows_with_limit
 from masu.util.common import safe_float
 from masu.util.common import strip_characters_from_column_name
-from reporting.provider.azure.models import AzureEnabledTagKeys
-from reporting.provider.azure.models import TRINO_COLUMNS
+from reporting.provider.azure.models import TRINO_REQUIRED_COLUMNS
+
+LOG = logging.getLogger(__name__)
 
 
 def azure_json_converter(tag_str):
@@ -38,84 +44,34 @@ def azure_date_converter(date):
             new_date = ciso8601.parse_datetime(new_date_str)
         return new_date
     else:
-        return nan
+        return pd.NaT
 
 
 class AzurePostProcessor:
-
-    INGRESS_REQUIRED_COLUMNS = {
-        "SubscriptionGuid",
-        "ResourceGroup",
-        "ResourceLocation",
-        "UsageDateTime",
-        "MeterCategory",
-        "MeterSubcategory",
-        "MeterId",
-        "MeterName",
-        "MeterRegion",
-        "UsageQuantity",
-        "ResourceRate",
-        "PreTaxCost",
-        "ConsumedService",
-        "ResourceType",
-        "InstanceId",
-        "OfferId",
-        "AdditionalInfo",
-        "ServiceInfo1",
-        "ServiceInfo2",
-        "ServiceName",
-        "ServiceTier",
-        "Currency",
-        "UnitOfMeasure",
-    }
-
-    INGRESS_ALT_COLUMNS = {
-        "SubscriptionId",
-        "ResourceGroup",
-        "ResourceLocation",
-        "Date",
-        "MeterCategory",
-        "MeterSubCategory",
-        "MeterId",
-        "MeterName",
-        "MeterRegion",
-        "UnitOfMeasure",
-        "Quantity",
-        "EffectivePrice",
-        "CostInBillingCurrency",
-        "ConsumedService",
-        "ResourceId",
-        "OfferId",
-        "AdditionalInfo",
-        "ServiceInfo1",
-        "ServiceInfo2",
-        "ResourceName",
-        "ReservationId",
-        "ReservationName",
-        "UnitPrice",
-        "PublisherType",
-        "PublisherName",
-        "ChargeType",
-        "BillingAccountId",
-        "BillingAccountName",
-        "BillingCurrencyCode",
-        "BillingPeriodStartDate",
-        "BillingPeriodEndDate",
-        "ServiceFamily",
-    }
-
     def __init__(self, schema):
         self.schema = schema
         self.enabled_tag_keys = set()
+
+    # Different Azure Cost Exports can have different fields,
+    # this maps some column names to expected names for consistency with TRINO_REQUIRED_COLUMNS
+    COL_TRANSLATION = {
+        "resourcegroupname": "resourcegroup",
+        "instancename": "resourceid",
+        "product": "productname",
+    }
 
     def check_ingress_required_columns(self, col_names):
         """
         Checks the required columns for ingress.
         """
-        if not set(col_names).issuperset(self.INGRESS_REQUIRED_COLUMNS):
-            if not set(col_names).issuperset(self.INGRESS_ALT_COLUMNS):
-                missing_columns = [x for x in self.INGRESS_REQUIRED_COLUMNS if x not in col_names]
-                return missing_columns
+        lower_columns = [x.lower() for x in col_names]
+        missing_columns = [x for x in INGRESS_REQUIRED_COLUMNS if x not in lower_columns]
+        for alternative_set in INGRESS_REQUIRED_ALT_COLUMNS:
+            if not any(x in lower_columns for x in alternative_set):
+                missing_columns.append(alternative_set[0])
+
+        if missing_columns != []:
+            return missing_columns
         return None
 
     def get_column_converters(self, col_names, panda_kwargs):
@@ -123,14 +79,11 @@ class AzurePostProcessor:
         Return source specific parquet column converters.
         """
         converters = {
-            "usagedatetime": azure_date_converter,
             "date": azure_date_converter,
             "billingperiodstartdate": azure_date_converter,
             "billingperiodenddate": azure_date_converter,
-            "usagequantity": safe_float,
             "quantity": safe_float,
             "resourcerate": safe_float,
-            "pretaxcost": safe_float,
             "costinbillingcurrency": safe_float,
             "effectiveprice": safe_float,
             "unitprice": safe_float,
@@ -150,30 +103,32 @@ class AzurePostProcessor:
         """
         return data_frame
 
-    def process_dataframe(self, data_frame):
+    def process_dataframe(self, data_frame, filename=None):
         columns = list(data_frame)
         column_name_map = {}
 
         for column in columns:
             new_col_name = strip_characters_from_column_name(column)
+            new_col_name = self.COL_TRANSLATION.get(new_col_name, new_col_name)
             column_name_map[column] = new_col_name
 
         data_frame = data_frame.rename(columns=column_name_map)
 
-        columns = set(data_frame)
-        columns = set(TRINO_COLUMNS).union(columns)
-        columns = sorted(columns)
-
-        data_frame = data_frame.reindex(columns=columns)
+        missing = set(TRINO_REQUIRED_COLUMNS).difference(data_frame)
+        to_add = {k: TRINO_REQUIRED_COLUMNS[k] for k in missing}
+        data_frame = data_frame.assign(**to_add)
 
         unique_tags = set()
-        for tags_json in data_frame["tags"]:
-            unique_tags.update(json.loads(tags_json))
+        for tags_json in data_frame["tags"].values:
+            if pd.notnull(tags_json):
+                unique_tags.update(json.loads(tags_json))
         self.enabled_tag_keys.update(unique_tags)
+        # Add a unique identifer that we can use for deduplicating
+        data_frame["row_uuid"] = data_frame.apply(lambda _: str(uuid4()), axis=1)
         return data_frame, self._generate_daily_data(data_frame)
 
     def finalize_post_processing(self):
         """
         Uses information gather in the post processing to update the cost models.
         """
-        create_enabled_keys(self.schema, AzureEnabledTagKeys, self.enabled_tag_keys)
+        populate_enabled_tag_rows_with_limit(self.schema, self.enabled_tag_keys, Provider.PROVIDER_AZURE)

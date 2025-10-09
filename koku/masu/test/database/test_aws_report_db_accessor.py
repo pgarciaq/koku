@@ -5,140 +5,36 @@
 """Test the AWSReportDBAccessor utility object."""
 import datetime
 import decimal
-import os
 import pkgutil
-import random
 from decimal import Decimal
 from unittest.mock import Mock
 from unittest.mock import patch
 
-import django.apps
 from dateutil import relativedelta
 from django.conf import settings
-from django.db import OperationalError
 from django.db.models import F
 from django.db.models import Max
 from django.db.models import Min
 from django.db.models import Sum
-from django.db.models.query import QuerySet
 from django.db.utils import ProgrammingError
 from django_tenants.utils import schema_context
-from psycopg2.errors import DeadlockDetected
 from trino.exceptions import TrinoExternalError
 
-from api.metrics.constants import DEFAULT_DISTRIBUTION_TYPE
-from api.utils import DateHelper
+from api.provider.models import Provider
 from koku.database import get_model
-from koku.database_exc import ExtendedDBException
+from koku.trino_database import TrinoHiveMetastoreError
 from masu.database import AWS_CUR_TABLE_MAP
 from masu.database.aws_report_db_accessor import AWSReportDBAccessor
 from masu.database.cost_model_db_accessor import CostModelDBAccessor
 from masu.database.ocp_report_db_accessor import OCPReportDBAccessor
-from masu.database.report_db_accessor_base import ReportSchema
 from masu.database.report_manifest_db_accessor import ReportManifestDBAccessor
-from masu.external.date_accessor import DateAccessor
 from masu.test import MasuTestCase
-from masu.test.database.helpers import ReportObjectCreator
+from reporting.models import OCPAWSCostLineItemProjectDailySummaryP
+from reporting.provider.all.models import EnabledTagKeys
+from reporting.provider.all.models import TagMapping
+from reporting.provider.aws.models import AWSCostEntryBill
 from reporting.provider.aws.models import AWSCostEntryLineItemDailySummary
-from reporting.provider.aws.models import AWSEnabledTagKeys
-from reporting.provider.aws.models import AWSTagsSummary
-from reporting.provider.aws.openshift.models import OCPAWSCostLineItemProjectDailySummaryP
-from reporting_common import REPORT_COLUMN_MAP
-
-
-class ReportSchemaTest(MasuTestCase):
-    """Test Cases for the ReportSchema object."""
-
-    def setUp(self):
-        """Set up the test class with required objects."""
-        super().setUp()
-        self.accessor = AWSReportDBAccessor(schema=self.schema)
-        self.all_tables = list(AWS_CUR_TABLE_MAP.values())
-        self.foreign_key_tables = [
-            AWS_CUR_TABLE_MAP["bill"],
-        ]
-
-    def test_init(self):
-        """Test the initializer."""
-        tables = django.apps.apps.get_models()
-        report_schema = ReportSchema(tables)
-
-        for table_name in self.all_tables:
-            self.assertIsNotNone(getattr(report_schema, table_name))
-
-        self.assertNotEqual(report_schema.column_types, {})
-
-    def test_get_reporting_tables(self):
-        """Test that the report schema is populated with a column map."""
-        tables = django.apps.apps.get_models()
-        report_schema = ReportSchema(tables)
-
-        report_schema._set_reporting_tables(tables)
-
-        for table in self.all_tables:
-            self.assertIsNotNone(getattr(report_schema, table))
-
-        self.assertTrue(hasattr(report_schema, "column_types"))
-
-        column_types = report_schema.column_types
-
-        for table in self.all_tables:
-            self.assertIn(table, column_types)
-
-        table_types = column_types[random.choice(self.all_tables)]
-
-        django_field_types = [
-            "IntegerField",
-            "FloatField",
-            "JSONField",
-            "DateTimeField",
-            "DecimalField",
-            "CharField",
-            "TextField",
-            "PositiveIntegerField",
-        ]
-        for table_type in table_types.values():
-            self.assertIn(table_type, django_field_types)
-
-    def test_exec_raw_sql_query(self):
-        class _db:
-            def set_schema(*args, **kwargs):
-                return None
-
-        class _crsr:
-            def __init__(self, *args, **kwargs):
-                self.db = _db()
-
-            def __enter__(self, *args, **kwargs):
-                return self
-
-            def __exit__(self, *args, **kwargs):
-                pass
-
-            def execute(self, *args, **kwargs):
-                try:
-                    self.dd_exc = DeadlockDetected(
-                        "deadlock detected"
-                        + os.linesep
-                        + "DETAIL: Process 88  transaction 34  blocked by process 99"
-                        + os.linesep
-                        + "Process 99  transaction 78  blocked by process 88"
-                        + os.linesep
-                    )
-                    raise self.dd_exc
-                except DeadlockDetected:
-                    raise OperationalError(
-                        "deadlock detected"
-                        + os.linesep
-                        + "DETAIL: Process 88  transaction 34  blocked by process 99"
-                        + os.linesep
-                        + "Process 99  transaction 78  blocked by process 88"
-                        + os.linesep
-                    )
-
-        with patch("masu.database.report_db_accessor_base.connection.cursor", return_value=_crsr()):
-            with self.assertRaises(ExtendedDBException):
-                self.accessor._execute_raw_sql_query(None, None)
+from reporting.provider.aws.models import AWSCostEntryLineItemSummaryByEC2ComputeP
 
 
 class AWSReportDBAccessorTest(MasuTestCase):
@@ -150,8 +46,6 @@ class AWSReportDBAccessorTest(MasuTestCase):
         super().setUpClass()
 
         cls.accessor = AWSReportDBAccessor(schema=cls.schema)
-        cls.report_schema = cls.accessor.report_schema
-        cls.creator = ReportObjectCreator(cls.schema)
 
         cls.all_tables = list(AWS_CUR_TABLE_MAP.values())
         cls.foreign_key_tables = [
@@ -162,48 +56,14 @@ class AWSReportDBAccessorTest(MasuTestCase):
     def setUp(self):
         """Set up a test with database objects."""
         super().setUp()
-        today = DateAccessor().today_with_timezone("UTC")
-        billing_start = today.replace(day=1)
 
         self.cluster_id = "testcluster"
-
         self.manifest_dict = {
             "assembly_id": "1234",
-            "billing_period_start_datetime": billing_start,
+            "billing_period_start_datetime": self.dh.this_month_start,
             "num_total_files": 2,
             "provider_id": self.aws_provider.uuid,
         }
-
-    def test_initializer(self):
-        """Test initializer."""
-        self.assertIsNotNone(self.report_schema)
-
-    def test_get_db_obj_query_default(self):
-        """Test that a query is returned."""
-        table_name = random.choice(self.all_tables)
-        query = self.accessor._get_db_obj_query(table_name)
-        self.assertIsInstance(query, QuerySet)
-
-    def test_get_db_obj_query_with_columns(self):
-        """Test that a query is returned with limited columns."""
-        tested = False
-        for table_name in self.foreign_key_tables:
-            columns = list(REPORT_COLUMN_MAP[table_name].values())
-
-            selected_columns = [random.choice(columns) for _ in range(2)]
-            missing_columns = set(columns).difference(selected_columns)
-
-            query = self.accessor._get_db_obj_query(table_name, columns=selected_columns)
-            with schema_context(self.schema):
-                self.assertIsInstance(query, QuerySet)
-                result = query.first()
-                if result:
-                    for column in selected_columns:
-                        self.assertTrue(column in result)
-                    for column in missing_columns:
-                        self.assertFalse(column in result)
-                    tested = True
-        self.assertTrue(tested)
 
     def _create_columns_from_data(self, datadict):
         columns = {}
@@ -223,9 +83,7 @@ class AWSReportDBAccessorTest(MasuTestCase):
     def test_get_bill_query_before_date(self):
         """Test that gets a query for cost entry bills before a date."""
         with schema_context(self.schema):
-            table_name = AWS_CUR_TABLE_MAP["bill"]
-            query = self.accessor._get_db_obj_query(table_name)
-            first_entry = query.first()
+            first_entry = AWSCostEntryBill.objects.first()
 
             # Verify that the result is returned for cutoff_date == billing_period_start
             cutoff_date = first_entry.billing_period_start
@@ -248,44 +106,24 @@ class AWSReportDBAccessorTest(MasuTestCase):
 
     def test_bills_for_provider_uuid(self):
         """Test that bills_for_provider_uuid returns the right bills."""
-        bill1_date = datetime.datetime(2018, 1, 6, 0, 0, 0)
-        bill2_date = datetime.datetime(2018, 2, 3, 0, 0, 0)
-
-        self.creator.create_cost_entry_bill(bill_date=bill1_date, provider_uuid=self.aws_provider.uuid)
-        bill2 = self.creator.create_cost_entry_bill(provider_uuid=self.aws_provider.uuid, bill_date=bill2_date)
-
-        bills = self.accessor.bills_for_provider_uuid(
-            self.aws_provider.uuid, start_date=bill2_date.strftime("%Y-%m-%d")
-        )
+        bills = self.accessor.bills_for_provider_uuid(self.aws_provider.uuid, start_date=self.dh.today)
         with schema_context(self.schema):
             self.assertEqual(len(bills), 1)
-            self.assertEqual(bills[0].id, bill2.id)
-
-    def test_mark_bill_as_finalized(self):
-        """Test that test_mark_bill_as_finalized sets finalized_datetime field."""
-        bill = self.creator.create_cost_entry_bill(provider_uuid=self.aws_provider.uuid)
-        with schema_context(self.schema):
-            self.assertIsNone(bill.finalized_datetime)
-            self.accessor.mark_bill_as_finalized(bill.id)
-            bill.refresh_from_db()
-            self.assertIsNotNone(bill.finalized_datetime)
 
     def test_populate_markup_cost(self):
         """Test that the daily summary table is populated."""
-        summary_table_name = AWS_CUR_TABLE_MAP["line_item_daily_summary"]
-        summary_table = getattr(self.accessor.report_schema, summary_table_name)
-
         bills = self.accessor.get_cost_entry_bills_query_by_provider(self.aws_provider.uuid)
         with schema_context(self.schema):
             bill_ids = [str(bill.id) for bill in bills.all()]
 
-            summary_entry = summary_table.objects.all().aggregate(Min("usage_start"), Max("usage_start"))
+            summary_entry = AWSCostEntryLineItemDailySummary.objects.all().aggregate(
+                Min("usage_start"), Max("usage_start")
+            )
             start_date = summary_entry["usage_start__min"]
             end_date = summary_entry["usage_start__max"]
 
-        query = self.accessor._get_db_obj_query(summary_table_name)
         with schema_context(self.schema):
-            expected_markup = query.filter(cost_entry_bill__in=bill_ids).aggregate(
+            expected_markup = AWSCostEntryLineItemDailySummary.objects.filter(cost_entry_bill__in=bill_ids).aggregate(
                 markup=Sum(F("unblended_cost") * decimal.Decimal(0.1))
             )
             expected_markup = expected_markup.get("markup")
@@ -294,10 +132,8 @@ class AWSReportDBAccessorTest(MasuTestCase):
             self.aws_provider.uuid, decimal.Decimal(0.1), start_date, end_date, bill_ids
         )
         with schema_context(self.schema):
-            query = (
-                self.accessor._get_db_obj_query(summary_table_name)
-                .filter(cost_entry_bill__in=bill_ids)
-                .aggregate(Sum("markup_cost"))
+            query = AWSCostEntryLineItemDailySummary.objects.filter(cost_entry_bill__in=bill_ids).aggregate(
+                Sum("markup_cost")
             )
             actual_markup = query.get("markup_cost__sum")
             self.assertAlmostEqual(actual_markup, expected_markup, 6)
@@ -305,9 +141,8 @@ class AWSReportDBAccessorTest(MasuTestCase):
     @patch("masu.database.aws_report_db_accessor.AWSReportDBAccessor._execute_trino_raw_sql_query")
     def test_populate_line_item_daily_summary_table_trino(self, mock_trino):
         """Test that we construst our SQL and query using Trino."""
-        dh = DateHelper()
-        start_date = dh.this_month_start.date()
-        end_date = dh.this_month_end.date()
+        start_date = self.dh.this_month_start.date()
+        end_date = self.dh.this_month_end.date()
 
         bills = self.accessor.get_cost_entry_bills_query_by_provider(self.aws_provider.uuid)
         with schema_context(self.schema):
@@ -323,7 +158,7 @@ class AWSReportDBAccessorTest(MasuTestCase):
         mock_trino.assert_called()
 
     @patch("masu.database.aws_report_db_accessor.AWSReportDBAccessor._execute_trino_raw_sql_query")
-    def test_populate_ocp_on_aws_ui_summary_tables_trino(self, mock_trino):
+    def test_populate_ocp_on_aws_ui_summary_tables_trino_managed(self, mock_trino):
         """Test that Trino is used to populate UI summary."""
         start_date = datetime.datetime.strptime("2023-05-01", "%Y-%m-%d").date()
         end_date = datetime.datetime.strptime("2023-05-31", "%Y-%m-%d").date()
@@ -339,52 +174,19 @@ class AWSReportDBAccessorTest(MasuTestCase):
     @patch("masu.database.aws_report_db_accessor.AWSReportDBAccessor.delete_ocp_on_aws_hive_partition_by_day")
     @patch("masu.database.aws_report_db_accessor.AWSReportDBAccessor.delete_hive_partition_by_month")
     @patch("masu.database.aws_report_db_accessor.AWSReportDBAccessor._execute_trino_multipart_sql_query")
-    def test_populate_ocp_on_aws_cost_daily_summary_trino(self, mock_trino, mock_month_delete, mock_delete):
-        """Test that we construst our SQL and query using Trino."""
-        dh = DateHelper()
-        start_date = dh.this_month_start.date()
-        end_date = dh.this_month_end.date()
-
-        bills = self.accessor.get_cost_entry_bills_query_by_provider(self.aws_provider.uuid)
-        with schema_context(self.schema):
-            current_bill_id = bills.first().id if bills else None
-
-        with CostModelDBAccessor(self.schema, self.aws_provider.uuid) as cost_model_accessor:
-            markup = cost_model_accessor.markup
-            markup_value = float(markup.get("value", 0)) / 100
-            distribution = cost_model_accessor.distribution_info.get("distribution_type", DEFAULT_DISTRIBUTION_TYPE)
-
-        self.accessor.populate_ocp_on_aws_cost_daily_summary_trino(
-            start_date,
-            end_date,
-            self.ocp_provider_uuid,
-            self.aws_provider_uuid,
-            self.ocp_cluster_id,
-            current_bill_id,
-            markup_value,
-            distribution,
-        )
-        mock_trino.assert_called()
-
-    @patch("masu.database.aws_report_db_accessor.AWSReportDBAccessor.delete_ocp_on_aws_hive_partition_by_day")
-    @patch("masu.database.aws_report_db_accessor.AWSReportDBAccessor.delete_hive_partition_by_month")
-    @patch("masu.database.aws_report_db_accessor.AWSReportDBAccessor._execute_trino_multipart_sql_query")
-    def test_populate_ocp_on_aws_cost_daily_summary_trino_memory_distribution(
-        self, mock_trino, mock_month_delete, mock_delete
+    @patch("masu.database.aws_report_db_accessor.AWSReportDBAccessor._get_matched_tags_strings")
+    def test_populate_ocp_on_aws_cost_daily_summary_trino_managed(
+        self, mock_get_tags, mock_trino, mock_month_delete, mock_delete
     ):
         """Test that we construst our SQL and query using Trino."""
-        dh = DateHelper()
-        start_date = dh.this_month_start.date()
-        end_date = dh.this_month_end.date()
+        start_date = self.dh.this_month_start.date()
+        end_date = self.dh.this_month_end.date()
 
         bills = self.accessor.get_cost_entry_bills_query_by_provider(self.aws_provider.uuid)
         with schema_context(self.schema):
             current_bill_id = bills.first().id if bills else None
 
-        with CostModelDBAccessor(self.schema, self.aws_provider.uuid) as cost_model_accessor:
-            markup = cost_model_accessor.markup
-            markup_value = float(markup.get("value", 0)) / 100
-            distribution = "memory"
+        mock_get_tags.return_value = "fake-tags"
 
         self.accessor.populate_ocp_on_aws_cost_daily_summary_trino(
             start_date,
@@ -393,129 +195,8 @@ class AWSReportDBAccessorTest(MasuTestCase):
             self.aws_provider_uuid,
             self.ocp_cluster_id,
             current_bill_id,
-            markup_value,
-            distribution,
         )
         mock_trino.assert_called()
-
-    def test_populate_enabled_tag_keys(self):
-        """Test that enabled tag keys are populated."""
-        dh = DateHelper()
-        start_date = dh.this_month_start.date()
-        end_date = dh.this_month_end.date()
-
-        bills = self.accessor.bills_for_provider_uuid(self.aws_provider_uuid, start_date)
-        with schema_context(self.schema):
-            AWSTagsSummary.objects.all().delete()
-            AWSEnabledTagKeys.objects.all().delete()
-            bill_ids = [bill.id for bill in bills]
-            self.assertEqual(AWSEnabledTagKeys.objects.count(), 0)
-            self.accessor.populate_enabled_tag_keys(start_date, end_date, bill_ids)
-            self.assertNotEqual(AWSEnabledTagKeys.objects.count(), 0)
-
-    def test_update_line_item_daily_summary_with_enabled_tags(self):
-        """Test that we filter the daily summary table's tags with only enabled tags."""
-        dh = DateHelper()
-        start_date = dh.this_month_start.date()
-        end_date = dh.this_month_end.date()
-
-        bills = self.accessor.bills_for_provider_uuid(self.aws_provider_uuid, start_date)
-        with schema_context(self.schema):
-            AWSTagsSummary.objects.all().delete()
-            key_to_keep = AWSEnabledTagKeys.objects.filter(key="app").first()
-            AWSEnabledTagKeys.objects.all().update(enabled=False)
-            AWSEnabledTagKeys.objects.filter(key="app").update(enabled=True)
-            bill_ids = [bill.id for bill in bills]
-            self.accessor.update_line_item_daily_summary_with_enabled_tags(start_date, end_date, bill_ids)
-            tags = (
-                AWSCostEntryLineItemDailySummary.objects.filter(
-                    usage_start__gte=start_date, cost_entry_bill_id__in=bill_ids
-                )
-                .values_list("tags")
-                .distinct()
-            )
-
-            for tag in tags:
-                tag_dict = tag[0]
-                tag_keys = list(tag_dict.keys())
-                if tag_keys:
-                    self.assertEqual([key_to_keep.key], tag_keys)
-                else:
-                    self.assertEqual([], tag_keys)
-
-    def test_delete_line_item_daily_summary_entries_for_date_range(self):
-        """Test that daily summary rows are deleted."""
-        with schema_context(self.schema):
-            start_date = AWSCostEntryLineItemDailySummary.objects.aggregate(Max("usage_start")).get("usage_start__max")
-            end_date = start_date
-
-        table_query = AWSCostEntryLineItemDailySummary.objects.filter(
-            source_uuid=self.aws_provider_uuid, usage_start__gte=start_date, usage_start__lte=end_date
-        )
-        with schema_context(self.schema):
-            self.assertNotEqual(table_query.count(), 0)
-
-        self.accessor.delete_line_item_daily_summary_entries_for_date_range(
-            self.aws_provider_uuid, start_date, end_date
-        )
-
-        with schema_context(self.schema):
-            self.assertEqual(table_query.count(), 0)
-
-    def test_delete_line_item_daily_summary_entries_for_date_range_with_filter(self):
-        """Test that daily summary rows are deleted."""
-        dh = DateHelper()
-        start_date = dh.this_month_start.date()
-        end_date = dh.this_month_end.date()
-        new_cluster_id = "new_cluster_id"
-
-        with schema_context(self.schema):
-            cluster_ids = OCPAWSCostLineItemProjectDailySummaryP.objects.values_list("cluster_id").distinct()
-            cluster_ids = [cluster_id[0] for cluster_id in cluster_ids]
-
-            table_query = OCPAWSCostLineItemProjectDailySummaryP.objects.filter(
-                source_uuid=self.aws_provider_uuid, usage_start__gte=start_date, usage_start__lte=end_date
-            )
-            row_count = table_query.count()
-
-            # Change the cluster on some rows
-            update_uuids = table_query.values_list("uuid")[0 : round(row_count / 2, 2)]
-            table_query.filter(uuid__in=update_uuids).update(cluster_id=new_cluster_id)
-
-            self.assertNotEqual(row_count, 0)
-
-        self.accessor.delete_line_item_daily_summary_entries_for_date_range(
-            self.aws_provider_uuid,
-            start_date,
-            end_date,
-            table=OCPAWSCostLineItemProjectDailySummaryP,
-            filters={"cluster_id": cluster_ids[0]},
-        )
-
-        with schema_context(self.schema):
-            # Make sure we didn't delete everything
-            table_query = OCPAWSCostLineItemProjectDailySummaryP.objects.filter(
-                source_uuid=self.aws_provider_uuid, usage_start__gte=start_date, usage_start__lte=end_date
-            )
-            self.assertNotEqual(table_query.count(), 0)
-
-            # Make sure we didn't delete this cluster
-            table_query = OCPAWSCostLineItemProjectDailySummaryP.objects.filter(
-                source_uuid=self.aws_provider_uuid,
-                usage_start__gte=start_date,
-                usage_start__lte=end_date,
-                cluster_id=new_cluster_id,
-            )
-            self.assertNotEqual(table_query.count(), 0)
-
-            # Make sure we deleted this cluster
-            table_query = OCPAWSCostLineItemProjectDailySummaryP.objects.filter(
-                source_uuid=self.aws_provider_uuid,
-                usage_start__gte=start_date,
-                usage_start__lte=end_date,
-                cluster_id=cluster_ids[0],
-            )
-            self.assertEqual(table_query.count(), 0)
 
     def test_table_properties(self):
         self.assertEqual(self.accessor.line_item_daily_summary_table, get_model("AWSCostEntryLineItemDailySummary"))
@@ -547,33 +228,73 @@ class AWSReportDBAccessorTest(MasuTestCase):
 
     @patch("masu.database.aws_report_db_accessor.AWSReportDBAccessor.schema_exists_trino")
     @patch("masu.database.aws_report_db_accessor.AWSReportDBAccessor.table_exists_trino")
-    @patch("masu.database.aws_report_db_accessor.AWSReportDBAccessor._execute_trino_raw_sql_query")
-    def test_delete_ocp_on_aws_hive_partition_by_day(self, mock_trino, mock_table_exist, mock_schema_exists):
+    @patch("masu.database.report_db_accessor_base.trino_db.connect")
+    @patch("time.sleep", return_value=None)
+    def test_delete_ocp_on_aws_hive_partition_by_day(
+        self, mock_sleep, mock_connect, mock_table_exists, mock_schema_exists
+    ):
         """Test that deletions work with retries."""
         mock_schema_exists.return_value = False
         self.accessor.delete_ocp_on_aws_hive_partition_by_day(
             [1], self.aws_provider_uuid, self.ocp_provider_uuid, "2022", "01"
         )
-        mock_trino.assert_not_called()
+        mock_connect.assert_not_called()
+
+        mock_connect.reset_mock()
 
         mock_schema_exists.return_value = True
-        mock_trino.reset_mock()
-        error = {"errorName": "HIVE_METASTORE_ERROR"}
-        mock_trino.side_effect = TrinoExternalError(error)
-        with self.assertRaises(TrinoExternalError):
+        attrs = {"cursor.side_effect": TrinoExternalError({"errorName": "HIVE_METASTORE_ERROR"})}
+        mock_connect.return_value = Mock(**attrs)
+
+        with self.assertRaises(TrinoHiveMetastoreError):
             self.accessor.delete_ocp_on_aws_hive_partition_by_day(
                 [1], self.aws_provider_uuid, self.ocp_provider_uuid, "2022", "01"
             )
-        mock_trino.assert_called()
-        # Confirms that the error log would be logged on last attempt
-        self.assertEqual(mock_trino.call_args_list[-1].kwargs.get("attempts_left"), 0)
-        self.assertEqual(mock_trino.call_count, settings.HIVE_PARTITION_DELETE_RETRIES)
+
+        mock_connect.assert_called()
+        self.assertEqual(mock_connect.call_count, settings.HIVE_PARTITION_DELETE_RETRIES)
+
+    @patch("masu.database.aws_report_db_accessor.AWSReportDBAccessor.schema_exists_trino")
+    @patch("masu.database.aws_report_db_accessor.AWSReportDBAccessor.table_exists_trino")
+    @patch("masu.database.report_db_accessor_base.trino_db.connect")
+    @patch("time.sleep", return_value=None)
+    def test_delete_ocp_on_aws_hive_partition_by_day_managed_table(
+        self, mock_sleep, mock_connect, mock_table_exists, mock_schema_exists
+    ):
+        """Test that deletions work with retries."""
+        mock_schema_exists.return_value = False
+        self.accessor.delete_ocp_on_aws_hive_partition_by_day(
+            [1],
+            self.aws_provider_uuid,
+            self.ocp_provider_uuid,
+            "2022",
+            "01",
+        )
+        mock_connect.assert_not_called()
+
+        mock_connect.reset_mock()
+
+        mock_schema_exists.return_value = True
+        attrs = {"cursor.side_effect": TrinoExternalError({"errorName": "HIVE_METASTORE_ERROR"})}
+        mock_connect.return_value = Mock(**attrs)
+
+        with self.assertRaises(TrinoHiveMetastoreError):
+            self.accessor.delete_ocp_on_aws_hive_partition_by_day(
+                [1],
+                self.aws_provider_uuid,
+                self.ocp_provider_uuid,
+                "2022",
+                "01",
+            )
+
+        mock_connect.assert_called()
+        self.assertEqual(mock_connect.call_count, settings.HIVE_PARTITION_DELETE_RETRIES)
 
     @patch("masu.database.aws_report_db_accessor.AWSReportDBAccessor._execute_trino_raw_sql_query")
     def test_check_for_matching_enabled_keys_no_matches(self, mock_trino):
         """Test that Trino is used to find matched tags."""
         with schema_context(self.schema):
-            AWSEnabledTagKeys.objects.all().delete()
+            EnabledTagKeys.objects.filter(provider_type=Provider.PROVIDER_AWS).delete()
         value = self.accessor.check_for_matching_enabled_keys()
         self.assertFalse(value)
 
@@ -584,17 +305,11 @@ class AWSReportDBAccessorTest(MasuTestCase):
         self.assertTrue(value)
 
     @patch("masu.database.aws_report_db_accessor.AWSReportDBAccessor._execute_raw_sql_query")
-    @patch("masu.database.aws_report_db_accessor.is_ocp_savings_plan_cost_enabled")
-    def test_back_populate_ocp_infrastructure_costs(self, mock_unleash, mock_execute):
+    def test_back_populate_ocp_infrastructure_costs(self, mock_execute):
         """Test that we back populate raw cost to OCP."""
-        is_savingsplan_cost = True
-        mock_unleash.return_value = is_savingsplan_cost
         report_period_id = 1
-        dh = DateHelper()
-
-        start_date = dh.this_month_start
-        end_date = dh.today
-
+        start_date = self.dh.this_month_start
+        end_date = self.dh.today
         sql = pkgutil.get_data("masu.database", "sql/reporting_ocpaws_ocp_infrastructure_back_populate.sql")
         sql = sql.decode("utf-8")
         sql_params = {
@@ -602,58 +317,16 @@ class AWSReportDBAccessorTest(MasuTestCase):
             "start_date": start_date,
             "end_date": end_date,
             "report_period_id": report_period_id,
-            "is_savingsplan_cost": is_savingsplan_cost,
         }
 
         mock_jinja = Mock()
-
         mock_jinja.return_value = sql, sql_params
         accessor = AWSReportDBAccessor(schema=self.schema)
         accessor.prepare_query = mock_jinja
         accessor.back_populate_ocp_infrastructure_costs(start_date, end_date, report_period_id)
-        accessor.prepare_query.assert_called_with(sql, sql_params)
-        mock_execute.assert_called()
-
-        mock_jinja.reset_mock()
-        mock_execute.reset_mock()
-        mock_unleash.reset_mock()
-        is_savingsplan_cost = False
-        mock_unleash.return_value = is_savingsplan_cost
-        accessor.back_populate_ocp_infrastructure_costs(start_date, end_date, report_period_id)
-
-        sql_params = {
-            "schema": self.schema,
-            "start_date": start_date,
-            "end_date": end_date,
-            "report_period_id": report_period_id,
-            "is_savingsplan_cost": is_savingsplan_cost,
-        }
 
         accessor.prepare_query.assert_called_with(sql, sql_params)
         mock_execute.assert_called()
-
-    @patch("masu.database.aws_report_db_accessor.AWSReportDBAccessor._execute_trino_raw_sql_query")
-    def test_check_for_invoice_id_trino(self, mock_trino):
-        """Check that an invoice ID exists or not."""
-        mock_trino.return_value = [
-            ("1",),
-        ]
-        expected = ["1"]
-        check_date = DateHelper().today
-        invoice_ids = self.accessor.check_for_invoice_id_trino(str(self.aws_provider.uuid), check_date)
-
-        self.assertEqual(invoice_ids, expected)
-
-        mock_trino.reset_mock()
-
-        mock_trino.return_value = [
-            ("",),
-        ]
-        expected = []
-        check_date = DateHelper().today
-        invoice_ids = self.accessor.check_for_invoice_id_trino(str(self.aws_provider.uuid), check_date)
-
-        self.assertEqual(invoice_ids, expected)
 
     @patch("masu.database.aws_report_db_accessor.AWSReportDBAccessor._execute_raw_sql_query")
     def test_truncate_partition(self, mock_query):
@@ -684,7 +357,6 @@ class AWSReportDBAccessorTest(MasuTestCase):
                 self.accessor.delete_hive_partition_by_month(table, self.ocp_provider_uuid, "2022", "01")
             mock_trino.assert_called()
             # Confirms that the error log would be logged on last attempt
-            self.assertEqual(mock_trino.call_args_list[-1].kwargs.get("attempts_left"), 0)
             self.assertEqual(mock_trino.call_count, settings.HIVE_PARTITION_DELETE_RETRIES)
 
         # Test that deletions short circuit if the schema does not exist
@@ -696,3 +368,161 @@ class AWSReportDBAccessorTest(MasuTestCase):
             self.accessor.delete_hive_partition_by_month(table, self.ocp_provider_uuid, "2022", "01")
             mock_trino.assert_not_called()
             mock_table_exist.assert_not_called()
+
+    def test_update_line_item_daily_summary_with_tag_mapping(self):
+        """
+        Test that mapped tags are updated in aws line item summary tables.
+        After the update, the child tag's key-value data is cleared and the parent tag's data is updated accordingly.
+        """
+        populated_keys = []
+
+        table_classes = [AWSCostEntryLineItemDailySummary, AWSCostEntryLineItemSummaryByEC2ComputeP]
+
+        for table_class in table_classes:
+            with self.subTest(table_class=table_class):
+                populated_keys = []
+                with schema_context(self.schema):
+                    enabled_tags = EnabledTagKeys.objects.filter(provider_type=Provider.PROVIDER_AWS, enabled=True)
+                    for enabled_tag in enabled_tags:
+                        tag_count = table_class.objects.filter(
+                            tags__has_key=enabled_tag.key,
+                            usage_start__gte=self.dh.this_month_start,
+                            usage_start__lte=self.dh.today,
+                        ).count()
+                        if tag_count > 0:
+                            key_metadata = [enabled_tag.key, enabled_tag, tag_count]
+                            populated_keys.append(key_metadata)
+                        if len(populated_keys) == 2:
+                            break
+
+                    parent_key, parent_obj, parent_count = populated_keys[0]
+                    child_key, child_obj, child_count = populated_keys[1]
+                    TagMapping.objects.create(parent=parent_obj, child=child_obj)
+                    self.accessor.update_line_item_daily_summary_with_tag_mapping(
+                        self.dh.this_month_start, self.dh.today, table_name=table_class._meta.db_table
+                    )
+                    expected_parent_count = parent_count + child_count
+                    actual_parent_count = table_class.objects.filter(
+                        tags__has_key=parent_key,
+                        usage_start__gte=self.dh.this_month_start,
+                        usage_start__lte=self.dh.today,
+                    ).count()
+                    self.assertEqual(expected_parent_count, actual_parent_count)
+                    actual_child_count = table_class.objects.filter(
+                        tags__has_key=child_key,
+                        usage_start__gte=self.dh.this_month_start,
+                        usage_start__lte=self.dh.today,
+                    ).count()
+                    self.assertEqual(0, actual_child_count)
+
+                    # Clear TagMapping objects
+                    TagMapping.objects.filter(parent=parent_obj, child=child_obj).delete()
+
+    def test_populate_ocp_on_aws_tag_information(self):
+        """
+        This tests the tag mapping feature.
+        """
+        populated_keys = []
+        report_period_id = 1
+        with schema_context(self.schema):
+            enabled_tags = EnabledTagKeys.objects.filter(provider_type=Provider.PROVIDER_AWS, enabled=True)
+            for enabled_tag in enabled_tags:
+                tag_count = OCPAWSCostLineItemProjectDailySummaryP.objects.filter(
+                    tags__has_key=enabled_tag.key,
+                    usage_start__gte=self.dh.this_month_start,
+                    usage_start__lte=self.dh.today,
+                ).count()
+                if tag_count > 0:
+                    key_metadata = [enabled_tag.key, enabled_tag, tag_count]
+                    populated_keys.append(key_metadata)
+                if len(populated_keys) == 2:
+                    break
+            bill_ids = OCPAWSCostLineItemProjectDailySummaryP.objects.filter(
+                tags__has_key=enabled_tag.key,
+                usage_start__gte=self.dh.this_month_start,
+                usage_start__lte=self.dh.today,
+            ).values_list("cost_entry_bill", flat=True)
+            parent_key, parent_obj, parent_count = populated_keys[0]
+            child_key, child_obj, child_count = populated_keys[1]
+            TagMapping.objects.create(parent=parent_obj, child=child_obj)
+            self.accessor.populate_ocp_on_aws_tag_information(
+                bill_ids, self.dh.this_month_start, self.dh.today, report_period_id
+            )
+            expected_parent_count = parent_count + child_count
+            actual_parent_count = OCPAWSCostLineItemProjectDailySummaryP.objects.filter(
+                tags__has_key=parent_key, usage_start__gte=self.dh.this_month_start, usage_start__lte=self.dh.today
+            ).count()
+            self.assertEqual(expected_parent_count, actual_parent_count)
+            actual_child_count = OCPAWSCostLineItemProjectDailySummaryP.objects.filter(
+                tags__has_key=child_key, usage_start__gte=self.dh.this_month_start, usage_start__lte=self.dh.today
+            ).count()
+            self.assertEqual(0, actual_child_count)
+
+    @patch("masu.database.aws_report_db_accessor.AWSReportDBAccessor._execute_trino_raw_sql_query")
+    def test_populate_ec2_compute_summary_table_trino(self, mock_trino):
+        """
+        Test that we construst our SQL and query using Trino to populate AWSCostEntryLineItemSummaryByEC2ComputeP.
+        """
+        start_date = self.dh.this_month_start.date()
+
+        bills = self.accessor.get_cost_entry_bills_query_by_provider(self.aws_provider.uuid)
+        with schema_context(self.schema):
+            current_bill_id = bills.first().id if bills else None
+
+        with CostModelDBAccessor(self.schema, self.aws_provider.uuid) as cost_model_accessor:
+            markup = cost_model_accessor.markup
+            markup_value = float(markup.get("value", 0)) / 100
+
+        self.accessor.populate_ec2_compute_summary_table_trino(
+            self.aws_provider_uuid, start_date, current_bill_id, markup_value
+        )
+        mock_trino.assert_called()
+
+    def test_get_matched_tags_strings_postgres(self):
+        """Test fetching match tag strings via postgres."""
+        tags = ['"app": "mobile"']
+        result = self.accessor._get_matched_tags_strings(
+            1, self.aws_provider_uuid, self.ocp_provider_uuid, "2022-04-01", "2022-04-10"
+        )
+        self.assertEqual(tags, result)
+
+    @patch(
+        "masu.database.aws_report_db_accessor.AWSReportDBAccessor.get_openshift_on_cloud_matched_tags",
+        return_value=None,
+    )
+    @patch("masu.database.aws_report_db_accessor.AWSReportDBAccessor.get_openshift_on_cloud_matched_tags_trino")
+    def test_get_matched_tags_strings_trino(self, mock_postgres_tags, mock_trino_tags):
+        """Test fetching match tag strings via trino."""
+        tags = ['"app"']
+        mock_trino_tags.return_value = {"app"}
+        start = self.dh.this_month_start
+        end = self.dh.this_month_end
+        result = self.accessor._get_matched_tags_strings(1, self.aws_provider_uuid, self.ocp_provider_uuid, start, end)
+        self.assertEqual(tags, result)
+
+    @patch(
+        "masu.database.aws_report_db_accessor.AWSReportDBAccessor.get_openshift_on_cloud_matched_tags",
+        return_value=None,
+    )
+    @patch(
+        "masu.database.aws_report_db_accessor.AWSReportDBAccessor.get_openshift_on_cloud_matched_tags_trino",
+        return_value=[],
+    )
+    def test_get_matched_tags_strings_no_tags(self, mock_postgres_tags, mock_trino_tags):
+        """Test fetching match tag with no tags returned."""
+        start = self.dh.this_month_start
+        end = self.dh.this_month_end
+        result = self.accessor._get_matched_tags_strings(1, self.aws_provider_uuid, self.ocp_provider_uuid, start, end)
+        self.assertEqual([], result)
+
+    @patch(
+        "masu.database.aws_report_db_accessor.AWSReportDBAccessor.get_openshift_on_cloud_matched_tags",
+        return_value=None,
+    )
+    @patch("masu.database.aws_report_db_accessor.is_tag_processing_disabled", return_value=True)
+    def test_get_matched_tags_strings_trino_disabled(self, mock_postgres_tags, mock_unleash):
+        """Test fetching match tag strings."""
+        result = self.accessor._get_matched_tags_strings(
+            1, self.aws_provider_uuid, self.ocp_provider_uuid, "2022-04-01", "2022-04-10"
+        )
+        self.assertEqual([], result)

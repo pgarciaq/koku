@@ -4,8 +4,9 @@
 #
 """Common serializer logic."""
 import copy
+from collections.abc import Mapping
 
-from django.utils.translation import ugettext as _
+from django.utils.translation import gettext
 from rest_framework import serializers
 from rest_framework.fields import DateField
 
@@ -16,6 +17,7 @@ from api.report.queries import ReportQueryHandler
 from api.utils import DateHelper
 from api.utils import get_currency
 from api.utils import materialized_view_month_start
+from masu.processor import check_group_by_limit
 from reporting.provider.ocp.models import OpenshiftCostCategory
 
 
@@ -41,7 +43,7 @@ def handle_invalid_fields(this, data):
     if unknown_keys:
         error = {}
         for unknown_key in unknown_keys:
-            error[unknown_key] = _("Unsupported parameter or invalid value")
+            error[unknown_key] = gettext("Unsupported parameter or invalid value")
         raise serializers.ValidationError(error)
     return data
 
@@ -80,7 +82,7 @@ def validate_field(this, field, serializer_cls, value, **kwargs):
     subclasses = serializer_cls.__subclasses__()
     if subclasses and not serializer.is_valid():
         message = "Unsupported parameter or invalid value"
-        error = serializers.ValidationError({field: _(message)})
+        error = serializers.ValidationError({field: gettext(message)})
         for subcls in subclasses:
             for parent in subcls.__bases__:
                 # when using multiple inheritance, the data is valid as long as one
@@ -136,11 +138,13 @@ class BaseSerializer(serializers.Serializer):
     """A common serializer base for all of our serializers."""
 
     _opfields = None
+    _op_mapping = None
     _tagkey_support = None
     _aws_category = False
 
     def __init__(self, *args, **kwargs):
         """Initialize the BaseSerializer."""
+        self.schema = None
         self.tag_keys = kwargs.pop("tag_keys", set())
         self.aws_category_keys = kwargs.pop("aws_category_keys", set())
         super().__init__(*args, **kwargs)
@@ -150,6 +154,18 @@ class BaseSerializer(serializers.Serializer):
 
         if self._opfields:
             add_operator_specified_fields(self.fields, self._opfields)
+        if self.context.get("request"):
+            self.schema = self.context["request"].user.customer.schema_name
+
+    def _op_mapping_replacement(self, data):
+        """Replaces key in the data with what is in the _op_mapping.
+        This function converts the value in the op to a db model field for querying.
+        """
+        if isinstance(data, Mapping):
+            for serializer_key, internal_key in self._op_mapping.items():
+                if serializer_key in data:
+                    data[internal_key] = data.pop(serializer_key)
+        return data
 
     def validate(self, data):
         """Validate incoming data.
@@ -196,6 +212,12 @@ class BaseSerializer(serializers.Serializer):
             setattr(self, key, val)
             self.fields.update({key: val})
 
+    def to_internal_value(self, data):
+        """Send to internal value."""
+        if self._op_mapping:
+            return super().to_internal_value(self._op_mapping_replacement(data))
+        return super().to_internal_value(data)
+
 
 class FilterSerializer(BaseSerializer):
     """A base serializer for filter operations."""
@@ -225,6 +247,14 @@ class FilterSerializer(BaseSerializer):
             (ValidationError): if filter inputs are invalid
 
         """
+        unsupported_exact_filters = ["org_unit_id", "infrastructure"]
+        for key in data:
+            if key.startswith("exact:"):
+                base_key = key.split(":", 1)[1]
+                if base_key in unsupported_exact_filters:
+                    raise serializers.ValidationError(
+                        {key: f"The 'exact:' operator is not supported for the '{base_key}' filter."}
+                    )
         handle_invalid_fields(self, data)
         resolution = data.get("resolution")
         time_scope_value = data.get("time_scope_value")
@@ -328,6 +358,7 @@ class ParamSerializer(BaseSerializer):
         "limit",
         "capacity",
         "cost_total_distributed",
+        "storage_class",
     )
 
     def validate(self, data):
@@ -454,10 +485,7 @@ class ParamSerializer(BaseSerializer):
             (ValidationError): if group_by field inputs are invalid
 
         """
-        if len(value) > 2:
-            # Max support group_bys is 2
-            error = {"group_by": ("Cost Management supports a max of two group_by options.")}
-            raise serializers.ValidationError(error)
+        check_group_by_limit(self.schema, len(value))
         validate_field(self, "group_by", self.GROUP_BY_SERIALIZER, value, tag_keys=self.tag_keys)
         return value
 
@@ -479,7 +507,7 @@ class ParamSerializer(BaseSerializer):
                 continue  # fields that do not require a group-by
 
             if "or:" in key:
-                error[key] = _(f'The order_by key "{key}" can not contain the or parameter.')
+                error[key] = gettext(f'The order_by key "{key}" can not contain the or parameter.')
                 raise serializers.ValidationError(error)
 
             if "group_by" in self.initial_data:
@@ -500,6 +528,10 @@ class ParamSerializer(BaseSerializer):
 
                 # special case: we order by account_alias, but we group by account.
                 if key == "account_alias" and ("account" in group_keys or "account" in or_keys):
+                    continue  # special case: we order by subscription_name, but we group by subscription_guid.
+                if key == "subscription_name" and (
+                    "subscription_guid" in group_keys or "subscription_guid" in or_keys
+                ):
                     continue
                 # sepcial case: we order by date, but we group by an allowed param.
                 if key == "date" and group_keys:
@@ -510,12 +542,12 @@ class ParamSerializer(BaseSerializer):
                         and value.get("date") <= dh.today.date()
                     ):
                         continue
-                    error[key] = _(
+                    error[key] = gettext(
                         f"Order-by date must be from {materialized_view_month_start(dh).date()} to {dh.today.date()}"
                     )
                     raise serializers.ValidationError(error)
 
-            error[key] = _(f'Order-by "{key}" requires matching Group-by.')
+            error[key] = gettext(f'Order-by "{key}" requires matching Group-by.')
             raise serializers.ValidationError(error)
         validate_field(self, "order_by", self.ORDER_BY_SERIALIZER, value)
         return value

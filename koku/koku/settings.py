@@ -13,21 +13,22 @@ https://docs.djangoproject.com/en/2.0/topics/settings/
 For the full list of settings and their values, see
 https://docs.djangoproject.com/en/2.0/ref/settings/
 """
+import datetime
 import logging
 import os
+import re
 import sys
+from enum import StrEnum
 from json import JSONDecodeError
-from zoneinfo import ZoneInfo
 
-from boto3.session import Session
-from botocore.exceptions import ClientError
+import boto3
+import pandas as pd
 from corsheaders.defaults import default_headers
 
 from . import database
-from . import sentry
+from . import sentry  # noqa: F401
 from .configurator import CONFIGURATOR
 from .env import ENVIRONMENT
-
 
 # Database
 # https://docs.djangoproject.com/en/2.0/ref/settings/#databases
@@ -58,7 +59,6 @@ ENHANCED_ORG_ADMIN = ENVIRONMENT.bool("ENHANCED_ORG_ADMIN", default=False)
 
 ALLOWED_HOSTS = ["*"]
 
-
 # Application definition
 
 INSTALLED_APPS = [
@@ -79,11 +79,13 @@ INSTALLED_APPS = [
     # local apps
     "api",
     "hcs",
+    "key_metrics",
     "masu",
     "reporting",
     "reporting_common",
     "cost_models",
     "sources",
+    "subs",
 ]
 
 SILENCED_SYSTEM_CHECKS = ["django_tenants.W001"]
@@ -91,6 +93,7 @@ SILENCED_SYSTEM_CHECKS = ["django_tenants.W001"]
 SHARED_APPS = (
     "django_tenants",
     "api",
+    "key_metrics",
     "masu",
     "reporting_common",
     "django.contrib.contenttypes",
@@ -104,8 +107,6 @@ SHARED_APPS = (
 TENANT_APPS = ("reporting", "cost_models")
 TENANT_MULTIPROCESSING_MAX_PROCESSES = ENVIRONMENT.int("TENANT_MULTIPROCESSING_MAX_PROCESSES", default=2)
 TENANT_MULTIPROCESSING_CHUNKS = ENVIRONMENT.int("TENANT_MULTIPROCESSING_CHUNKS", default=2)
-
-DEFAULT_FILE_STORAGE = "django_tenants.storage.TenantFileSystemStorage"
 
 ACCOUNT_ENHANCED_METRICS = ENVIRONMENT.bool("ACCOUNT_ENHANCED_METRICS", default=False)
 
@@ -135,7 +136,12 @@ MIDDLEWARE = [
 MIDDLEWARE_TIME_TO_LIVE = ENVIRONMENT.int("MIDDLEWARE_TIME_TO_LIVE", default=900)  # in seconds (default = 15 minutes)
 
 DEVELOPMENT = ENVIRONMENT.bool("DEVELOPMENT", default=False)
+SCHEMA_SUFFIX = re.sub("[^a-zA-Z0-9_]", "_", ENVIRONMENT.get_value("SCHEMA_SUFFIX", default=""))
+print(f"ORG ID SUFFIX: '{SCHEMA_SUFFIX}'")
 if DEVELOPMENT:
+    # if SCHEMA_SUFFIX == "":
+    #     SCHEMA_SUFFIX = f"_{ENVIRONMENT.get_value('USER', default='')}"
+    print(f"ORG ID SUFFIX: '{SCHEMA_SUFFIX}'")
     DEFAULT_IDENTITY = {
         "identity": {
             "account_number": "10001",
@@ -163,6 +169,9 @@ UNLEASH_PREFIX = "https" if str(UNLEASH_PORT) == "443" else "http"
 UNLEASH_URL = f"{UNLEASH_PREFIX}://{UNLEASH_HOST}:{UNLEASH_PORT}/api"
 UNLEASH_TOKEN = CONFIGURATOR.get_feature_flag_token()
 UNLEASH_CACHE_DIR = ENVIRONMENT.get_value("UNLEASH_CACHE_DIR", default=os.path.join(BASE_DIR, "..", ".unleash"))
+
+# Set max group by options
+MAX_GROUP_BY = ENVIRONMENT.int("MAX_GROUP_BY_OVERRIDE", default=3)
 
 ### Currency URL
 CURRENCY_URL = ENVIRONMENT.get_value("CURRENCY_URL", default="https://open.er-api.com/v6/latest/USD")
@@ -219,54 +228,94 @@ REDIS_CONNECTION_POOL_KWARGS = {
 }
 
 KEEPDB = ENVIRONMENT.bool("KEEPDB", default=True)
+
+
+class CacheEnum(StrEnum):
+    default = "default"
+    api = "api"
+    rbac = "rbac"
+    worker = "worker"
+
+
 TEST_CACHE_LOCATION = "unique-snowflake"
 if "test" in sys.argv:
     TEST_RUNNER = "koku.koku_test_runner.KokuTestRunner"
     CACHES = {
-        "default": {
+        CacheEnum.default: {
             "BACKEND": "django.core.cache.backends.dummy.DummyCache",
             "LOCATION": TEST_CACHE_LOCATION,
+            "KEY_PREFIX": "default",
             "KEY_FUNCTION": "django_tenants.cache.make_key",
             "REVERSE_KEY_FUNCTION": "django_tenants.cache.reverse_key",
         },
-        "rbac": {"BACKEND": "django.core.cache.backends.dummy.DummyCache", "LOCATION": TEST_CACHE_LOCATION},
-        "worker": {"BACKEND": "django.core.cache.backends.locmem.LocMemCache", "LOCATION": TEST_CACHE_LOCATION},
+        CacheEnum.api: {
+            "BACKEND": "django.core.cache.backends.dummy.DummyCache",
+            "LOCATION": TEST_CACHE_LOCATION,
+            "KEY_PREFIX": "api",
+            "KEY_FUNCTION": "django_tenants.cache.make_key",
+            "REVERSE_KEY_FUNCTION": "django_tenants.cache.reverse_key",
+        },
+        CacheEnum.rbac: {
+            "BACKEND": "django.core.cache.backends.dummy.DummyCache",
+            "KEY_PREFIX": "rbac",
+            "LOCATION": TEST_CACHE_LOCATION,
+        },
+        CacheEnum.worker: {
+            "BACKEND": "django.core.cache.backends.locmem.LocMemCache",
+            "LOCATION": TEST_CACHE_LOCATION,
+        },
     }
 else:
     CACHES = {
-        "default": {
+        CacheEnum.default: {
             "BACKEND": "django_redis.cache.RedisCache",
-            "LOCATION": f"redis://{REDIS_HOST}:{REDIS_PORT}/{REDIS_DB}",
+            "LOCATION": REDIS_URL,
+            "KEY_PREFIX": "default",
             "KEY_FUNCTION": "django_tenants.cache.make_key",
             "REVERSE_KEY_FUNCTION": "django_tenants.cache.reverse_key",
-            "TIMEOUT": 3600,  # 1 hour default
+            "TIMEOUT": 3_600,  # 1 hour default
             "OPTIONS": {
                 "CLIENT_CLASS": "django_redis.client.DefaultClient",
                 "IGNORE_EXCEPTIONS": True,
-                "MAX_ENTRIES": 1000,
+                "MAX_ENTRIES": 1_000,
                 "CONNECTION_POOL_CLASS_KWARGS": REDIS_CONNECTION_POOL_KWARGS,
             },
         },
-        "rbac": {
+        CacheEnum.api: {
             "BACKEND": "django_redis.cache.RedisCache",
-            "LOCATION": f"redis://{REDIS_HOST}:{REDIS_PORT}/1",
+            "LOCATION": REDIS_URL,
+            "KEY_PREFIX": "api",
+            "KEY_FUNCTION": "django_tenants.cache.make_key",
+            "REVERSE_KEY_FUNCTION": "django_tenants.cache.reverse_key",
+            "TIMEOUT": 3_600,  # 1 hour default
+            "OPTIONS": {
+                "CLIENT_CLASS": "django_redis.client.DefaultClient",
+                "IGNORE_EXCEPTIONS": True,
+                "MAX_ENTRIES": 1_000,
+                "CONNECTION_POOL_CLASS_KWARGS": REDIS_CONNECTION_POOL_KWARGS,
+            },
+        },
+        CacheEnum.rbac: {
+            "BACKEND": "django_redis.cache.RedisCache",
+            "KEY_PREFIX": "rbac",
+            "LOCATION": REDIS_URL,
             "TIMEOUT": ENVIRONMENT.get_value("RBAC_CACHE_TIMEOUT", default=300),
             "OPTIONS": {
                 "CLIENT_CLASS": "django_redis.client.DefaultClient",
                 "IGNORE_EXCEPTIONS": True,
-                "MAX_ENTRIES": 1000,
+                "MAX_ENTRIES": 1_000,
                 "CONNECTION_POOL_CLASS_KWARGS": REDIS_CONNECTION_POOL_KWARGS,
             },
         },
-        "worker": {
+        CacheEnum.worker: {
             "BACKEND": "django.core.cache.backends.db.DatabaseCache",
             "LOCATION": "worker_cache_table",
-            "TIMEOUT": 86400,  # 24 hours
+            "TIMEOUT": 86_400,  # 24 hours
         },
     }
 
 if ENVIRONMENT.bool("CACHED_VIEWS_DISABLED", default=False):
-    CACHES.update({"default": {"BACKEND": "django.core.cache.backends.dummy.DummyCache"}})
+    CACHES.update({CacheEnum.default: {"BACKEND": "django.core.cache.backends.dummy.DummyCache"}})
 DATABASES = {"default": database.config()}
 
 DATABASE_ROUTERS = ("django_tenants.routers.TenantSyncRouter",)
@@ -293,7 +342,6 @@ AUTH_PASSWORD_VALIDATORS = [
     {"NAME": "django.contrib.auth.password_validation.NumericPasswordValidator"},
 ]
 
-
 # Internationalization
 # https://docs.djangoproject.com/en/2.0/topics/i18n/
 
@@ -301,11 +349,9 @@ LANGUAGE_CODE = "en-us"
 
 TIME_ZONE = "UTC"
 
-UTC = ZoneInfo("UTC")
+UTC = datetime.UTC
 
 USE_I18N = True
-
-USE_L10N = True
 
 USE_TZ = True
 
@@ -318,9 +364,16 @@ NOTIFICATION_CHECK_TIME = ENVIRONMENT.int("NOTIFICATION_CHECK_TIME", default=24)
 # https://docs.djangoproject.com/en/2.2/howto/static-files/
 STATIC_ROOT = os.path.join(BASE_DIR, "static")
 STATIC_URL = "{}/static/".format(API_PATH_PREFIX.rstrip("/"))
-
 STATICFILES_DIRS = [os.path.join(BASE_DIR, "..", "docs/specs")]
-STATICFILES_STORAGE = "whitenoise.storage.CompressedManifestStaticFilesStorage"
+
+STORAGES = {
+    "default": {
+        "BACKEND": "django_tenants.storage.TenantFileSystemStorage",
+    },
+    "staticfiles": {
+        "BACKEND": "whitenoise.storage.CompressedManifestStaticFilesStorage",
+    },
+}
 
 INTERNAL_IPS = ["127.0.0.1"]
 
@@ -345,8 +398,13 @@ REST_FRAMEWORK = {
 }
 
 CW_AWS_ACCESS_KEY_ID = CONFIGURATOR.get_cloudwatch_access_id()
-CW_AWS_SECRET_ACCESS_KEY = CONFIGURATOR.get_cloudwatch_access_key()
-CW_AWS_REGION = CONFIGURATOR.get_cloudwatch_region()
+
+CLOUDWATCH_CREDENTIALS = {
+    "aws_access_key_id": CW_AWS_ACCESS_KEY_ID,
+    "aws_secret_access_key": CONFIGURATOR.get_cloudwatch_access_key(),
+    "region_name": CONFIGURATOR.get_cloudwatch_region(),
+}
+
 CW_LOG_GROUP = CONFIGURATOR.get_cloudwatch_log_group()
 
 LOGGING_FORMATTER = ENVIRONMENT.get_value("DJANGO_LOG_FORMATTER", default="simple")
@@ -359,59 +417,54 @@ VERBOSE_FORMATTING = (
     "%(task_id)s %(task_parent_id)s %(task_root_id)s "
     "%(message)s"
 )
-SIMPLE_FORMATTING = "[%(asctime)s] %(levelname)s %(task_root_id)s %(message)s"
+SIMPLE_FORMATTING = (
+    "[%(asctime)s] %(levelname)s %(task_root_id)s %(task_parent_id)s %(task_id)s %(process)d %(message)s"
+)
 
 LOG_DIRECTORY = ENVIRONMENT.get_value("LOG_DIRECTORY", default=BASE_DIR)
 DEFAULT_LOG_FILE = os.path.join(LOG_DIRECTORY, "app.log")
 LOGGING_FILE = ENVIRONMENT.get_value("DJANGO_LOG_FILE", default=DEFAULT_LOG_FILE)
 
 if CW_AWS_ACCESS_KEY_ID:
-    try:
-        POD_NAME = ENVIRONMENT.get_value("APP_POD_NAME", default="local")
-        BOTO3_SESSION = Session(
-            aws_access_key_id=CW_AWS_ACCESS_KEY_ID,
-            aws_secret_access_key=CW_AWS_SECRET_ACCESS_KEY,
-            region_name=CW_AWS_REGION,
-        )
-        watchtower = BOTO3_SESSION.client("logs")
-        watchtower.create_log_stream(logGroupName=CW_LOG_GROUP, logStreamName=POD_NAME)
-        LOGGING_HANDLERS += ["watchtower"]
-        WATCHTOWER_HANDLER = {
-            "level": KOKU_LOGGING_LEVEL,
-            "class": "watchtower.CloudWatchLogHandler",
-            "boto3_session": BOTO3_SESSION,
-            "log_group": CW_LOG_GROUP,
-            "stream_name": POD_NAME,
-            "formatter": LOGGING_FORMATTER,
-            "use_queues": False,
-            "create_log_group": False,
-        }
-    except ClientError as e:
-        if e.response.get("Error", {}).get("Code") == "ResourceAlreadyExistsException":
-            LOGGING_HANDLERS += ["watchtower"]
-            WATCHTOWER_HANDLER = {
-                "level": KOKU_LOGGING_LEVEL,
-                "class": "watchtower.CloudWatchLogHandler",
-                "boto3_session": BOTO3_SESSION,
-                "log_group": CW_LOG_GROUP,
-                "stream_name": POD_NAME,
-                "formatter": LOGGING_FORMATTER,
-                "use_queues": False,
-                "create_log_group": False,
-            }
-        else:
-            print("CloudWatch not configured.")
+    cw_client = boto3.client("logs", **CLOUDWATCH_CREDENTIALS)
+    POD_NAME = ENVIRONMENT.get_value("APP_POD_NAME", default="local")
+    LOGGING_HANDLERS += ["watchtower"]
+    WATCHTOWER_HANDLER = {
+        "level": KOKU_LOGGING_LEVEL,
+        "formatter": LOGGING_FORMATTER,
+        "class": "watchtower.CloudWatchLogHandler",
+        "log_group_name": CW_LOG_GROUP,
+        "log_stream_name": POD_NAME,
+        "use_queues": False,
+        "boto3_client": cw_client,
+        "create_log_group": False,
+        "create_log_stream": True,  # will create stream if it does not exist
+    }
+else:
+    print("CloudWatch not configured.")
 
 LOGGING = {
     "version": 1,
     "disable_existing_loggers": False,
     "formatters": {
-        "verbose": {"()": "koku.log.TaskFormatter", "format": VERBOSE_FORMATTING},
-        "simple": {"()": "koku.log.TaskFormatter", "format": SIMPLE_FORMATTING},
+        "verbose": {
+            "()": "koku.log.TaskFormatter",
+            "format": VERBOSE_FORMATTING,
+        },
+        "simple": {
+            "()": "koku.log.TaskFormatter",
+            "format": SIMPLE_FORMATTING,
+        },
     },
     "handlers": {
-        "celery": {"class": "logging.StreamHandler", "formatter": LOGGING_FORMATTER},
-        "console": {"class": "logging.StreamHandler", "formatter": LOGGING_FORMATTER},
+        "celery": {
+            "class": "logging.StreamHandler",
+            "formatter": LOGGING_FORMATTER,
+        },
+        "console": {
+            "class": "logging.StreamHandler",
+            "formatter": LOGGING_FORMATTER,
+        },
         "file": {
             "level": KOKU_LOGGING_LEVEL,
             "class": "logging.FileHandler",
@@ -428,23 +481,74 @@ LOGGING = {
             "handlers": LOGGING_HANDLERS,
             "level": ENVIRONMENT.get_value("GUNICORN_LOG_LEVEL", default="DEBUG"),
         },
-        "django": {"handlers": LOGGING_HANDLERS, "level": DJANGO_LOGGING_LEVEL},
-        "api": {"handlers": LOGGING_HANDLERS, "level": KOKU_LOGGING_LEVEL},
-        "celery": {"handlers": LOGGING_HANDLERS, "level": KOKU_LOGGING_LEVEL, "propagate": False},
-        "cost_models": {"handlers": LOGGING_HANDLERS, "level": KOKU_LOGGING_LEVEL},
-        "forecast": {"handlers": LOGGING_HANDLERS, "level": KOKU_LOGGING_LEVEL},
-        "hcs": {"handlers": LOGGING_HANDLERS, "level": KOKU_LOGGING_LEVEL},
-        "kafka_utils": {"handlers": LOGGING_HANDLERS, "level": KOKU_LOGGING_LEVEL},
-        "koku": {"handlers": LOGGING_HANDLERS, "level": KOKU_LOGGING_LEVEL},
-        "providers": {"handlers": LOGGING_HANDLERS, "level": KOKU_LOGGING_LEVEL},
-        "reporting": {"handlers": LOGGING_HANDLERS, "level": KOKU_LOGGING_LEVEL},
-        "reporting_common": {"handlers": LOGGING_HANDLERS, "level": KOKU_LOGGING_LEVEL},
-        "masu": {"handlers": LOGGING_HANDLERS, "level": KOKU_LOGGING_LEVEL, "propagate": False},
-        "sources": {"handlers": LOGGING_HANDLERS, "level": KOKU_LOGGING_LEVEL},
+        "django": {
+            "handlers": LOGGING_HANDLERS,
+            "level": DJANGO_LOGGING_LEVEL,
+        },
+        "api": {
+            "handlers": LOGGING_HANDLERS,
+            "level": KOKU_LOGGING_LEVEL,
+        },
+        "celery": {
+            "handlers": LOGGING_HANDLERS,
+            "level": KOKU_LOGGING_LEVEL,
+            "propagate": False,
+        },
+        "cost_models": {
+            "handlers": LOGGING_HANDLERS,
+            "level": KOKU_LOGGING_LEVEL,
+        },
+        "forecast": {
+            "handlers": LOGGING_HANDLERS,
+            "level": KOKU_LOGGING_LEVEL,
+        },
+        "hcs": {
+            "handlers": LOGGING_HANDLERS,
+            "level": KOKU_LOGGING_LEVEL,
+        },
+        "kafka_utils": {
+            "handlers": LOGGING_HANDLERS,
+            "level": KOKU_LOGGING_LEVEL,
+        },
+        "koku": {
+            "handlers": LOGGING_HANDLERS,
+            "level": KOKU_LOGGING_LEVEL,
+        },
+        "providers": {
+            "handlers": LOGGING_HANDLERS,
+            "level": KOKU_LOGGING_LEVEL,
+        },
+        "reporting": {
+            "handlers": LOGGING_HANDLERS,
+            "level": KOKU_LOGGING_LEVEL,
+        },
+        "reporting_common": {
+            "handlers": LOGGING_HANDLERS,
+            "level": KOKU_LOGGING_LEVEL,
+        },
+        "masu": {
+            "handlers": LOGGING_HANDLERS,
+            "level": KOKU_LOGGING_LEVEL,
+            "propagate": False,
+        },
+        "sources": {
+            "handlers": LOGGING_HANDLERS,
+            "level": KOKU_LOGGING_LEVEL,
+        },
+        "subs": {
+            "handlers": LOGGING_HANDLERS,
+            "level": KOKU_LOGGING_LEVEL,
+        },
         # The following set the log level for the UnleashClient and Unleash cache refresh jobs.
         # Setting to WARNING will prevent the INFO level spam.
-        "UnleashClient": {"handlers": LOGGING_HANDLERS, "level": UNLEASH_LOGGING_LEVEL},
-        "apscheduler": {"handlers": LOGGING_HANDLERS, "level": UNLEASH_LOGGING_LEVEL},
+        "UnleashClient": {
+            "handlers": LOGGING_HANDLERS,
+            "level": UNLEASH_LOGGING_LEVEL,
+        },
+        "apscheduler": {
+            "handlers": LOGGING_HANDLERS,
+            "level": UNLEASH_LOGGING_LEVEL,
+        },
     },
 }
 
@@ -456,7 +560,6 @@ KOKU_DEFAULT_CURRENCY = ENVIRONMENT.get_value("KOKU_DEFAULT_CURRENCY", default="
 KOKU_DEFAULT_COST_TYPE = ENVIRONMENT.get_value("KOKU_DEFAULT_COST_TYPE", default="unblended_cost")
 KOKU_DEFAULT_TIMEZONE = ENVIRONMENT.get_value("KOKU_DEFAULT_TIMEZONE", default="UTC")
 KOKU_DEFAULT_LOCALE = ENVIRONMENT.get_value("KOKU_DEFAULT_LOCALE", default="en_US.UTF-8")
-
 
 # Cors Setup
 # See https://github.com/ottoyiu/django-cors-headers
@@ -472,36 +575,41 @@ if len(sys.argv) > 1 and sys.argv[1] == "test" and DISABLE_LOGGING:
 # AWS S3 Bucket Settings
 REQUESTED_BUCKET = ENVIRONMENT.get_value("REQUESTED_BUCKET", default="koku-report")
 REQUESTED_ROS_BUCKET = ENVIRONMENT.get_value("REQUESTED_ROS_BUCKET", default="ros-report")
+REQUESTED_SUBS_BUCKET = ENVIRONMENT.get_value("REQUESTED_SUBS_BUCKET", default="subs-report")
 S3_TIMEOUT = ENVIRONMENT.int("S3_CONNECTION_TIMEOUT", default=60)
 S3_ENDPOINT = CONFIGURATOR.get_object_store_endpoint()
 S3_REGION = ENVIRONMENT.get_value("S3_REGION", default="us-east-1")
-S3_BUCKET_PATH = ENVIRONMENT.get_value("S3_BUCKET_PATH", default="data_archive")
 S3_BUCKET_NAME = CONFIGURATOR.get_object_store_bucket(REQUESTED_BUCKET)
 S3_ACCESS_KEY = CONFIGURATOR.get_object_store_access_key(REQUESTED_BUCKET)
 S3_SECRET = CONFIGURATOR.get_object_store_secret_key(REQUESTED_BUCKET)
+# HCS
+S3_HCS_BUCKET_NAME = CONFIGURATOR.get_object_store_bucket(REQUESTED_BUCKET)
+S3_HCS_ACCESS_KEY = CONFIGURATOR.get_object_store_access_key(REQUESTED_BUCKET)
+S3_HCS_SECRET = CONFIGURATOR.get_object_store_secret_key(REQUESTED_BUCKET)
+S3_HCS_REGION = CONFIGURATOR.get_object_store_region(REQUESTED_BUCKET)
+S3_HCS_ENDPOINT = CONFIGURATOR.get_object_store_endpoint()
+# ROS
 S3_ROS_BUCKET_NAME = CONFIGURATOR.get_object_store_bucket(REQUESTED_ROS_BUCKET)
 S3_ROS_ACCESS_KEY = CONFIGURATOR.get_object_store_access_key(REQUESTED_ROS_BUCKET)
 S3_ROS_SECRET = CONFIGURATOR.get_object_store_secret_key(REQUESTED_ROS_BUCKET)
 S3_ROS_REGION = CONFIGURATOR.get_object_store_region(REQUESTED_ROS_BUCKET)
+S3_ROS_ENDPOINT = CONFIGURATOR.get_object_store_endpoint()
+# SUBS
+S3_SUBS_BUCKET_NAME = CONFIGURATOR.get_object_store_bucket(REQUESTED_SUBS_BUCKET)
+S3_SUBS_ACCESS_KEY = CONFIGURATOR.get_object_store_access_key(REQUESTED_SUBS_BUCKET)
+S3_SUBS_SECRET = CONFIGURATOR.get_object_store_secret_key(REQUESTED_SUBS_BUCKET)
+S3_SUBS_REGION = CONFIGURATOR.get_object_store_region(REQUESTED_SUBS_BUCKET)
+S3_SUBS_ENDPOINT = CONFIGURATOR.get_object_store_endpoint()
 SKIP_MINIO_DATA_DELETION = ENVIRONMENT.bool("SKIP_MINIO_DATA_DELETION", default=False)
 
-ENABLE_S3_ARCHIVING = ENVIRONMENT.bool("ENABLE_S3_ARCHIVING", default=False)
 PARQUET_PROCESSING_BATCH_SIZE = ENVIRONMENT.int("PARQUET_PROCESSING_BATCH_SIZE", default=200000)
-
-OCI_CONFIG = {
-    "user": ENVIRONMENT.get_value("OCI_CLI_USER", default="OCI_USER"),
-    "key_file": ENVIRONMENT.get_value("OCI_CLI_KEY_FILE", default="None"),
-    "fingerprint": ENVIRONMENT.get_value("OCI_CLI_FINGERPRINT", default="OCI_FINGERPRINT"),
-    "tenancy": ENVIRONMENT.get_value("OCI_CLI_TENANCY", default="OCI_TENANT"),
-}
+PANDAS_COLUMN_BATCH_SIZE = ENVIRONMENT.int("PANDAS_COLUMN_BATCH_SIZE", default=250)
 
 # Trino Settings
 TRINO_HOST = ENVIRONMENT.get_value("TRINO_HOST", default=None)
 TRINO_PORT = ENVIRONMENT.get_value("TRINO_PORT", default=None)
 TRINO_DATE_STEP = ENVIRONMENT.int("TRINO_DATE_STEP", default=5)
-
-# IBM Settings
-IBM_SERVICE_URL = ENVIRONMENT.get_value("IBM_SERVICE_URL", default="https://enterprise.cloud.ibm.com")
+TRINO_S3A_OR_S3 = ENVIRONMENT.get_value("TRINO_S3A_OR_S3", default="s3a")
 
 # Time to wait between cold storage retrieval for data export. Default is 3 hours
 COLD_STORAGE_RETRIVAL_WAIT_TIME = ENVIRONMENT.int("COLD_STORAGE_RETRIVAL_WAIT_TIME", default=10800)
@@ -516,6 +624,15 @@ PROMETHEUS_PUSHGATEWAY = ENVIRONMENT.get_value("PROMETHEUS_PUSHGATEWAY", default
 
 # Flag for automatic data ingest on Provider create
 AUTO_DATA_INGEST = ENVIRONMENT.bool("AUTO_DATA_INGEST", default=True)
+POLLING_TIMER = ENVIRONMENT.int("POLLING_TIMER", default=86400)
+POLLING_COUNT = ENVIRONMENT.int("POLLING_COUNT", default=21)
+
+# Used for setting threshold for XL customers based on manifest report count.
+XL_REPORT_COUNT = ENVIRONMENT.int("XL_REPORT_COUNT", default=100)
+
+# PROCESSING_WAIT_TIMER, used to prevent queuing new tasks until previous ones are complete
+PROCESSING_WAIT_TIMER = ENVIRONMENT.int("PROCESSING_WAIT_TIMER", default=3)
+LARGE_PROCESSING_WAIT_TIMER = ENVIRONMENT.int("LARGE_PROCESSING_WAIT_TIMER", default=7)
 QE_SCHEMA = ENVIRONMENT.get_value("QE_SCHEMA", default=None)
 
 # Flag for maximum retries for source delete before proceeding
@@ -550,3 +667,23 @@ CELERY_REDIS_RETRY_ON_TIMEOUT = REDIS_RETRY_ON_TIMEOUT
 
 # HCS debugging
 ENABLE_HCS_DEBUG = ENVIRONMENT.bool("ENABLE_HCS_DEBUG", default=False)
+
+# SUBS Data Extraction debugging
+ENABLE_SUBS_DEBUG = ENVIRONMENT.bool("ENABLE_SUBS_DEBUG", default=False)
+ENABLE_SUBS_PROVIDER_TYPES = ENVIRONMENT.list("ENABLE_SUBS_PROVIDER_TYPES", default=["AWS"])
+
+# ROS debugging
+DISABLE_ROS_MSG = ENVIRONMENT.bool("DISABLE_ROS_MSG", default=False)
+
+# Delay Celery Tasks Timeout
+DELAYED_TASK_TIME = ENVIRONMENT.int("DELAYED_TASK_TIME", default=3600)
+
+AZURE_COST_MGMT_CLIENT_API_VERSION = ENVIRONMENT.get_value(
+    "AZURE_COST_MGMT_CLIENT_API_VERSION", default="2023-07-01-preview"
+)
+
+# Data validation
+VALIDATION_RANGE = ENVIRONMENT.int("VALIDATION_RANGE", default=5)
+
+pd.options.mode.copy_on_write = True
+pd.options.mode.chained_assignment = "raise"

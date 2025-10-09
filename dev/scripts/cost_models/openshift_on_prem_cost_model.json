@@ -213,6 +213,87 @@
                 ]
             },
             "cost_type": "Infrastructure"
+        },
+        {
+            "metric": {
+                "name": "vm_cost_per_month"
+            },
+            "tiered_rates": [
+                {
+                    "unit": "USD",
+                    "value": 0.5,
+                    "usage_start": null,
+                    "usage_end": null
+                }
+            ],
+            "cost_type": "Infrastructure"
+        },
+        {
+            "metric": {
+                "name": "vm_cost_per_hour"
+            },
+            "tiered_rates": [
+                {
+                    "unit": "USD",
+                    "value": 0.007,
+                    "usage_start": null,
+                    "usage_end": null
+                }
+            ],
+            "cost_type": "Supplementary"
+        },
+        {
+            "metric": {
+                "name": "cluster_cost_per_hour"
+            },
+            "tiered_rates": [
+                {
+                    "unit": "USD",
+                    "value": 3.45,
+                    "usage_start": null,
+                    "usage_end": null
+                }
+            ],
+            "cost_type": "Infrastructure"
+        },
+        {
+            "metric": {
+                "name": "project_per_month"
+            },
+            "tag_rates": {
+                "tag_key": "cats",
+                "tag_values": [
+                    {
+                        "unit": "USD",
+                        "value": 50,
+                        "default": false,
+                        "tag_value": "nilla",
+                        "description": ""
+                    },
+                    {
+                        "unit": "USD",
+                        "value": 100,
+                        "default": false,
+                        "tag_value": "sushi",
+                        "description": ""
+                    },
+                    {
+                        "unit": "USD",
+                        "value": 25,
+                        "default": true,
+                        "tag_value": "fries",
+                        "description": ""
+                    },
+                    {
+                        "unit": "USD",
+                        "value": 5,
+                        "default": false,
+                        "tag_value": "cinnamon",
+                        "description": ""
+                    }
+                ]
+            },
+            "cost_type": "Infrastructure"
         }
     ]
 }

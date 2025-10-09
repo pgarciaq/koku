@@ -39,6 +39,7 @@ CREATE TABLE IF NOT EXISTS hive.{{schema | sqlsafe}}.reporting_ocpusagelineitem_
     persistentvolumeclaim_usage_gigabyte_months double,
     source_uuid varchar,
     infrastructure_usage_cost varchar,
+    csi_volume_handle varchar,
     cost_category_id int,
     source varchar,
     year varchar,
@@ -83,6 +84,7 @@ INSERT INTO hive.{{schema | sqlsafe}}.reporting_ocpusagelineitem_daily_summary (
     persistentvolumeclaim_usage_gigabyte_months,
     source_uuid,
     infrastructure_usage_cost,
+    csi_volume_handle,
     cost_category_id,
     source,
     year,
@@ -90,11 +92,23 @@ INSERT INTO hive.{{schema | sqlsafe}}.reporting_ocpusagelineitem_daily_summary (
     day
 )
 -- node label line items by day trino sql
-WITH cte_ocp_node_label_line_item_daily AS (
+WITH cte_pg_enabled_keys as (
+    select array['vm_kubevirt_io_name'] || array_agg(key order by key) as keys
+      from postgres.{{schema | sqlsafe}}.reporting_enabledtagkeys
+     where enabled = true
+     and provider_type = 'OCP'
+),
+cte_ocp_node_label_line_item_daily AS (
     SELECT date(nli.interval_start) as usage_start,
         nli.node,
-        nli.node_labels
+        cast(
+            map_filter(
+                cast(json_parse(nli.node_labels) as map(varchar, varchar)),
+                (k,v) -> contains(pek.keys, k)
+            ) as json
+        ) as node_labels
     FROM hive.{{schema | sqlsafe}}.openshift_node_labels_line_items_daily AS nli
+    CROSS JOIN cte_pg_enabled_keys AS pek
     WHERE nli.source = {{source}}
        AND nli.year = {{year}}
        AND nli.month = {{month}}
@@ -102,14 +116,20 @@ WITH cte_ocp_node_label_line_item_daily AS (
        AND nli.interval_start < date_add('day', 1, {{end_date}})
     GROUP BY date(nli.interval_start),
         nli.node,
-        nli.node_labels
+        3 -- needs to match the lables cardinality
 ),
 -- namespace label line items by day trino sql
 cte_ocp_namespace_label_line_item_daily AS (
     SELECT date(nli.interval_start) as usage_start,
         nli.namespace,
-        nli.namespace_labels
+        cast(
+            map_filter(
+                cast(json_parse(nli.namespace_labels) as map(varchar, varchar)),
+                (k,v) -> contains(pek.keys, k)
+            ) as json
+        ) as namespace_labels
     FROM hive.{{schema | sqlsafe}}.openshift_namespace_labels_line_items_daily AS nli
+    CROSS JOIN cte_pg_enabled_keys AS pek
     WHERE nli.source = {{source}}
        AND nli.year = {{year}}
        AND nli.month = {{month}}
@@ -117,7 +137,7 @@ cte_ocp_namespace_label_line_item_daily AS (
        AND nli.interval_start < date_add('day', 1, {{end_date}})
     GROUP BY date(nli.interval_start),
         nli.namespace,
-        nli.namespace_labels
+        3 -- needs to match the labels cardinality
 ),
 -- Daily sum of cluster CPU and memory capacity
 cte_ocp_node_capacity AS (
@@ -231,6 +251,7 @@ SELECT null as uuid,
     NULL as persistentvolumeclaim_usage_gigabyte_months,
     pua.source_uuid,
     '{"cpu": 0.000000000, "memory": 0.000000000, "storage": 0.000000000}' as infrastructure_usage_cost,
+    NULL as csi_volume_handle,
     pua.cost_category_id,
     {{source}} as source,
     cast(year(pua.usage_start) as varchar) as year,
@@ -240,12 +261,15 @@ FROM (
     SELECT date(li.interval_start) as usage_start,
         li.namespace,
         li.node,
-        max(cat.id) as cost_category_id,
+        max(cat_ns.cost_category_id) as cost_category_id,
         li.source as source_uuid,
         map_concat(
-            cast(json_parse(coalesce(nli.node_labels, '{}')) as map(varchar, varchar)),
-            cast(json_parse(coalesce(nsli.namespace_labels, '{}')) as map(varchar, varchar)),
-            cast(json_parse(li.pod_labels) as map(varchar, varchar))
+            cast(coalesce(nli.node_labels, cast(map(array[], array[]) as json)) as map(varchar, varchar)),
+            cast(coalesce(nsli.namespace_labels, cast(map(array[], array[]) as json)) as map(varchar, varchar)),
+            map_filter(
+                cast(json_parse(li.pod_labels) AS MAP(VARCHAR, VARCHAR)),
+                (k, v) -> CONTAINS(pek.keys, k)
+            )
         ) as pod_labels,
         max(li.resource_id) as resource_id,
         sum(li.pod_usage_cpu_core_seconds) / 3600.0 as pod_usage_cpu_core_hours,
@@ -263,6 +287,7 @@ FROM (
         max(cc.cluster_capacity_cpu_core_seconds) / 3600.0 as cluster_capacity_cpu_core_hours,
         max(cc.cluster_capacity_memory_byte_seconds) / 3600.0 * power(2, -30) as cluster_capacity_memory_gigabyte_hours
     FROM hive.{{schema | sqlsafe}}.openshift_pod_usage_line_items_daily as li
+    CROSS JOIN cte_pg_enabled_keys AS pek
     LEFT JOIN cte_ocp_node_label_line_item_daily as nli
         ON nli.node = li.node
             AND nli.usage_start = date(li.interval_start)
@@ -274,13 +299,14 @@ FROM (
             AND nc.node = li.node
     LEFT JOIN cte_ocp_cluster_capacity as cc
         ON cc.usage_start = date(li.interval_start)
-    LEFT JOIN postgres.{{schema | sqlsafe}}.reporting_ocp_cost_category as cat
-        ON any_match(cat.namespace, x -> li.namespace LIKE x)
+    LEFT JOIN postgres.{{schema | sqlsafe}}.reporting_ocp_cost_category_namespace AS cat_ns
+        ON li.namespace LIKE cat_ns.namespace
     WHERE li.source = {{source}}
         AND li.year = {{year}}
         AND li.month = {{month}}
         AND li.interval_start >= {{start_date}}
         AND li.interval_start < date_add('day', 1, {{end_date}})
+        AND li.node != ''
     GROUP BY date(li.interval_start),
         li.namespace,
         li.node,
@@ -349,6 +375,7 @@ SELECT null as uuid,
         power(2, -30)) as persistentvolumeclaim_usage_gigabyte_months,
     sua.source_uuid,
     '{"cpu": 0.000000000, "memory": 0.000000000, "storage": 0.000000000}' as infrastructure_usage_cost,
+    sua.csi_volume_handle,
     sua.cost_category_id,
     {{source}} as source,
     cast(year(sua.usage_start) as varchar) as year,
@@ -363,19 +390,27 @@ FROM (
         sli.storageclass,
         date(sli.interval_start) as usage_start,
         map_concat(
-            cast(json_parse(coalesce(nli.node_labels, '{}')) as map(varchar, varchar)),
-            cast(json_parse(coalesce(nsli.namespace_labels, '{}')) as map(varchar, varchar)),
-            cast(json_parse(sli.persistentvolume_labels) as map(varchar, varchar)),
-            cast(json_parse(sli.persistentvolumeclaim_labels) as map(varchar, varchar))
+            cast(coalesce(nli.node_labels, cast(map(array[], array[]) as json)) as map(varchar, varchar)),
+            cast(coalesce(nsli.namespace_labels, cast(map(array[], array[]) as json)) as map(varchar, varchar)),
+            map_filter(
+                cast(json_parse(sli.persistentvolume_labels) AS MAP(VARCHAR, VARCHAR)),
+                (k, v) -> CONTAINS(pek.keys, k)
+            ),
+            map_filter(
+                cast(json_parse(sli.persistentvolumeclaim_labels) AS MAP(VARCHAR, VARCHAR)),
+                (k, v) -> CONTAINS(pek.keys, k)
+            )
         ) as volume_labels,
         sli.source as source_uuid,
-        max(cat.id) as cost_category_id,
+        sli.csi_volume_handle as csi_volume_handle,
+        max(cat_ns.cost_category_id) as cost_category_id,
         max(sli.persistentvolumeclaim_capacity_bytes) as persistentvolumeclaim_capacity_bytes,
         sum(sli.persistentvolumeclaim_capacity_byte_seconds) as persistentvolumeclaim_capacity_byte_seconds,
         -- Divide volume usage and requests by the number of nodes that volume is mounted on
         sum(sli.volume_request_storage_byte_seconds) / max(nc.node_count) as volume_request_storage_byte_seconds,
         sum(sli.persistentvolumeclaim_usage_byte_seconds) / max(nc.node_count) as persistentvolumeclaim_usage_byte_seconds
     FROM hive.{{schema | sqlsafe}}.openshift_storage_usage_line_items_daily sli
+    CROSS JOIN cte_pg_enabled_keys AS pek
     LEFT JOIN cte_volume_nodes as vn
         ON vn.usage_start = date(sli.interval_start)
             AND vn.persistentvolumeclaim = sli.persistentvolumeclaim
@@ -390,8 +425,8 @@ FROM (
     LEFT JOIN cte_ocp_namespace_label_line_item_daily as nsli
         ON nsli.namespace = sli.namespace
             AND nsli.usage_start = date(sli.interval_start)
-    LEFT JOIN postgres.{{schema | sqlsafe}}.reporting_ocp_cost_category as cat
-        ON any_match(cat.namespace, x -> sli.namespace LIKE x)
+    LEFT JOIN postgres.{{schema | sqlsafe}}.reporting_ocp_cost_category_namespace AS cat_ns
+        ON sli.namespace LIKE cat_ns.namespace
     WHERE sli.source = {{source}}
         AND sli.year = {{year}}
         AND sli.month = {{month}}
@@ -403,6 +438,7 @@ FROM (
         sli.persistentvolumeclaim,
         sli.persistentvolume,
         sli.storageclass,
+        sli.csi_volume_handle,
         date(sli.interval_start),
         8,  /* THIS ORDINAL MUST BE KEPT IN SYNC WITH THE map_filter EXPRESSION */
             /* The map_filter expression was too complex for trino to use */
@@ -504,6 +540,8 @@ cte_unallocated_capacity AS (
         AND lids.usage_start < date_add('day', 1, {{end_date}})
         AND lids.namespace != 'Platform unallocated'
         AND lids.namespace != 'Worker unallocated'
+        AND lids.namespace != 'Network unattributed'
+        AND lids.namespace != 'Storage unattributed'
         AND lids.node IS NOT NULL
         AND lids.data_source = 'Pod'
     GROUP BY lids.node, lids.usage_start, lids.source_uuid
@@ -532,14 +570,14 @@ SELECT
     cluster_capacity_memory_gigabyte_hours,
     data_source,
     source_uuid,
-    cat.id as cost_category_id,
+    cat_ns.cost_category_id as cost_category_id,
     source,
     year,
     month,
     day
 FROM cte_unallocated_capacity AS uc
-LEFT JOIN postgres.{{schema | sqlsafe}}.reporting_ocp_cost_category AS cat
-    ON any_match(cat.namespace, x -> uc.namespace LIKE x)
+LEFT JOIN postgres.{{schema | sqlsafe}}.reporting_ocp_cost_category_namespace AS cat_ns
+    ON uc.namespace LIKE cat_ns.namespace
 ;
 
 INSERT INTO postgres.{{schema | sqlsafe}}.reporting_ocpusagelineitem_daily_summary (
@@ -572,6 +610,7 @@ INSERT INTO postgres.{{schema | sqlsafe}}.reporting_ocpusagelineitem_daily_summa
     persistentvolume,
     storageclass,
     volume_labels,
+    all_labels,
     persistentvolumeclaim_capacity_gigabyte,
     persistentvolumeclaim_capacity_gigabyte_months,
     volume_request_storage_gigabyte_months,
@@ -609,6 +648,10 @@ SELECT uuid(),
     persistentvolume,
     storageclass,
     json_parse(volume_labels),
+    json_parse(json_format(cast(map_concat(
+        cast(json_parse(coalesce(pod_labels, '{}')) as map(varchar, varchar)),
+        cast(json_parse(coalesce(volume_labels, '{}')) as map(varchar, varchar))
+    )as json))) as all_labels,
     persistentvolumeclaim_capacity_gigabyte,
     persistentvolumeclaim_capacity_gigabyte_months,
     volume_request_storage_gigabyte_months,

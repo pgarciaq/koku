@@ -5,17 +5,17 @@
 """Database accessor for OCP rate data."""
 import copy
 import logging
+from collections import defaultdict
 
-from django_tenants.utils import schema_context
+from django.db import transaction
 
 from api.metrics import constants as metric_constants
 from cost_models.models import CostModel
-from masu.database.koku_database_access import KokuDBAccess
 
 LOG = logging.getLogger(__name__)
 
 
-class CostModelDBAccessor(KokuDBAccess):
+class CostModelDBAccessor:
     """Class to interact with customer reporting tables."""
 
     def __init__(self, schema, provider_uuid):
@@ -26,16 +26,26 @@ class CostModelDBAccessor(KokuDBAccess):
             provider_uuid (str): Provider uuid
 
         """
-        super().__init__(schema)
+        self.schema = schema
         self.provider_uuid = provider_uuid
         self._cost_model = None
+
+    def __enter__(self):
+        """Enter context manager."""
+        connection = transaction.get_connection()
+        connection.set_schema(self.schema)
+        return self
+
+    def __exit__(self, exception_type, exception_value, traceback):
+        """Context manager reset schema to public and exit."""
+        connection = transaction.get_connection()
+        connection.set_schema_to_public()
 
     @property
     def cost_model(self):
         """Return the cost model database object."""
         if self._cost_model is None:
-            with schema_context(self.schema):
-                self._cost_model = CostModel.objects.filter(costmodelmap__provider_uuid=self.provider_uuid).first()
+            self._cost_model = CostModel.objects.filter(costmodelmap__provider_uuid=self.provider_uuid).first()
         return self._cost_model
 
     @property
@@ -51,11 +61,7 @@ class CostModelDBAccessor(KokuDBAccess):
             if not rate.get("tiered_rates"):
                 continue
             metric_name = rate.get("metric", {}).get("name")
-            metric_cost_type = rate.pop("cost_type", None)
-            if not metric_cost_type:
-                for default_metric in metric_constants.COST_MODEL_METRIC_MAP:
-                    if metric_name == default_metric.get("metric"):
-                        metric_cost_type = default_metric.get("default_cost_type")
+            metric_cost_type = rate["cost_type"]
             if metric_name in metric_rate_map.keys():
                 metric_mapping = metric_rate_map.get(metric_name)
                 if metric_cost_type in metric_mapping.get("tiered_rates", {}).keys():
@@ -109,47 +115,35 @@ class CostModelDBAccessor(KokuDBAccess):
         """Get the rates."""
         return self.price_list.get(value)
 
-    def get_cpu_core_usage_per_hour_rates(self):
-        """Get cpu usage rates."""
-        cpu_usage_rates = self.get_rates("cpu_core_usage_per_hour")
-        LOG.info("OCP CPU usage rates: %s", str(cpu_usage_rates))
-        return cpu_usage_rates
-
-    def get_memory_gb_usage_per_hour_rates(self):
-        """Get the memory usage rates."""
-        mem_usage_rates = self.get_rates("memory_gb_usage_per_hour")
-        LOG.info("OCP Memory usage rates: %s", str(mem_usage_rates))
-        return mem_usage_rates
-
-    def get_cpu_core_request_per_hour_rates(self):
-        """Get cpu request rates."""
-        cpu_request_rates = self.get_rates("cpu_core_request_per_hour")
-        LOG.info("OCP CPU request rates: %s", str(cpu_request_rates))
-        return cpu_request_rates
-
-    def get_memory_gb_request_per_hour_rates(self):
-        """Get the memory request rates."""
-        mem_request_rates = self.get_rates("memory_gb_request_per_hour")
-        LOG.info("OCP Memory request rates: %s", str(mem_request_rates))
-        return mem_request_rates
-
-    def get_storage_gb_usage_per_month_rates(self):
-        """Get the storage usage rates."""
-        storage_usage_rates = self.get_rates("storage_gb_usage_per_month")
-        LOG.info("OCP Storage usage rates: %s", str(storage_usage_rates))
-        return storage_usage_rates
-
-    def get_storage_gb_request_per_month_rates(self):
-        """Get the storage request rates."""
-        storage_request_rates = self.get_rates("storage_gb_request_per_month")
-        LOG.info("OCP Storage request rates: %s", str(storage_request_rates))
-        return storage_request_rates
-
-    def get_node_per_month_rates(self):
-        """Get the storage request rates."""
-        node_rates = self.get_rates("node_cost_per_month")
-        LOG.info("OCP Node rate: %s", str(node_rates))
-        return node_rates
+    @property
+    def metric_to_tag_params_map(self):
+        """Returns the tag rate parameters"""
+        if not self.cost_model:
+            return {}
+        tag_rate_list = []
+        all_rates = copy.deepcopy(self.cost_model.rates)
+        for rate in all_rates:
+            tag_rate_param = {}
+            tag_rate = rate.get("tag_rates")
+            if not tag_rate:
+                continue
+            metric_name = rate.get("metric", {}).get("name")
+            tag_rate_param["rate_type"] = rate["cost_type"]
+            tag_rate_param["tag_key"] = tag_rate.get("tag_key")
+            kv_pairs_rates = {}
+            for tag_value in tag_rate.get("tag_values"):
+                if tag_value.get("default"):
+                    tag_rate_param["default_rate"] = float(tag_value.get("value"))
+                else:
+                    kv_pairs_rates[tag_value.get("tag_value")] = float(tag_value.get("value"))
+            if kv_pairs_rates:
+                tag_rate_param["value_rates"] = kv_pairs_rates
+            tag_rate_list.append({metric_name: tag_rate_param})
+        metric_map = defaultdict(list)
+        for item in tag_rate_list:
+            for metric_name, params in item.items():
+                metric_map[metric_name].append(params)
+        return metric_map
 
     @property  # noqa: C901
     def tag_based_price_list(self):  # noqa: C901
@@ -164,11 +158,7 @@ class CostModelDBAccessor(KokuDBAccess):
             if not rate.get("tag_rates"):
                 continue
             metric_name = rate.get("metric", {}).get("name")
-            metric_cost_type = rate.pop("cost_type", None)
-            if not metric_cost_type:
-                for default_metric in metric_constants.COST_MODEL_METRIC_MAP:
-                    if metric_name == default_metric.get("metric"):
-                        metric_cost_type = default_metric.get("default_cost_type")
+            metric_cost_type = rate["cost_type"]
             tag_rates_list = []
             tag = rate.get("tag_rates")
             tag_rate_dict = {}
@@ -189,13 +179,13 @@ class CostModelDBAccessor(KokuDBAccess):
                 if existing_cost_dict.get(metric_cost_type):
                     existing_list = existing_cost_dict.get(metric_cost_type)
                     existing_list.extend(tag_rates_list)
-                    existing_cost_dict[f"{metric_cost_type}"] = existing_list
+                    existing_cost_dict[metric_cost_type] = existing_list
                 else:
-                    existing_cost_dict[f"{metric_cost_type}"] = tag_rates_list
+                    existing_cost_dict[metric_cost_type] = tag_rates_list
                     tag_rates["tag_rates"] = existing_cost_dict
                     metric_rate_map[metric_name] = tag_rates
             else:
-                format_tag_rates = {f"{metric_cost_type}": tag_rates_list}
+                format_tag_rates = {metric_cost_type: tag_rates_list}
                 rate["tag_rates"] = format_tag_rates
                 metric_rate_map[metric_name] = rate
         return metric_rate_map
@@ -235,7 +225,7 @@ class CostModelDBAccessor(KokuDBAccess):
         {
             metric: {
                 key: {
-                    'default_value': <value>, 'defined_keys': [keys, to, be, ignored]
+                    'default_value': <value>, 'defined_keys': [values, to, be, ignored]
                 }
             }
         }
@@ -249,6 +239,7 @@ class CostModelDBAccessor(KokuDBAccess):
                     tag_key = tag.get("tag_key")
                     tag_keys_to_ignore = list(tag.get("tag_values").keys())
                     default_value = tag.get("tag_key_default")
+                    # NOTE: defined keys is actually list of values that have a rate associated with them.
                     tag_dict[tag_key] = {"default_value": default_value, "defined_keys": tag_keys_to_ignore}
                     results_dict[key] = tag_dict
         return results_dict
@@ -288,7 +279,7 @@ class CostModelDBAccessor(KokuDBAccess):
         {
             metric: {
                 key: {
-                    'default_value': <value>, 'defined_keys': [keys, to, be, ignored]
+                    'default_value': <value>, 'defined_keys': [values, to, be, ignored]
                 }
             }
         }
@@ -302,6 +293,7 @@ class CostModelDBAccessor(KokuDBAccess):
                     tag_key = tag.get("tag_key")
                     tag_keys_to_ignore = list(tag.get("tag_values").keys())
                     default_value = tag.get("tag_key_default")
+                    # Note: defined_keys is actually a list of tag values that have a specific rate
                     tag_dict[tag_key] = {"default_value": default_value, "defined_keys": tag_keys_to_ignore}
                     results_dict[key] = tag_dict
         return results_dict

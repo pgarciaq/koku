@@ -8,6 +8,7 @@ import copy
 from django.db.models import CharField
 from django.db.models import F
 from django.db.models import Value
+from django.db.models.fields.json import KT
 from django.db.models.functions import Coalesce
 from django_tenants.utils import tenant_context
 
@@ -29,7 +30,9 @@ class OCPAzureReportQueryHandler(AzureReportQueryHandler):
             parameters    (QueryParameters): parameter object for query
 
         """
-        self._mapper = OCPAzureProviderMap(provider=self.provider, report_type=parameters.report_type)
+        self._mapper = OCPAzureProviderMap(
+            provider=self.provider, report_type=parameters.report_type, schema_name=parameters.tenant.schema_name
+        )
         self.group_by_options = self._mapper.provider_map.get("group_by_options")
         self._limit = parameters.get_filter("limit")
 
@@ -61,6 +64,9 @@ class OCPAzureReportQueryHandler(AzureReportQueryHandler):
             else:
                 annotations["project"] = F("namespace")
 
+        for tag_db_name, _, original_tag in self._tag_group_by:
+            annotations[tag_db_name] = KT(f"{self._mapper.tag_column}__{original_tag}")
+
         return annotations
 
     def execute_query(self):  # noqa: C901
@@ -85,6 +91,15 @@ class OCPAzureReportQueryHandler(AzureReportQueryHandler):
 
             annotations = self._mapper.report_type_map.get("annotations")
             query_data = query.values(*query_group_by).annotate(**annotations)
+
+            if (
+                "subscription_guid" in query_group_by
+                and "subscription_name" not in query_order_by
+                and "-subscription_name" not in query_order_by
+            ):
+                query_data = query_data.annotate(
+                    subscription_name=Coalesce(F(self._mapper.provider_map.get("alias")), "subscription_guid")
+                )
 
             if is_grouped_by_project(self.parameters):
                 query_data = self._project_classification_annotation(query_data)

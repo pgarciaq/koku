@@ -6,11 +6,12 @@
 import logging
 from decimal import Decimal
 
+from django.utils import timezone
 from django_tenants.utils import schema_context
 
+from api.common import log_json
 from masu.database.cost_model_db_accessor import CostModelDBAccessor
 from masu.database.gcp_report_db_accessor import GCPReportDBAccessor
-from masu.external.date_accessor import DateAccessor
 from masu.util.gcp.common import get_bills_from_provider
 from reporting.provider.gcp.models import UI_SUMMARY_TABLES
 
@@ -47,7 +48,7 @@ class GCPCostModelCostUpdater:
                     bill_ids = [str(bill.id) for bill in bills]
                 report_accessor.populate_markup_cost(markup_value, start_date, end_date, bill_ids)
         except GCPCostModelCostUpdaterError as error:
-            LOG.error("Unable to update markup costs. Error: %s", str(error))
+            LOG.error(log_json(msg="unable to update markup costs"), exc_info=error)
 
     def update_summary_cost_model_costs(self, start_date=None, end_date=None):
         """Update the GCP summary table with the charge information.
@@ -61,21 +62,35 @@ class GCPCostModelCostUpdater:
 
         """
         LOG.debug(
-            "Starting charge calculation updates for provider: %s. Dates: %s-%s",
-            self._provider.uuid,
-            str(start_date),
-            str(end_date),
+            log_json(
+                msg="starting charge calculation updates",
+                schema=self._schema,
+                provider_uuid=self._provider.uuid,
+                start_date=start_date,
+                end_date=end_date,
+            )
         )
 
         self._update_markup_cost(start_date, end_date)
 
         with GCPReportDBAccessor(self._schema) as accessor:
             LOG.debug(
-                "Updating GCP derived cost summary for schema: %s and provider: %s", self._schema, self._provider.uuid
+                log_json(
+                    msg="updating GCP derived cost summary",
+                    schema=self._schema,
+                    provider_uuid=self._provider.uuid,
+                )
             )
-            accessor.populate_ui_summary_tables(start_date, end_date, self._provider.uuid, UI_SUMMARY_TABLES)
-            bills = accessor.bills_for_provider_uuid(self._provider.uuid, start_date)
+            invoice_month = start_date.strftime("%Y%m")
+            invoice_dates = accessor.fetch_invoice_month_dates(
+                start_date, end_date, invoice_month, self._provider.uuid
+            )
+            invoice_start, invoice_end = invoice_dates[0]
+            accessor.populate_ui_summary_tables(
+                invoice_start, invoice_end, self._provider.uuid, invoice_month, UI_SUMMARY_TABLES
+            )
+            bills = accessor.bills_for_provider_uuid(self._provider.uuid, invoice_month=invoice_month)
             with schema_context(self._schema):
                 for bill in bills:
-                    bill.derived_cost_datetime = DateAccessor().today_with_timezone("UTC")
+                    bill.derived_cost_datetime = timezone.now()
                     bill.save()

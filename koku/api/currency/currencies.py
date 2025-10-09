@@ -13,6 +13,12 @@ CURRENCIES = [
         "description": "AUD (A$) - Australian Dollar",
     },
     {
+        "code": "BRL",
+        "name": "Brazilian Real",
+        "symbol": "R$",
+        "description": "BRL (R$) - Brazilian Real",
+    },
+    {
         "code": "CAD",
         "name": "Canadian Dollar",
         "symbol": "CA$",
@@ -29,6 +35,12 @@ CURRENCIES = [
         "name": "Chinese Yuan",
         "symbol": "CN\u00a5",
         "description": "CNY (CN\u00a5) - Chinese Yuan",
+    },
+    {
+        "code": "CZK",
+        "name": "Czech Koruna",
+        "symbol": "K\u010d",
+        "description": "CZK (K\u010d) - Czech Koruna",
     },
     {
         "code": "DKK",
@@ -53,6 +65,12 @@ CURRENCIES = [
         "name": "Hong Kong Dollar",
         "symbol": "HK$",
         "description": "HKD (HK$) - Hong Kong Dollar",
+    },
+    {
+        "code": "INR",
+        "name": "Indian Rupee",
+        "symbol": "\u20b9",
+        "description": "INR (\u20b9) - Indian Rupee",
     },
     {
         "code": "JPY",

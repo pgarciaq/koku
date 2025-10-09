@@ -3,10 +3,10 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 """Models for cost entry tables."""
-# flake8: noqa
 from reporting.currency.models import CurrencySettings
 from reporting.ingress.models import IngressReports
 from reporting.partition.models import PartitionedTable
+from reporting.provider.all.models import EnabledTagKeys
 from reporting.provider.all.openshift.models import OCPAllComputeSummaryPT
 from reporting.provider.all.openshift.models import OCPAllCostLineItemDailySummaryP
 from reporting.provider.all.openshift.models import OCPAllCostLineItemProjectDailySummaryP
@@ -28,7 +28,6 @@ from reporting.provider.aws.models import AWSCostSummaryByServiceP
 from reporting.provider.aws.models import AWSCostSummaryP
 from reporting.provider.aws.models import AWSDatabaseSummaryP
 from reporting.provider.aws.models import AWSEnabledCategoryKeys
-from reporting.provider.aws.models import AWSEnabledTagKeys
 from reporting.provider.aws.models import AWSNetworkSummaryP
 from reporting.provider.aws.models import AWSOrganizationalUnit
 from reporting.provider.aws.models import AWSStorageSummaryByAccountP
@@ -53,7 +52,6 @@ from reporting.provider.azure.models import AzureCostSummaryByLocationP
 from reporting.provider.azure.models import AzureCostSummaryByServiceP
 from reporting.provider.azure.models import AzureCostSummaryP
 from reporting.provider.azure.models import AzureDatabaseSummaryP
-from reporting.provider.azure.models import AzureEnabledTagKeys
 from reporting.provider.azure.models import AzureNetworkSummaryP
 from reporting.provider.azure.models import AzureStorageSummaryP
 from reporting.provider.azure.models import AzureTagsSummary
@@ -78,7 +76,6 @@ from reporting.provider.gcp.models import GCPCostSummaryByRegionP
 from reporting.provider.gcp.models import GCPCostSummaryByServiceP
 from reporting.provider.gcp.models import GCPCostSummaryP
 from reporting.provider.gcp.models import GCPDatabaseSummaryP
-from reporting.provider.gcp.models import GCPEnabledTagKeys
 from reporting.provider.gcp.models import GCPNetworkSummaryP
 from reporting.provider.gcp.models import GCPStorageSummaryByAccountP
 from reporting.provider.gcp.models import GCPStorageSummaryByProjectP
@@ -98,25 +95,13 @@ from reporting.provider.gcp.openshift.models import OCPGCPDatabaseSummaryP
 from reporting.provider.gcp.openshift.models import OCPGCPNetworkSummaryP
 from reporting.provider.gcp.openshift.models import OCPGCPStorageSummaryP
 from reporting.provider.gcp.openshift.models import OCPGCPTagsSummary
+from reporting.provider.models import SubsIDMap
+from reporting.provider.models import SubsLastProcessed
 from reporting.provider.models import TenantAPIProvider
-from reporting.provider.oci.models import OCIComputeSummaryByAccountP
-from reporting.provider.oci.models import OCIComputeSummaryP
-from reporting.provider.oci.models import OCICostEntryBill
-from reporting.provider.oci.models import OCICostEntryLineItemDailySummary
-from reporting.provider.oci.models import OCICostSummaryByAccountP
-from reporting.provider.oci.models import OCICostSummaryByServiceP
-from reporting.provider.oci.models import OCICostSummaryP
-from reporting.provider.oci.models import OCIDatabaseSummaryP
-from reporting.provider.oci.models import OCIEnabledTagKeys
-from reporting.provider.oci.models import OCINetworkSummaryP
-from reporting.provider.oci.models import OCIStorageSummaryByAccountP
-from reporting.provider.oci.models import OCIStorageSummaryP
-from reporting.provider.oci.models import OCITagsSummary
 from reporting.provider.ocp.costs.models import CostSummary
 from reporting.provider.ocp.models import OCPCostSummaryByNodeP
 from reporting.provider.ocp.models import OCPCostSummaryByProjectP
 from reporting.provider.ocp.models import OCPCostSummaryP
-from reporting.provider.ocp.models import OCPEnabledTagKeys
 from reporting.provider.ocp.models import OCPPodSummaryByProjectP
 from reporting.provider.ocp.models import OCPPodSummaryP
 from reporting.provider.ocp.models import OCPStorageVolumeLabelSummary
@@ -126,7 +111,6 @@ from reporting.provider.ocp.models import OCPUsageReportPeriod
 from reporting.provider.ocp.models import OCPVolumeSummaryByProjectP
 from reporting.provider.ocp.models import OCPVolumeSummaryP
 from reporting.user_settings.models import UserSettings
-
 
 # These are partitioned tables
 OCP_ON_ALL_PERSPECTIVES = (
@@ -164,18 +148,20 @@ OCP_ON_AZURE_PERSPECTIVES = (
     OCPAzureDatabaseSummaryP,
 )
 
+# These are cleaned during source delete
+# Also used during the expired_data flow
 TRINO_MANAGED_TABLES = {
     "reporting_ocpusagelineitem_daily_summary": "source",
-    "reporting_ocpawscostlineitem_project_daily_summary": "ocp_source",
-    "reporting_ocpawscostlineitem_project_daily_summary_temp": "ocp_source",
-    "aws_openshift_daily_resource_matched_temp": "ocp_source",
-    "aws_openshift_daily_tag_matched_temp": "ocp_source",
-    "azure_openshift_daily_resource_matched_temp": "ocp_source",
-    "azure_openshift_daily_tag_matched_temp": "ocp_source",
-    "reporting_ocpazurecostlineitem_project_daily_summary": "ocp_source",
-    "reporting_ocpazurecostlineitem_project_daily_summary_temp": "ocp_source",
-    "reporting_ocpgcpcostlineitem_project_daily_summary": "ocp_source",
-    "reporting_ocpgcpcostlineitem_project_daily_summary_temp": "ocp_source",
-    "gcp_openshift_daily_resource_matched_temp": "ocp_source",
-    "gcp_openshift_daily_tag_matched_temp": "ocp_source",
+    "managed_gcp_openshift_daily_temp": "ocp_source",
+    "managed_gcp_openshift_disk_capacities_temp": "ocp_source",
+    "managed_reporting_ocpgcpcostlineitem_project_daily_summary_temp": "ocp_source",
+    "managed_reporting_ocpgcpcostlineitem_project_daily_summary": "ocp_source",
+    "managed_aws_openshift_daily_temp": "ocp_source",
+    "managed_reporting_ocpawscostlineitem_project_daily_summary_temp": "ocp_source",
+    "managed_reporting_ocpawscostlineitem_project_daily_summary": "ocp_source",
+    "managed_aws_openshift_disk_capacities_temp": "ocp_source",
+    "managed_azure_openshift_daily_temp": "ocp_source",
+    "managed_azure_openshift_disk_capacities_temp": "ocp_source",
+    "managed_reporting_ocpazurecostlineitem_project_daily_summary_temp": "ocp_source",
+    "managed_reporting_ocpazurecostlineitem_project_daily_summary": "ocp_source",
 }

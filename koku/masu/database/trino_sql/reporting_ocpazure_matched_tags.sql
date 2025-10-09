@@ -8,8 +8,8 @@ WITH cte_unnested_azure_tags AS (
     WHERE source = {{azure_source_uuid}}
         AND year = {{year}}
         AND month = {{month}}
-        AND coalesce(usagedatetime, date) >= {{start_date}}
-        AND coalesce(usagedatetime, date) < date_add('day', 1, {{end_date}})
+        AND date >= {{start_date}}
+        AND date < date_add('day', 1, {{end_date}})
 ),
 cte_unnested_ocp_tags AS (
     SELECT DISTINCT pod_key,
@@ -40,9 +40,11 @@ FROM (
             lower(azure.key) = lower(ocp.volume_key)
                 AND lower(azure.value) = lower(ocp.volume_value)
         )
-    JOIN postgres.{{schema | sqlsafe}}.reporting_azureenabledtagkeys AS atk
-        ON azure.key = atk.key
-       AND atk.enabled = true
-    JOIN postgres.{{schema | sqlsafe}}.reporting_ocpenabledtagkeys AS otk
+    JOIN postgres.{{schema | sqlsafe}}.reporting_enabledtagkeys AS etk
+        ON azure.key = etk.key
+       AND etk.enabled = true
+       AND etk.provider_type = 'Azure'
+    JOIN postgres.{{schema | sqlsafe}}.reporting_enabledtagkeys AS otk
         ON ocp.pod_key = otk.key or ocp.volume_key = otk.key
+        AND otk.provider_type = 'OCP'
 ) AS matches

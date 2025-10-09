@@ -9,9 +9,12 @@ import uuid
 from unittest.mock import patch
 
 import pandas as pd
+from django.conf import settings
 from django.test.utils import override_settings
 
 from api.common import log_json
+from koku.cache import build_trino_schema_exists_key
+from koku.cache import build_trino_table_exists_key
 from masu.processor.report_parquet_processor_base import PostgresSummaryTableError
 from masu.processor.report_parquet_processor_base import ReportParquetProcessorBase
 from masu.test import MasuTestCase
@@ -88,14 +91,14 @@ class ReportParquetProcessorBaseTest(MasuTestCase):
             self.processor.postgres_summary_table
 
     @override_settings(S3_BUCKET_NAME="test-bucket")
-    @patch("masu.processor.aws.aws_report_parquet_processor.ReportParquetProcessorBase._execute_sql")
+    @patch("masu.processor.aws.aws_report_parquet_processor.ReportParquetProcessorBase._execute_trino_sql")
     def test_generate_create_table_sql(self, mock_execute):
         """Test the generate parquet table sql."""
         generated_sql = self.processor._generate_create_table_sql()
 
         expected_start = f"CREATE TABLE IF NOT EXISTS {self.schema}.{self.table_name}"
         expected_end = (
-            f"WITH(external_location = 's3a://test-bucket/{self.temp_dir}', "
+            f"WITH(external_location = '{settings.TRINO_S3A_OR_S3}://test-bucket/{self.temp_dir}', "
             "format = 'PARQUET', partitioned_by=ARRAY['source', 'year', 'month'])"
         )
         self.assertTrue(generated_sql.startswith(expected_start))
@@ -108,7 +111,7 @@ class ReportParquetProcessorBaseTest(MasuTestCase):
         self.assertTrue(generated_sql.endswith(expected_end))
 
     @override_settings(S3_BUCKET_NAME="test-bucket")
-    @patch("masu.processor.aws.aws_report_parquet_processor.ReportParquetProcessorBase._execute_sql")
+    @patch("masu.processor.aws.aws_report_parquet_processor.ReportParquetProcessorBase._execute_trino_sql")
     def test_generate_create_table_sql_with_provider_map(self, mock_execute):
         """Test the generate parquet table sql."""
         partition_map = {
@@ -121,7 +124,7 @@ class ReportParquetProcessorBaseTest(MasuTestCase):
 
         expected_start = f"CREATE TABLE IF NOT EXISTS {self.schema}.{self.table_name}"
         expected_end = (
-            f"WITH(external_location = 's3a://test-bucket/{self.temp_dir}', "
+            f"WITH(external_location = '{settings.TRINO_S3A_OR_S3}://test-bucket/{self.temp_dir}', "
             "format = 'PARQUET', partitioned_by=ARRAY['source', 'year', 'month', 'day'])"
         )
         self.assertTrue(generated_sql.startswith(expected_start))
@@ -133,7 +136,7 @@ class ReportParquetProcessorBaseTest(MasuTestCase):
             self.assertIn(f"{other_col} varchar", generated_sql)
         self.assertTrue(generated_sql.endswith(expected_end))
 
-    @patch("masu.processor.report_parquet_processor_base.ReportParquetProcessorBase._execute_sql")
+    @patch("masu.processor.report_parquet_processor_base.ReportParquetProcessorBase._execute_trino_sql")
     def test_create_table(self, mock_execute):
         """Test the Trino/Hive create table method."""
         expected_logs = []
@@ -147,7 +150,7 @@ class ReportParquetProcessorBaseTest(MasuTestCase):
             for expected_log in expected_logs:
                 self.assertIn(expected_log, logger.output)
 
-    @patch("masu.processor.report_parquet_processor_base.ReportParquetProcessorBase._execute_sql")
+    @patch("masu.processor.report_parquet_processor_base.ReportParquetProcessorBase._execute_trino_sql")
     def test_sync_hive_partitions(self, mock_execute):
         """Test that hive partitions are synced."""
         expected_log = self.log_output_info + str(
@@ -157,25 +160,57 @@ class ReportParquetProcessorBaseTest(MasuTestCase):
             self.processor.sync_hive_partitions()
             self.assertIn(expected_log, logger.output)
 
-    @patch("masu.processor.report_parquet_processor_base.ReportParquetProcessorBase._execute_sql")
-    def test_schema_exists(self, mock_execute):
-        """Test that hive partitions are synced."""
-        expected_log = self.log_output_info + str(log_json(msg="checking for schema", schema=self.schema_name))
-        with self.assertLogs(self.log_base, level="INFO") as logger:
-            self.processor.schema_exists()
-            self.assertIn(expected_log, logger.output)
+    @patch.object(ReportParquetProcessorBase, "_execute_trino_sql")
+    def test_schema_exists_cache_value_in_cache(self, trino_mock):
+        with patch(
+            "masu.processor.report_parquet_processor_base.get_value_from_cache",
+            return_value=True,
+        ):
+            self.assertTrue(self.processor.schema_exists())
+            trino_mock.assert_not_called()
 
-    @patch("masu.processor.report_parquet_processor_base.ReportParquetProcessorBase._execute_sql")
-    def test_table_exists(self, mock_execute):
-        """Test that hive partitions are synced."""
-        expected_log = self.log_output_info + str(
-            log_json(msg="checking for table", table=self.table_name, schema=self.schema_name)
-        )
-        with self.assertLogs(self.log_base, level="INFO") as logger:
-            self.processor.table_exists()
-            self.assertIn(expected_log, logger.output)
+    @patch.object(ReportParquetProcessorBase, "_execute_trino_sql")
+    def test_schema_exists_cache_value_not_in_cache(self, trino_mock):
+        trino_mock.return_value = True
+        key = build_trino_schema_exists_key(self.account)
+        with patch("masu.processor.report_parquet_processor_base.set_value_in_cache") as mock_cache_set:
+            self.assertTrue(self.processor.schema_exists())
+            mock_cache_set.assert_called_with(key, True)
 
-    @patch("masu.processor.report_parquet_processor_base.ReportParquetProcessorBase._execute_sql")
+    @patch.object(ReportParquetProcessorBase, "_execute_trino_sql")
+    def test_schema_exists_cache_value_not_in_cache_not_exists(self, trino_mock):
+        trino_mock.return_value = False
+        key = build_trino_schema_exists_key(self.account)
+        with patch("masu.processor.report_parquet_processor_base.set_value_in_cache") as mock_cache_set:
+            self.assertFalse(self.processor.schema_exists())
+            mock_cache_set.assert_called_with(key, False)
+
+    @patch.object(ReportParquetProcessorBase, "_execute_trino_sql")
+    def test_table_exists_cache_value_in_cache(self, trino_mock):
+        with patch(
+            "masu.processor.report_parquet_processor_base.get_value_from_cache",
+            return_value=True,
+        ):
+            self.assertTrue(self.processor.table_exists())
+            trino_mock.assert_not_called()
+
+    @patch.object(ReportParquetProcessorBase, "_execute_trino_sql")
+    def test_table_exists_cache_value_not_in_cache(self, trino_mock):
+        trino_mock.return_value = True
+        key = build_trino_table_exists_key(self.account, self.table_name)
+        with patch("masu.processor.report_parquet_processor_base.set_value_in_cache") as mock_cache_set:
+            self.assertTrue(self.processor.table_exists())
+            mock_cache_set.assert_called_with(key, True)
+
+    @patch.object(ReportParquetProcessorBase, "_execute_trino_sql")
+    def test_table_exists_cache_value_not_in_cache_not_exists(self, trino_mock):
+        trino_mock.return_value = False
+        key = build_trino_table_exists_key(self.account, self.table_name)
+        with patch("masu.processor.report_parquet_processor_base.set_value_in_cache") as mock_cache_set:
+            self.assertFalse(self.processor.table_exists())
+            mock_cache_set.assert_called_with(key, False)
+
+    @patch("masu.processor.report_parquet_processor_base.ReportParquetProcessorBase._execute_trino_sql")
     def test_create_schema(self, mock_execute):
         """Test that hive partitions are synced."""
         expected_log = self.log_output_info + str(

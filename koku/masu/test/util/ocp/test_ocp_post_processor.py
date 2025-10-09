@@ -19,6 +19,81 @@ from masu.util.ocp.ocp_post_processor import OCPPostProcessor
 class TestOCPPostProcessor(MasuTestCase):
     """Test OCP Post Processor."""
 
+    def setUp(self):
+        """Set up test environment."""
+        self.schema = "test_schema"
+        self.report_type = "pod_usage"
+        self.post_processor = OCPPostProcessor(self.schema, self.report_type)
+        self.anomalous_data = [
+            # Good data
+            {
+                "pod_usage_cpu_core_seconds": 100,
+                "pod_request_cpu_core_seconds": 200,
+                "persistentvolumeclaim_capacity_bytes": 10e9,
+            },
+            # Bad CPU data
+            {
+                "pod_usage_cpu_core_seconds": 3.7e21,
+                "pod_request_cpu_core_seconds": 200,
+                "persistentvolumeclaim_capacity_bytes": 10e9,
+            },
+            # Bad PVC data
+            {
+                "pod_usage_cpu_core_seconds": 100,
+                "pod_request_cpu_core_seconds": 200,
+                "persistentvolumeclaim_capacity_bytes": 3.7e21,
+            },
+            # Another bad PVC data point in byte-seconds
+            {
+                "pod_usage_cpu_core_seconds": 100,
+                "pod_request_cpu_core_seconds": 200,
+                "persistentvolumeclaim_capacity_byte_seconds": 3.7e21,
+            },
+            # Good data with a different set of columns
+            {"pod_limit_cpu_core_seconds": 500, "pod_usage_memory_byte_seconds": 10e9},
+            # A row with both good and bad data
+            {"pod_limit_cpu_core_seconds": 3.7e21, "pod_usage_memory_byte_seconds": 10e9},
+        ]
+        self.original_df = pd.DataFrame(self.anomalous_data)
+
+    def test_remove_anomalies_no_anomalies(self):
+        """Test that the function does not remove rows when there are no anomalies."""
+        safe_data = [
+            {
+                "pod_usage_cpu_core_seconds": 100,
+                "pod_request_cpu_core_seconds": 200,
+                "persistentvolumeclaim_capacity_bytes": 10e9,
+            },
+            {
+                "pod_usage_cpu_core_seconds": 1e14,
+                "pod_request_cpu_core_seconds": 100,
+                "persistentvolumeclaim_capacity_bytes": 1e17,
+            },
+        ]
+        test_df = pd.DataFrame(safe_data)
+        cleaned_df = self.post_processor._remove_anomalies(test_df, "filename.csv")
+        self.assertEqual(len(cleaned_df), len(test_df))
+
+    def test_remove_anomalies_removes_anomalous_rows(self):
+        """Test that the function correctly removes anomalous rows."""
+        cleaned_df = self.post_processor._remove_anomalies(self.original_df, "filename.csv")
+        self.assertEqual(len(cleaned_df), 2)
+        self.assertTrue("pod_usage_cpu_core_seconds" in cleaned_df.columns)
+        self.assertFalse(cleaned_df["pod_usage_cpu_core_seconds"].isin([1.1e18]).any())
+        self.assertFalse(cleaned_df["persistentvolumeclaim_capacity_bytes"].isin([1.1e18]).any())
+
+    def test_remove_anomalies_empty_dataframe(self):
+        """Test that the function works correctly with an empty dataframe."""
+        test_df = pd.DataFrame()
+        cleaned_df = self.post_processor._remove_anomalies(test_df, "filename.csv")
+        self.assertTrue(cleaned_df.empty)
+
+    def test_process_dataframe_removes_anomalies(self):
+        """Test that the main process_dataframe method correctly calls the anomaly function."""
+        with patch.object(self.post_processor, "_generate_daily_data") as mock_generate_daily_data:
+            mock_generate_daily_data.return_value = self.original_df.copy()
+            self.post_processor.process_dataframe(self.original_df.copy(), "filename.csv")
+
     def test_ocp_generate_daily_data(self):
         """Test that OCP data is aggregated to daily."""
         usage = random.randint(1, 10)
@@ -29,6 +104,7 @@ class TestOCPPostProcessor(MasuTestCase):
         resource_id = "123"
         pvc = "pvc_1"
         label = '{"key": "value"}'
+        csi_driver = "ebs.csi.aws.com"
 
         interval_start = datetime.datetime(2021, 6, 7, 1, 0, 0)
         next_hour = datetime.datetime(2021, 6, 7, 2, 0, 0)
@@ -64,7 +140,6 @@ class TestOCPPostProcessor(MasuTestCase):
             "node_capacity_memory_bytes": capacity,
             "node_capacity_memory_byte_seconds": capacity,
             "pod_labels": label,
-            "unexpected_column": None,
         }
 
         base_storage_data = {
@@ -73,13 +148,14 @@ class TestOCPPostProcessor(MasuTestCase):
             "persistentvolumeclaim": pvc,
             "persistentvolume": pvc,
             "storageclass": "gold",
+            "node": node,
+            "csi_driver": csi_driver,
             "persistentvolumeclaim_capacity_bytes": capacity,
             "persistentvolumeclaim_capacity_byte_seconds": capacity,
             "volume_request_storage_byte_seconds": usage,
             "persistentvolumeclaim_usage_byte_seconds": usage,
             "persistentvolume_labels": label,
             "persistentvolumeclaim_labels": label,
-            "unexpected_column": None,
         }
 
         base_node_data = {"node": node, "node_labels": label}
@@ -109,40 +185,62 @@ class TestOCPPostProcessor(MasuTestCase):
             self.assertEqual(second_day.shape[0], 1)
 
             if report_type == "pod_usage":
-                self.assertTrue((first_day["pod_usage_cpu_core_seconds"] == usage * 2).bool())
-                self.assertTrue((first_day["pod_usage_memory_byte_seconds"] == usage * 2).bool())
-                self.assertTrue((first_day["node_capacity_cpu_cores"] == capacity).bool())
+                self.assertTrue((first_day["pod_usage_cpu_core_seconds"] == usage * 2).any(bool_only=True))
+                self.assertTrue((first_day["pod_usage_memory_byte_seconds"] == usage * 2).any(bool_only=True))
+                self.assertTrue((first_day["node_capacity_cpu_cores"] == capacity).any(bool_only=True))
 
-                self.assertTrue((second_day["pod_usage_cpu_core_seconds"] == usage).bool())
-                self.assertTrue((second_day["pod_usage_memory_byte_seconds"] == usage).bool())
-                self.assertTrue((second_day["node_capacity_cpu_cores"] == capacity).bool())
+                self.assertTrue((second_day["pod_usage_cpu_core_seconds"] == usage).any(bool_only=True))
+                self.assertTrue((second_day["pod_usage_memory_byte_seconds"] == usage).any(bool_only=True))
+                self.assertTrue((second_day["node_capacity_cpu_cores"] == capacity).any(bool_only=True))
+
+                # assert that the new_required_cols have been added:
+                self.assertEqual(first_day["node_role"].dtype, pd.StringDtype(storage="pyarrow"))
+
             elif report_type == "storage_usage":
-                self.assertTrue((first_day["persistentvolumeclaim_usage_byte_seconds"] == usage * 2).bool())
-                self.assertTrue((first_day["volume_request_storage_byte_seconds"] == usage * 2).bool())
-                self.assertTrue((first_day["persistentvolumeclaim_capacity_byte_seconds"] == capacity * 2).bool())
-                self.assertTrue((first_day["persistentvolumeclaim_capacity_bytes"] == capacity).bool())
+                self.assertTrue(
+                    (first_day["persistentvolumeclaim_usage_byte_seconds"] == usage * 2).any(bool_only=True)
+                )
+                self.assertTrue((first_day["volume_request_storage_byte_seconds"] == usage * 2).any(bool_only=True))
+                self.assertTrue(
+                    (first_day["persistentvolumeclaim_capacity_byte_seconds"] == capacity * 2).any(bool_only=True)
+                )
+                self.assertTrue((first_day["persistentvolumeclaim_capacity_bytes"] == capacity).any(bool_only=True))
 
-                self.assertTrue((second_day["persistentvolumeclaim_usage_byte_seconds"] == usage).bool())
-                self.assertTrue((second_day["volume_request_storage_byte_seconds"] == usage).bool())
-                self.assertTrue((second_day["persistentvolumeclaim_capacity_byte_seconds"] == capacity).bool())
-                self.assertTrue((second_day["persistentvolumeclaim_capacity_bytes"] == capacity).bool())
+                self.assertTrue((second_day["persistentvolumeclaim_usage_byte_seconds"] == usage).any(bool_only=True))
+                self.assertTrue((second_day["volume_request_storage_byte_seconds"] == usage).any(bool_only=True))
+                self.assertTrue(
+                    (second_day["persistentvolumeclaim_capacity_byte_seconds"] == capacity).any(bool_only=True)
+                )
+                self.assertTrue((second_day["persistentvolumeclaim_capacity_bytes"] == capacity).any(bool_only=True))
+
+                self.assertTrue((first_day["node"] == node).any(bool_only=True))
+                self.assertTrue((first_day["csi_driver"] == csi_driver).any(bool_only=True))
+                # assert that the new_required_cols have been added:
+                self.assertEqual(first_day["csi_volume_handle"].dtype, pd.StringDtype(storage="pyarrow"))
+
             elif report_type == "node_labels":
-                self.assertTrue((first_day["node"] == node).bool())
-                self.assertTrue((first_day["node_labels"] == label).bool())
+                self.assertTrue((first_day["node"] == node).any(bool_only=True))
+                self.assertTrue((first_day["node_labels"] == label).any(bool_only=True))
 
-                self.assertTrue((second_day["node"] == node).bool())
-                self.assertTrue((second_day["node_labels"] == label).bool())
+                self.assertTrue((second_day["node"] == node).any(bool_only=True))
+                self.assertTrue((second_day["node_labels"] == label).any(bool_only=True))
             elif report_type == "namespace_labels":
-                self.assertTrue((first_day["namespace"] == namespace).bool())
-                self.assertTrue((first_day["namespace_labels"] == label).bool())
+                self.assertTrue((first_day["namespace"] == namespace).any(bool_only=True))
+                self.assertTrue((first_day["namespace_labels"] == label).any(bool_only=True))
 
-                self.assertTrue((second_day["namespace"] == namespace).bool())
-                self.assertTrue((second_day["namespace_labels"] == label).bool())
+                self.assertTrue((second_day["namespace"] == namespace).any(bool_only=True))
+                self.assertTrue((second_day["namespace_labels"] == label).any(bool_only=True))
 
     def test_ocp_process_dataframe(self):
         """Test the unique tag key processing for OpenShift."""
 
-        for label_type in ("pod_labels", "volume_labels", "namespace_labels", "node_labels"):
+        for label_type in (
+            "pod_labels",
+            "persistentvolume_labels",
+            "persistentvolumeclaim_labels",
+            "namespace_labels",
+            "node_labels",
+        ):
             with self.subTest(label_type=label_type):
                 data = [
                     {
@@ -162,7 +260,7 @@ class TestOCPPostProcessor(MasuTestCase):
                 df = pd.DataFrame(data)
                 with patch("masu.util.ocp.ocp_post_processor.OCPPostProcessor._generate_daily_data"):
                     post_processor = OCPPostProcessor(self.schema, "pod_usage")
-                    processed_df, _ = post_processor.process_dataframe(df)
+                    processed_df, _ = post_processor.process_dataframe(df, "filename.csv")
                 pd.testing.assert_frame_equal(df, processed_df)
                 self.assertEqual(sorted(post_processor.enabled_tag_keys), sorted(expected_keys))
 
@@ -185,7 +283,7 @@ class TestOCPPostProcessor(MasuTestCase):
         df = pd.DataFrame(data)
         post_processor = OCPPostProcessor(self.schema, "pod_usage")
         with patch("masu.util.ocp.ocp_post_processor.OCPPostProcessor._generate_daily_data"):
-            processed_df, _ = post_processor.process_dataframe(df)
+            processed_df, _ = post_processor.process_dataframe(df, "filename.csv")
             pd.testing.assert_frame_equal(df, processed_df)
             self.assertEqual(post_processor.enabled_tag_keys, set())
 
@@ -209,7 +307,7 @@ class TestOCPPostProcessor(MasuTestCase):
         with patch("masu.util.ocp.ocp_post_processor.ciso8601.parse_datetime") as mock_parse:
             mock_parse.side_effect = ParserError
             dt = datetime_converter("parse error")
-            self.assertIsNone(dt)
+            self.assertTrue(pd.isnull(dt))
 
     def test_check_ingress_required_columns(self):
         """Test that None is returned."""

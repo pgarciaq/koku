@@ -4,40 +4,32 @@
 #
 """View for enable_tags masu admin endpoint."""
 import logging
-import pkgutil
 
-from django.db import connection
+from django.utils.decorators import method_decorator
 from django.views.decorators.cache import never_cache
 from django_tenants.utils import schema_context
-from jinjasql import JinjaSql
 from rest_framework import status
 from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from api.provider.models import Provider
-from reporting.models import AWSEnabledTagKeys
-from reporting.models import AzureEnabledTagKeys
-from reporting.models import GCPEnabledTagKeys
-from reporting.models import OCIEnabledTagKeys
-from reporting.models import OCPEnabledTagKeys
+from reporting.models import EnabledTagKeys
 
 
 LOG = logging.getLogger(__name__)
 RESPONSE_KEY = "tag_keys"
-PROVIDER_TYPE_TO_TABLE = {
-    Provider.PROVIDER_AWS.lower(): AWSEnabledTagKeys,
-    Provider.PROVIDER_AZURE.lower(): AzureEnabledTagKeys,
-    Provider.PROVIDER_GCP.lower(): GCPEnabledTagKeys,
-    Provider.PROVIDER_OCI.lower(): OCIEnabledTagKeys,
-    Provider.PROVIDER_OCP.lower(): OCPEnabledTagKeys,
+PROVIDER_TYPE_OPTIONS = {
+    Provider.PROVIDER_AWS.lower(),
+    Provider.PROVIDER_AZURE.lower(),
+    Provider.PROVIDER_GCP.lower(),
+    Provider.PROVIDER_OCP.lower(),
 }
 
 PROVIDER_TYPE_TO_FILE_PATH = {
     Provider.PROVIDER_AWS.lower(): "aws",
     Provider.PROVIDER_AZURE.lower(): "azure",
     Provider.PROVIDER_GCP.lower(): "gcp",
-    Provider.PROVIDER_OCI.lower(): "oci",
     Provider.PROVIDER_OCP.lower(): "openshift",
 }
 
@@ -47,10 +39,9 @@ class EnabledTagView(APIView):
 
     permission_classes = [AllowAny]
 
-    @never_cache
+    @method_decorator(never_cache)
     def get(self, request):
         """Handle the GET portion."""
-        provider_type_options = set(PROVIDER_TYPE_TO_TABLE.keys())
         params = request.query_params
         schema_name = params.get("schema")
         provider_type = params.get("provider_type", "").lower()
@@ -59,14 +50,14 @@ class EnabledTagView(APIView):
             errmsg = "schema is a required parameter."
             return Response({"Error": errmsg}, status=status.HTTP_400_BAD_REQUEST)
 
-        if provider_type is None or provider_type not in provider_type_options:
-            errmsg = f"provider_type must be supplied. Select one of {provider_type_options}"
+        if provider_type is None or provider_type not in PROVIDER_TYPE_OPTIONS:
+            errmsg = f"provider_type must be supplied. Select one of {PROVIDER_TYPE_OPTIONS}"
             return Response({"Error": errmsg}, status=status.HTTP_400_BAD_REQUEST)
 
-        enabled_tag_model = PROVIDER_TYPE_TO_TABLE.get(provider_type)
-
         with schema_context(schema_name):
-            enabled_tags = enabled_tag_model.objects.filter(enabled=True).all()
+            enabled_tags = EnabledTagKeys.objects.filter(
+                provider_type=Provider.PROVIDER_CASE_MAPPING[provider_type], enabled=True
+            ).all()
             tag_keys = [tag.key for tag in enabled_tags]
 
         msg = f"Retreived enabled tags {tag_keys} for schema: {schema_name}."
@@ -74,10 +65,9 @@ class EnabledTagView(APIView):
 
         return Response({RESPONSE_KEY: tag_keys})
 
-    @never_cache
+    @method_decorator(never_cache)
     def post(self, request):
         """Handle the POST."""
-        provider_type_options = set(PROVIDER_TYPE_TO_TABLE.keys())
         data = request.data
 
         schema_name = data.get("schema")
@@ -86,10 +76,9 @@ class EnabledTagView(APIView):
             errmsg = "schema is required."
             return Response({"Error": errmsg}, status=status.HTTP_400_BAD_REQUEST)
 
-        if provider_type is None or provider_type not in provider_type_options:
-            errmsg = f"provider_type must be supplied. Select one of {provider_type_options}"
+        if provider_type is None or provider_type not in PROVIDER_TYPE_OPTIONS:
+            errmsg = f"provider_type must be supplied. Select one of {PROVIDER_TYPE_OPTIONS}"
             return Response({"Error": errmsg}, status=status.HTTP_400_BAD_REQUEST)
-        enabled_tag_model = PROVIDER_TYPE_TO_TABLE.get(provider_type)
 
         action = data.get("action")
         if action is None:
@@ -101,30 +90,20 @@ class EnabledTagView(APIView):
         with schema_context(schema_name):
             if action.lower() == "create":
                 for key in tag_keys:
-                    tag_key_to_enable, _ = enabled_tag_model.objects.get_or_create(key=key)
+                    tag_key_to_enable, _ = EnabledTagKeys.objects.get_or_create(
+                        key=key, provider_type=Provider.PROVIDER_CASE_MAPPING[provider_type]
+                    )
                     tag_key_to_enable.enabled = True
                     tag_key_to_enable.save()
                 msg = f"Enabled tags for schema: {schema_name}."
                 LOG.info(msg)
             elif action.lower() == "delete":
                 for key in tag_keys:
-                    enabled_tag_key = enabled_tag_model.objects.filter(key=key).first()
+                    enabled_tag_key = EnabledTagKeys.objects.filter(
+                        key=key, provider_type=Provider.PROVIDER_CASE_MAPPING[provider_type]
+                    ).first()
                     enabled_tag_key.enabled = False
                     enabled_tag_key.save()
                 msg = f"Disabled tags for schema: {schema_name}."
                 LOG.info(msg)
-            elif action.lower() == "remove_stale":
-                jinja_sql = JinjaSql()
-                sql = pkgutil.get_data(
-                    "masu.database",
-                    f"sql/{PROVIDER_TYPE_TO_FILE_PATH.get(provider_type)}/remove_stale_enabled_tags.sql",
-                )
-                sql = sql.decode("utf-8")
-                params = {"schema": schema_name}
-                sql, params = jinja_sql.prepare_query(sql, params)
-                LOG.info("Removing stale enabled tag keys.")
-                with schema_context(schema_name):
-                    with connection.cursor() as cursor:
-                        cursor.execute(sql, params=params)
-
         return Response({RESPONSE_KEY: tag_keys})

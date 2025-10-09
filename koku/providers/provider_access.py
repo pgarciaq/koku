@@ -16,12 +16,7 @@ from providers.azure.provider import AzureProvider
 from providers.azure_local.provider import AzureLocalProvider
 from providers.gcp.provider import GCPProvider
 from providers.gcp_local.provider import GCPLocalProvider
-from providers.ibm.provider import IBMProvider
-from providers.ibm_local.provider import IBMLocalProvider
-from providers.oci.provider import OCIProvider
-from providers.oci_local.provider import OCILocalProvider
 from providers.ocp.provider import OCPProvider
-
 
 LOG = logging.getLogger(__name__)
 
@@ -48,15 +43,11 @@ class ProviderAccessor:
         services = {
             Provider.PROVIDER_AWS: AWSProvider,
             Provider.PROVIDER_AWS_LOCAL: AWSLocalProvider,
-            Provider.PROVIDER_OCI: OCIProvider,
-            Provider.PROVIDER_OCI_LOCAL: OCILocalProvider,
             Provider.PROVIDER_AZURE_LOCAL: AzureLocalProvider,
             Provider.PROVIDER_OCP: OCPProvider,
             Provider.PROVIDER_AZURE: AzureProvider,
             Provider.PROVIDER_GCP: GCPProvider,
             Provider.PROVIDER_GCP_LOCAL: GCPLocalProvider,
-            Provider.PROVIDER_IBM: IBMProvider,
-            Provider.PROVIDER_IBM_LOCAL: IBMLocalProvider,
         }
 
         self.service = None
@@ -181,5 +172,3 @@ class ProviderAccessor:
         LOG.info(f"Validating if ingress reports are accessible for source {source.uuid}.")
         self.service.is_file_reachable(source, reports_list)
         LOG.info(f"Ingress report validation complete for source {source.uuid}.")
-
-        return

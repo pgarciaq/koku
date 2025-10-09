@@ -9,9 +9,11 @@ from unittest.mock import Mock
 from unittest.mock import patch
 from unittest.mock import PropertyMock
 
-from adal.adal_error import AdalError
 from azure.common import AzureException
+from azure.core.exceptions import AzureError
+from azure.core.exceptions import ClientAuthenticationError
 from azure.core.exceptions import HttpResponseError
+from azure.core.exceptions import ServiceRequestError
 from azure.storage.blob import BlobClient
 from azure.storage.blob import BlobServiceClient
 from azure.storage.blob import ContainerClient
@@ -103,8 +105,8 @@ class AzureServiceTest(MasuTestCase):
         ) as mock_factory:
             mock_factory.return_value = Mock(  # AzureClientFactory()
                 spec=AzureClientFactory,
-                cloud_storage_account=Mock(
-                    return_value=Mock(  # .cloud_storage_account()
+                blob_service_client=Mock(
+                    return_value=Mock(  # .blob_service_client()
                         spec=BlobServiceClient,
                         get_blob_client=Mock(
                             return_value=Mock(  # .get_blob_client()
@@ -202,7 +204,7 @@ class AzureServiceTest(MasuTestCase):
 
     def test_get_latest_cost_export_for_path(self):
         """Test that the latest cost export is returned for a given path."""
-        report_path = "{}_{}".format(self.container_name, "blob.csv")
+        report_path = "{}_{}".format(self.container_name, "blob.csv.gz")
 
         mock_blob = Mock(last_modified=Mock(date=Mock(return_value=self.current_date_time.date())))
         name_attr = PropertyMock(return_value=report_path)
@@ -256,7 +258,7 @@ class AzureServiceTest(MasuTestCase):
         type(mock_blob).name = name_attr  # kludge to set name attribute on Mock
 
         svc = self.get_mock_client(blob_list=[mock_blob])
-        svc._cloud_storage_account.get_container_client.side_effect = throw_azure_http_error
+        svc._blob_service_client.get_container_client.side_effect = throw_azure_http_error
         with self.assertRaises(AzureCostReportNotFound):
             svc.get_latest_cost_export_for_path(report_path, self.container_name)
 
@@ -269,7 +271,7 @@ class AzureServiceTest(MasuTestCase):
         type(mock_blob).name = name_attr  # kludge to set name attribute on Mock
 
         svc = self.get_mock_client(blob_list=[mock_blob])
-        svc._cloud_storage_account.get_container_client.side_effect = throw_azure_http_error_403
+        svc._blob_service_client.get_container_client.side_effect = throw_azure_http_error_403
         with self.assertRaises(AzureCostReportNotFound):
             svc.get_latest_cost_export_for_path(report_path, self.container_name)
 
@@ -362,11 +364,13 @@ class AzureServiceTest(MasuTestCase):
         """Test that function handles a raised exception."""
         mock_factory.return_value = Mock(
             spec=AzureClientFactory,
-            cloud_storage_account=Mock(
+            blob_service_client=Mock(
                 return_value=Mock(
                     spec=BlobServiceClient,
                     get_container_client=Mock(
-                        return_value=Mock(spec=ContainerClient, list_blobs=Mock(side_effect=AdalError("test error")))
+                        return_value=Mock(
+                            spec=ContainerClient, list_blobs=Mock(side_effect=ClientAuthenticationError("test error"))
+                        )
                     ),
                 )
             ),
@@ -387,10 +391,10 @@ class AzureServiceTest(MasuTestCase):
 
         mock_factory.return_value = Mock(
             spec=AzureClientFactory,
-            cloud_storage_account=Mock(
+            blob_service_client=Mock(
                 return_value=Mock(
                     spec=BlobServiceClient,
-                    get_blob_client=Mock(side_effect=AdalError("test error")),
+                    get_blob_client=Mock(side_effect=ServiceRequestError("test error")),
                     get_container_client=Mock(
                         return_value=Mock(spec=ContainerClient, list_blobs=Mock(return_value=[mock_blob]))
                     ),
@@ -408,11 +412,13 @@ class AzureServiceTest(MasuTestCase):
         """Test that function handles a raised exception."""
         mock_factory.return_value = Mock(
             spec=AzureClientFactory,
-            cloud_storage_account=Mock(
+            blob_service_client=Mock(
                 return_value=Mock(
                     spec=BlobServiceClient,
                     get_container_client=Mock(
-                        return_value=Mock(spec=ContainerClient, list_blobs=Mock(side_effect=AdalError("test error")))
+                        return_value=Mock(
+                            spec=ContainerClient, list_blobs=Mock(side_effect=ServiceRequestError("test error"))
+                        )
                     ),
                 )
             ),
@@ -462,7 +468,6 @@ class AzureServiceTest(MasuTestCase):
         """
         report_path = "/container/report/path"
         blobs = (
-            FakeBlob(f"{report_path}/_manifest.json", datetime(2022, 12, 18)),
             FakeBlob(f"{report_path}/file01.csv", datetime(2022, 12, 16)),
             FakeBlob(f"{report_path}/file02.csv", datetime(2022, 12, 15)),
             FakeBlob("some/other/path/file01.csv", datetime(2022, 12, 1)),
@@ -482,6 +487,156 @@ class AzureServiceTest(MasuTestCase):
         type(mock_blob).name = name_attr  # kludge to set name attribute on Mock
 
         svc = self.get_mock_client(blob_list=[mock_blob])
-        svc._cloud_storage_account.get_container_client.side_effect = ResourceNotFoundError("Oops!")
+        svc._blob_service_client.get_container_client.side_effect = ResourceNotFoundError("Oops!")
         with self.assertRaises(AzureCostReportNotFound):
             svc.get_latest_cost_export_for_path(report_path, self.container_name)
+
+    @patch("masu.external.downloader.azure.azure_service.AzureClientFactory")
+    def test_azure_service_missing_credentials(self, mock_factory):
+        """Test that AzureService raises an error if credentials are not configured."""
+        mock_factory.return_value.subscription_id = "fake_subscription_id"
+        mock_factory.return_value.credentials = None
+
+        with self.assertRaises(AzureServiceError) as context:
+            AzureService(
+                tenant_id="fake_tenant_id",
+                client_id="fake_client_id",
+                client_secret="fake_client_secret",
+                resource_group_name="fake_resource_group",
+                storage_account_name="fake_storage_account",
+                subscription_id="fake_subscription_id",
+            )
+
+        self.assertIn("Azure Service credentials are not configured.", str(context.exception))
+
+    @patch("masu.external.downloader.azure.azure_service.AzureService._list_blobs")
+    @patch("masu.external.downloader.azure.azure_service.AzureClientFactory")
+    @patch("masu.external.downloader.azure.azure_service.NamedTemporaryFile")
+    def test_download_file_csv_key(self, mock_tempfile, mock_client_factory, mock_list_blobs):
+        """Test that the method correctly handles a non-.gzip key (CSV)."""
+
+        mock_blob = Mock()
+        mock_blob.name = "fake_key.csv"
+        mock_list_blobs.return_value = [mock_blob]
+
+        mock_blob_client = Mock()
+        mock_blob_client.download_blob.return_value.readall.return_value = b"fake_csv_data"
+        mock_blob_service_client = Mock()
+        mock_blob_service_client.get_blob_client.return_value = mock_blob_client
+        mock_client_factory.return_value.blob_service_client.return_value = mock_blob_service_client
+
+        mock_tempfile.return_value.name = "/tmp/fakefile.csv"
+
+        service = AzureService(
+            tenant_id="fake_tenant_id",
+            client_id="fake_client_id",
+            client_secret="fake_client_secret",
+            resource_group_name="fake_resource_group",
+            storage_account_name="fake_storage_account",
+            subscription_id="fake_subscription_id",
+        )
+
+        result = service.download_file("fake_key.csv", "fake_container")
+
+        self.assertTrue(result.endswith(".csv"))
+        mock_blob_service_client.get_blob_client.assert_called_with("fake_container", "fake_key.csv")
+        mock_blob_client.download_blob.assert_called_once()
+
+    @patch("masu.external.downloader.azure.azure_service.AzureService._list_blobs")
+    @patch("masu.external.downloader.azure.azure_service.AzureClientFactory")
+    @patch("masu.external.downloader.azure.azure_service.NamedTemporaryFile")
+    def test_download_file_gzip_key(self, mock_tempfile, mock_client_factory, mock_list_blobs):
+        """Test that the method correctly handles a .gzip key."""
+
+        mock_blob = Mock()
+        mock_blob.name = "fake_key.gzip"
+        mock_list_blobs.return_value = [mock_blob]
+
+        mock_blob_client = Mock()
+        mock_blob_client.download_blob.return_value.readall.return_value = b"fake_gzip_data"
+        mock_blob_service_client = Mock()
+        mock_blob_service_client.get_blob_client.return_value = mock_blob_client
+        mock_client_factory.return_value.blob_service_client.return_value = mock_blob_service_client
+
+        mock_tempfile.return_value.name = "/tmp/fakefile.gzip"
+
+        service = AzureService(
+            tenant_id="fake_tenant_id",
+            client_id="fake_client_id",
+            client_secret="fake_client_secret",
+            resource_group_name="fake_resource_group",
+            storage_account_name="fake_storage_account",
+            subscription_id="fake_subscription_id",
+        )
+
+        result = service.download_file("fake_key.gzip", "fake_container")
+
+        self.assertTrue(result.endswith(".gzip"))
+        mock_blob_service_client.get_blob_client.assert_called_with("fake_container", "fake_key.gzip")
+        mock_blob_client.download_blob.assert_called_once()
+
+    @patch("masu.external.downloader.azure.azure_service.AzureService._list_blobs")
+    @patch("masu.external.downloader.azure.azure_service.AzureClientFactory")
+    @patch("masu.external.downloader.azure.azure_service.NamedTemporaryFile")
+    def test_download_file_raises_exception(self, mock_tempfile, mock_client_factory, mock_list_blobs):
+        """Test that AzureServiceError is raised when an exception occurs during download."""
+
+        mock_blob = Mock()
+        mock_blob.name = "fake_key.csv"
+        mock_list_blobs.return_value = [mock_blob]
+
+        mock_blob_client = Mock()
+        mock_blob_service_client = Mock()
+
+        mock_blob_client.download_blob.side_effect = AzureError("Download failed")
+        mock_blob_service_client.get_blob_client.return_value = mock_blob_client
+        mock_client_factory.return_value.blob_service_client.return_value = mock_blob_service_client
+
+        mock_tempfile.return_value.name = "/tmp/fakefile.csv"
+
+        service = AzureService(
+            tenant_id="fake_tenant_id",
+            client_id="fake_client_id",
+            client_secret="fake_client_secret",
+            resource_group_name="fake_resource_group",
+            storage_account_name="fake_storage_account",
+            subscription_id="fake_subscription_id",
+        )
+
+        with self.assertRaises(AzureServiceError) as context:
+            service.download_file("fake_key.csv", "fake_container")
+
+        self.assertIn("Failed to download cost export", str(context.exception))
+
+    @patch("masu.external.downloader.azure.azure_service.AzureService._list_blobs")
+    @patch("masu.external.downloader.azure.azure_service.AzureClientFactory")
+    @patch("masu.external.downloader.azure.azure_service.NamedTemporaryFile")
+    def test_download_file_with_compression(self, mock_tempfile, mock_client_factory, mock_list_blobs):
+        """Test that the method correctly handles a .gzip key with compression."""
+
+        mock_blob = Mock()
+        mock_blob.name = "fake_key.csv.gz"
+        mock_list_blobs.return_value = [mock_blob]
+
+        mock_blob_client = Mock()
+        mock_blob_client.download_blob.return_value.readall.return_value = b"fake_gzip_data"
+        mock_blob_service_client = Mock()
+        mock_blob_service_client.get_blob_client.return_value = mock_blob_client
+        mock_client_factory.return_value.blob_service_client.return_value = mock_blob_service_client
+
+        mock_tempfile.return_value.name = "/tmp/fakefile.csv.gz"
+
+        service = AzureService(
+            tenant_id="fake_tenant_id",
+            client_id="fake_client_id",
+            client_secret="fake_client_secret",
+            resource_group_name="fake_resource_group",
+            storage_account_name="fake_storage_account",
+            subscription_id="fake_subscription_id",
+        )
+
+        result = service.download_file("fake_key.csv.gz", "fake_container")
+
+        self.assertTrue(result.endswith(".gz"))
+        mock_blob_service_client.get_blob_client.assert_called_with("fake_container", "fake_key.csv.gz")
+        mock_blob_client.download_blob.assert_called_once()

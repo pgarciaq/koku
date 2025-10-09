@@ -7,7 +7,6 @@ from tempfile import mkdtemp
 
 from django.conf import settings
 
-from koku.configurator import CONFIGURATOR
 from koku.env import ENVIRONMENT
 
 
@@ -22,6 +21,8 @@ DEFAULT_KAFKA_CONNECT = True
 DEFAULT_RETRY_SECONDS = 10
 DEFAULT_DEL_RECORD_LIMIT = 5000
 DEFAULT_MAX_ITERATIONS = 3
+DEFAULT_ENABLED_TAG_LIMIT = 200
+DEFAULT_ROS_URL_EXPIRATION = 172800
 
 
 class Config:
@@ -53,7 +54,6 @@ class Config:
     AWS_DATETIME_STR_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
     OCP_DATETIME_STR_FORMAT = "%Y-%m-%d %H:%M:%S +0000 UTC"
     AZURE_DATETIME_STR_FORMAT = "%Y-%m-%d"
-    OCI_DATETIME_STR_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 
     # Override the service's current date time time. Format: "%Y-%m-%d %H:%M:%S"
     MASU_DATE_OVERRIDE = ENVIRONMENT.get_value("DATE_OVERRIDE", default=DEFAULT_MASU_DATE_OVERRIDE)
@@ -64,28 +64,17 @@ class Config:
         "RETAIN_NUM_MONTHS", default=DEFAULT_MASU_RETAIN_NUM_MONTHS_LINE_ITEM_ONLY
     )
 
-    # TODO: Remove this if/when reporting model files are owned by masu
-    # The decimal precision of our database Numeric columns
-    REPORTING_DECIMAL_PRECISION = 9
-
     # Specify the number of months (bills) to ingest
     INITIAL_INGEST_NUM_MONTHS = ENVIRONMENT.int("INITIAL_INGEST_NUM_MONTHS", default=DEFAULT_INITIAL_INGEST_NUM_MONTHS)
 
     # Override the initial ingest requirement to allow INITIAL_INGEST_NUM_MONTHS
     INGEST_OVERRIDE = ENVIRONMENT.bool("INITIAL_INGEST_OVERRIDE", default=DEFAULT_INGEST_OVERRIDE)
 
-    # Insights Kafka
-    INSIGHTS_KAFKA_HOST = CONFIGURATOR.get_kafka_broker_host()
-    INSIGHTS_KAFKA_PORT = CONFIGURATOR.get_kafka_broker_port()
-    INSIGHTS_KAFKA_ADDRESS = f"{INSIGHTS_KAFKA_HOST}:{INSIGHTS_KAFKA_PORT}"
-    INSIGHTS_KAFKA_SASL = CONFIGURATOR.get_kafka_sasl()
-    INSIGHTS_KAFKA_CACERT = CONFIGURATOR.get_kafka_cacert()
-    INSIGHTS_KAFKA_AUTHTYPE = CONFIGURATOR.get_kafka_authtype()
-    HCCM_TOPIC = CONFIGURATOR.get_kafka_topic("platform.upload.hccm")
-    UPLOAD_TOPIC = CONFIGURATOR.get_kafka_topic("platform.upload.announce")
-    VALIDATION_TOPIC = CONFIGURATOR.get_kafka_topic("platform.upload.validation")
-    NOTIFICATION_TOPIC = CONFIGURATOR.get_kafka_topic("platform.notifications.ingress")
-    ROS_TOPIC = CONFIGURATOR.get_kafka_topic("hccm.ros.events")
+    # Limit the number of enabled tags:
+    ENABLED_TAG_LIMIT = ENVIRONMENT.int("TAG_ENABLED_LIMIT", default=DEFAULT_ENABLED_TAG_LIMIT)
+
+    # Set ROS presigned URL expiration:
+    ROS_URL_EXPIRATION = ENVIRONMENT.int("ROS_URL_EXPIRATION", default=DEFAULT_ROS_URL_EXPIRATION)
 
     # Flag to signal whether or not to connect to upload service
     KAFKA_CONNECT = ENVIRONMENT.bool("KAFKA_CONNECT", default=DEFAULT_KAFKA_CONNECT)

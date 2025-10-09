@@ -13,6 +13,7 @@ from django.db.models import JSONField
 TRINO_LINE_ITEM_DAILY_TABLE = "gcp_line_items_daily"
 TRINO_LINE_ITEM_TABLE = "gcp_line_items"
 TRINO_OCP_ON_GCP_DAILY_TABLE = "gcp_openshift_daily"
+TRINO_OCP_GCP_DAILY_SUMMARY_TABLE = "managed_reporting_ocpgcpcostlineitem_project_daily_summary"
 
 UI_SUMMARY_TABLES = (
     "reporting_gcp_cost_summary_p",
@@ -107,20 +108,6 @@ class GCPCostEntryLineItemDailySummary(models.Model):
     tags = JSONField(null=True)
     source_uuid = models.UUIDField(unique=False, null=True)
     credit_amount = models.DecimalField(max_digits=24, decimal_places=9, null=True, blank=True)
-
-
-class GCPEnabledTagKeys(models.Model):
-    """A collection of the current enabled tag keys."""
-
-    class Meta:
-        """Meta for GCPEnabledTagKeys."""
-
-        db_table = "reporting_gcpenabledtagkeys"
-        indexes = [models.Index(name="gcp_enabled_covering_ix", fields=["key", "enabled"])]
-
-    id = models.BigAutoField(primary_key=True)
-    key = models.CharField(max_length=253, unique=True)
-    enabled = models.BooleanField(null=False, default=False)
 
 
 class GCPTagsSummary(models.Model):

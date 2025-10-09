@@ -26,15 +26,12 @@ APP_EXTRA_FIELD_MAP = {
     Provider.PROVIDER_AZURE_LOCAL: ["resource_group", "storage_account"],
     Provider.PROVIDER_GCP: [],
     Provider.PROVIDER_GCP_LOCAL: [],
-    Provider.PROVIDER_OCI: ["bucket", "bucket_namespace", "bucket_region"],
-    Provider.PROVIDER_OCI_LOCAL: ["bucket", "bucket_namespace", "bucket_region"],
 }
 AUTH_TYPES = {
     Provider.PROVIDER_OCP: "token",
     Provider.PROVIDER_AWS: "arn",
     Provider.PROVIDER_AZURE: "tenant_id_client_id_client_secret",
     Provider.PROVIDER_GCP: "project_id_service_account_json",
-    Provider.PROVIDER_OCI: "ocid",
 }
 ENDPOINT_APPLICATIONS = "applications"
 ENDPOINT_APPLICATION_TYPES = "application_types"
@@ -43,14 +40,12 @@ ENDPOINT_SOURCES = "sources"
 ENDPOINT_SOURCE_TYPES = "source_types"
 APP_OPT_EXTRA_FEILD_MAP = {
     Provider.PROVIDER_OCP: [],
-    Provider.PROVIDER_AWS: ["storage_only", "bucket_region"],
-    Provider.PROVIDER_AWS_LOCAL: ["storage_only", "bucket_region"],
-    Provider.PROVIDER_AZURE: ["scope", "export_name", "storage_only"],
-    Provider.PROVIDER_AZURE_LOCAL: ["scope", "export_name", "storage_only"],
+    Provider.PROVIDER_AWS: ["storage_only", "bucket_region", "metered"],
+    Provider.PROVIDER_AWS_LOCAL: ["storage_only", "bucket_region", "metered"],
+    Provider.PROVIDER_AZURE: ["scope", "export_name", "storage_only", "metered"],
+    Provider.PROVIDER_AZURE_LOCAL: ["scope", "export_name", "storage_only", "metered"],
     Provider.PROVIDER_GCP: ["dataset", "bucket", "storage_only"],
     Provider.PROVIDER_GCP_LOCAL: ["dataset", "bucket", "storage_only"],
-    Provider.PROVIDER_OCI: [],
-    Provider.PROVIDER_OCI_LOCAL: [],
 }
 
 
@@ -191,10 +186,7 @@ class SourcesHTTPClient:
                 f"expected: {required_extras}, got: {list(app_settings.keys())}"
             )
         optional_extras = APP_OPT_EXTRA_FEILD_MAP[source_type]
-        opt_include = []
-        for opt in optional_extras:
-            if opt in app_settings:
-                opt_include.append(opt)
+        opt_include = [opt for opt in optional_extras if opt in app_settings]
         return {k: app_settings.get(k) for k in required_extras + opt_include}
 
     def get_credentials(self, source_type, app_type_id):
@@ -221,20 +213,22 @@ class SourcesHTTPClient:
         if not auth_data:
             raise SourcesHTTPClientError(f"Unable to get AWS roleARN for Source: {self._source_id}")
 
+        result = {"external_id": auth_data.get("extra", {}).get("external_id")}
+
         # Platform sources is moving the ARN from the password to the username field.
         # We are supporting both until the this change has made it to all environments.
-        username = auth_data.get("username")
-        if username:
-            return {"role_arn": username}
+        if username := auth_data.get("username"):
+            result["role_arn"] = username
+            return result
 
         auth_id = auth_data.get("id")
         auth_internal_url = (
             f"{self._internal_url}/{ENDPOINT_AUTHENTICATIONS}/{auth_id}?expose_encrypted_attribute[]=password"
         )
         auth_internal_response = self._get_network_response(auth_internal_url, "Unable to get AWS RoleARN")
-        password = auth_internal_response.get("password")
-        if password:
-            return {"role_arn": password}
+        if password := auth_internal_response.get("password"):
+            result["role_arn"] = password
+            return result
 
         raise SourcesHTTPClientError(f"Unable to get AWS roleARN for Source: {self._source_id}")
 
@@ -246,8 +240,7 @@ class SourcesHTTPClient:
         auth_data = (auth_response.get("data") or [None])[0]
         if not auth_data:
             raise SourcesHTTPClientError(f"Unable to get GCP credentials for Source: {self._source_id}")
-        project_id = auth_data.get("username")
-        if project_id:
+        if project_id := auth_data.get("username"):
             return {"project_id": project_id}
 
         raise SourcesHTTPClientError(f"Unable to get GCP credentials for Source: {self._source_id}")

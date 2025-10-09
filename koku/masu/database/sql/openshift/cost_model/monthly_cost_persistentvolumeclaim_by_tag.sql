@@ -38,6 +38,7 @@ INSERT INTO {{schema | sqlsafe}}.reporting_ocpusagelineitem_daily_summary (
     persistentvolume,
     storageclass,
     volume_labels,
+    all_labels,
     persistentvolumeclaim_capacity_gigabyte,
     persistentvolumeclaim_capacity_gigabyte_months,
     volume_request_storage_gigabyte_months,
@@ -117,6 +118,10 @@ cte_filtered_data AS (
         AND lids.volume_labels ? {{tag_key}}
         AND lids.infrastructure_monthly_cost_json IS NULL
         AND monthly_cost_type IS NULL
+        AND (
+            lids.cost_model_rate_type IS NULL
+            OR lids.cost_model_rate_type NOT IN ('Infrastructure', 'Supplementary')
+        )
         AND persistentvolumeclaim_capacity_gigabyte_months IS NOT NULL
         AND persistentvolumeclaim_capacity_gigabyte_months != 0
     GROUP BY lids.usage_start, lids.source_uuid, lids.cluster_id, lids.node, lids.namespace, lids.persistentvolumeclaim, lids.persistentvolume, lids.volume_labels, vc.pvc_count, lids.cost_category_id
@@ -150,6 +155,7 @@ SELECT uuid,
     persistentvolume,
     storageclass,
     volume_labels::jsonb,
+    volume_labels::jsonb as all_labels,
     persistentvolumeclaim_capacity_gigabyte,
     persistentvolumeclaim_capacity_gigabyte_months,
     volume_request_storage_gigabyte_months,

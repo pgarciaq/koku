@@ -4,17 +4,22 @@
 #
 """Update Cost Model Cost info for report summary tables."""
 import datetime
+import logging
 
 import ciso8601
 
 from api.models import Provider
+from api.utils import DateHelper
+from koku.cache import invalidate_cache_for_tenant_and_cache_key
 from koku.cache import invalidate_view_cache_for_tenant_and_source_type
-from masu.database.provider_db_accessor import ProviderDBAccessor
+from koku.cache import TAG_MAPPING_PREFIX
+from masu.processor import is_customer_cost_model_large
 from masu.processor.aws.aws_cost_model_cost_updater import AWSCostModelCostUpdater
 from masu.processor.azure.azure_cost_model_cost_updater import AzureCostModelCostUpdater
 from masu.processor.gcp.gcp_cost_model_cost_updater import GCPCostModelCostUpdater
-from masu.processor.oci.oci_cost_model_cost_updater import OCICostModelCostUpdater
 from masu.processor.ocp.ocp_cost_model_cost_updater import OCPCostModelCostUpdater
+
+LOG = logging.getLogger(__name__)
 
 
 class CostModelCostUpdaterError(Exception):
@@ -36,8 +41,7 @@ class CostModelCostUpdater:
         self._schema = customer_schema
         self.tracing_id = tracing_id
 
-        with ProviderDBAccessor(provider_uuid) as provider_accessor:
-            self._provider = provider_accessor.get_provider()
+        self._provider = Provider.objects.filter(uuid=provider_uuid).first()
         try:
             self._updater = self._set_updater()
         except Exception as err:
@@ -56,7 +60,11 @@ class CostModelCostUpdater:
             (Object) : Provider-specific report summary updater
 
         """
-        if self._provider is None:
+        if not self._provider:
+            return None
+
+        if not self._provider.setup_complete:
+            LOG.debug("Provider setup is not complete, skipping cost model cost updater")
             return None
 
         if self._provider.type in (Provider.PROVIDER_AWS, Provider.PROVIDER_AWS_LOCAL):
@@ -67,10 +75,6 @@ class CostModelCostUpdater:
             return OCPCostModelCostUpdater(self._schema, self._provider)
         if self._provider.type in (Provider.PROVIDER_GCP, Provider.PROVIDER_GCP_LOCAL):
             return GCPCostModelCostUpdater(self._schema, self._provider)
-        if self._provider.type in (Provider.PROVIDER_OCI, Provider.PROVIDER_OCI_LOCAL):
-            return OCICostModelCostUpdater(self._schema, self._provider)
-
-        return None
 
     def _format_dates(self, start_date, end_date):
         """Convert dates to strings for use in the updater."""
@@ -96,8 +100,14 @@ class CostModelCostUpdater:
             None
 
         """
-        start_date, end_date = self._format_dates(start_date, end_date)
-
         if self._updater:
-            self._updater.update_summary_cost_model_costs(start_date, end_date)
+            if is_customer_cost_model_large(self._schema):
+                for day_date in DateHelper().list_days(start_date, end_date):
+                    start, end = self._format_dates(day_date, day_date)
+                    self._updater.update_summary_cost_model_costs(start, end)
+            else:
+                start_date, end_date = self._format_dates(start_date, end_date)
+                self._updater.update_summary_cost_model_costs(start_date, end_date)
             invalidate_view_cache_for_tenant_and_source_type(self._schema, self._provider.type)
+            # Invalidate the tag_rate_map for tag mapping
+            invalidate_cache_for_tenant_and_cache_key(self._schema, TAG_MAPPING_PREFIX)

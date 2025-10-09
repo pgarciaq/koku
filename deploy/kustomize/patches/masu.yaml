@@ -2,6 +2,9 @@
   path: /objects/0/spec/deployments/-
   value:
     name: clowder-masu
+    metadata:
+      annotations:
+        ignore-check.kube-linter.io/minimum-three-replicas: This deployment uses 1 pod as currently it supports only internal administrative api
     replicas: ${{MASU_REPLICAS}}
     webServices:
       public:
@@ -16,6 +19,12 @@
       env:
         - name: CLOWDER_ENABLED
           value: ${CLOWDER_ENABLED}
+        - name: REDEPLOY_HASH
+          value: ${REDEPLOY_HASH_ALL}_${REDEPLOY_HASH_MASU}
+        - name: SCHEMA_SUFFIX
+          value: ${SCHEMA_SUFFIX}
+        - name: TRINO_S3A_OR_S3
+          value: ${TRINO_S3A_OR_S3}
         - name: MASU
           value: "true"
         - name: DJANGO_SECRET_KEY
@@ -27,13 +36,13 @@
         - name: AWS_ACCESS_KEY_ID
           valueFrom:
             secretKeyRef:
-              key: aws-access-key-id
+              key: aws_access_key_id
               name: koku-aws
               optional: false
         - name: AWS_SECRET_ACCESS_KEY
           valueFrom:
             secretKeyRef:
-              key: aws-secret-access-key
+              key: aws_secret_access_key
               name: koku-aws
               optional: false
         - name: GOOGLE_APPLICATION_CREDENTIALS
@@ -80,8 +89,6 @@
           value: ${PROMETHEUS_DIR}
         - name: REQUESTED_BUCKET
           value: ${S3_BUCKET_NAME}
-        - name: ENABLE_S3_ARCHIVING
-          value: ${ENABLE_S3_ARCHIVING}
         - name: POD_CPU_LIMIT # required to spin up appropriate number of gunicorn workers
           valueFrom:
             resourceFieldRef:
@@ -103,6 +110,18 @@
           value: ${INITIAL_INGEST_NUM_MONTHS}
         - name: INITIAL_INGEST_OVERRIDE
           value: ${INITIAL_INGEST_OVERRIDE}
+        - name: POLLING_TIMER
+          value: ${POLLING_TIMER}
+        - name: POLLING_COUNT
+          value: ${POLLING_COUNT}
+        - name: XL_REPORT_COUNT
+          value: ${XL_REPORT_COUNT}
+        - name: PROCESSING_WAIT_TIMER
+          value: ${PROCESSING_WAIT_TIMER}
+        - name: LARGE_PROCESSING_WAIT_TIMER
+          value: ${LARGE_PROCESSING_WAIT_TIMER}
+        - name: TAG_ENABLED_LIMIT
+          value: ${TAG_ENABLED_LIMIT}
         - name: KAFKA_CONNECT
           value: ${KAFKA_CONNECT}
         - name: PROMETHEUS_PUSHGATEWAY
@@ -111,25 +130,6 @@
           value: ${UNLEASH_CACHE_DIR}
         - name: QE_SCHEMA
           value: ${QE_SCHEMA}
-        - name: OCI_CLI_USER
-          valueFrom:
-            secretKeyRef:
-              key: oci-cli-user
-              name: koku-oci
-        - name: OCI_CLI_FINGERPRINT
-          valueFrom:
-            secretKeyRef:
-              key: oci-cli-fingerprint
-              name: koku-oci
-        - name: OCI_CLI_TENANCY
-          valueFrom:
-            secretKeyRef:
-              key: oci-cli-tenancy
-              name: koku-oci
-        - name: OCI_CLI_KEY_FILE
-          value: ${OCI_CLI_KEY_FILE}
-        - name: OCI_PYTHON_SDK_NO_SERVICE_IMPORTS
-          value: 'true'
         - name: ENHANCED_ORG_ADMIN
           value: ${ENHANCED_ORG_ADMIN}
         - name: TRINO_HOST
@@ -158,17 +158,14 @@
           timeoutSeconds: 10
       resources:
         limits:
-          cpu: ${MASU_CPU_LIMIT}
-          memory: ${MASU_MEMORY_LIMIT}
+          cpu: ${CPU_LIMIT_MASU}
+          memory: ${MEMORY_LIMIT_MASU}
         requests:
-          cpu: ${MASU_CPU_REQUEST}
-          memory: ${MASU_MEMORY_REQUEST}
+          cpu: ${CPU_REQUEST_MASU}
+          memory: ${MEMORY_REQUEST_MASU}
       volumeMounts:
       - name: gcp-credentials
         mountPath: /etc/gcp
-        readOnly: true
-      - name: oci-credentials
-        mountPath: /etc/oci
         readOnly: true
       - name: tmp-data
         mountPath: ${TMP_DIR}
@@ -181,12 +178,6 @@
           items:
             - key: gcp-credentials
               path: gcp-credentials.json
-      - name: oci-credentials
-        secret:
-          secretName: koku-oci
-          items:
-            - key: oci-credentials
-              path: oci-credentials.pem
 
 - op: add
   path: /parameters/-
@@ -199,28 +190,28 @@
   path: /parameters/-
   value:
     displayName: Memory Request
-    name: MASU_MEMORY_REQUEST
+    name: MEMORY_REQUEST_MASU
     required: true
-    value: 350Mi
+    value: 500Mi
 - op: add
   path: /parameters/-
   value:
     displayName: Memory Limit
-    name: MASU_MEMORY_LIMIT
+    name: MEMORY_LIMIT_MASU
     required: true
     value: 700Mi
 - op: add
   path: /parameters/-
   value:
     displayName: CPU Request
-    name: MASU_CPU_REQUEST
+    name: CPU_REQUEST_MASU
     required: true
     value: 50m
 - op: add
   path: /parameters/-
   value:
     displayName: CPU Limit
-    name: MASU_CPU_LIMIT
+    name: CPU_LIMIT_MASU
     required: true
     value: 100m
 - op: add
@@ -230,3 +221,9 @@
     name: MASU_KOKU_LOG_LEVEL
     required: true
     value: INFO
+- op: add
+  path: /parameters/-
+  value:
+    description: change this value to restart masu
+    name: REDEPLOY_HASH_MASU
+    value: "000000"

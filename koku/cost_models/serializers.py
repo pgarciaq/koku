@@ -3,9 +3,9 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 """Rate serializer."""
-import copy
 import logging
 from collections import defaultdict
+from copy import deepcopy
 from decimal import Decimal
 
 from rest_framework import serializers
@@ -23,6 +23,7 @@ from cost_models.cost_model_manager import CostModelManager
 from cost_models.models import CostModel
 
 MARKUP_CHOICES = (("percent", "%"),)
+TAG_RATE_ONLY = (metric_constants.OCP_PROJECT_MONTH,)
 LOG = logging.getLogger(__name__)
 
 
@@ -58,23 +59,27 @@ class MarkupSerializer(serializers.Serializer):
 class DistributionSerializer(BaseSerializer):
     """Serializer for distribution options"""
 
-    DISTRIBUTION_OPTIONS = {"distribution_type", "worker_cost", "platform_cost"}
-
-    distribution_type = serializers.ChoiceField(choices=metric_constants.DISTRIBUTION_CHOICES, required=False)
-    platform_cost = serializers.BooleanField(required=False)
-    worker_cost = serializers.BooleanField(required=False)
-
-    def validate(self, data):
-        """Run validation for distribution options."""
-
-        diff = self.DISTRIBUTION_OPTIONS.difference(data)
-        if diff == self.DISTRIBUTION_OPTIONS:
-            return {"distribution_type": metric_constants.CPU_DISTRIBUTION, "platform_cost": True, "worker_cost": True}
-        if diff:
-            distribution_info_str = ", ".join(diff)
-            error_msg = f"Missing distribution information: one of {distribution_info_str}"
-            raise serializers.ValidationError(error_msg)
-        return data
+    distribution_type = serializers.ChoiceField(
+        choices=metric_constants.DISTRIBUTION_CHOICES,
+        required=False,
+        default=metric_constants.DEFAULT_DISTRIBUTION_TYPE,
+    )
+    platform_cost = serializers.BooleanField(
+        required=False,
+        default=metric_constants.PLATFORM_COST_DEFAULT,
+    )
+    worker_cost = serializers.BooleanField(
+        required=False,
+        default=metric_constants.WORKER_UNALLOCATED_DEFAULT,
+    )
+    network_unattributed = serializers.BooleanField(
+        required=False,
+        default=metric_constants.NETWORK_UNATTRIBUTED_DEFAULT,
+    )
+    storage_unattributed = serializers.BooleanField(
+        required=False,
+        default=metric_constants.STORAGE_UNATTRIBUTED_DEFAULT,
+    )
 
 
 class TieredRateSerializer(serializers.Serializer):
@@ -209,8 +214,8 @@ class RateSerializer(serializers.Serializer):
     @property
     def metric_map(self):
         """Return a metric map dictionary with default values."""
-        metrics = copy.deepcopy(metric_constants.COST_MODEL_METRIC_MAP)
-        return {metric.get("metric"): metric.get("default_cost_type") for metric in metrics}
+        metrics = metric_constants.get_cost_model_metrics_map()
+        return {metric: value.get("default_cost_type") for metric, value in metrics.items()}
 
     @staticmethod
     def _convert_to_decimal(rate):
@@ -234,8 +239,8 @@ class RateSerializer(serializers.Serializer):
             ):  # noqa:W503
                 error_msg = (
                     "tiered_rate must not have gaps between tiers."
-                    "usage_start of {} should be less than or equal to the"
-                    " usage_end {} of the previous tier.".format(usage_start, next_tier)
+                    f"usage_start of {usage_start} should be less than or equal to the"
+                    f" usage_end {next_tier} of the previous tier."
                 )
                 raise serializers.ValidationError(error_msg)
             next_tier = usage_end
@@ -251,8 +256,8 @@ class RateSerializer(serializers.Serializer):
             if usage_end != next_bucket_usage_start:
                 error_msg = (
                     "tiered_rate must not have overlapping tiers."
-                    " usage_start value {} should equal to the"
-                    " usage_end value of the next tier, not {}.".format(usage_end, next_bucket_usage_start)
+                    f" usage_start value {usage_end} should equal to the"
+                    f" usage_end value of the next tier, not {next_bucket_usage_start}."
                 )
                 raise serializers.ValidationError(error_msg)
 
@@ -309,6 +314,15 @@ class RateSerializer(serializers.Serializer):
 
     def validate(self, data):
         """Validate that a rate must be defined."""
+        metric_name = data.get("metric").get("name")
+        if metric_name in TAG_RATE_ONLY and data.get("tiered_rates"):
+            error_msg = f"{metric_name} is only available as a tag based rate."
+            raise serializers.ValidationError(error_msg)
+
+        if metric_name not in metric_constants.METRIC_CHOICES:
+            error_msg = f"{metric_name} is an invalid metric"
+            raise serializers.ValidationError(error_msg)
+
         tiered_rates = self.validate_tiered_rates(data.get("tiered_rates", []))
         tag_rates = self.validate_tag_rates(data.get("tag_rates", {}))
         if tiered_rates:
@@ -317,11 +331,7 @@ class RateSerializer(serializers.Serializer):
             data["tag_rates"] = tag_rates
 
         rate_keys_str = ", ".join(str(rate_key) for rate_key in self.RATE_TYPES)
-        if data.get("metric").get("name") not in [metric for metric, _ in metric_constants.METRIC_CHOICES]:
-            error_msg = "{} is an invalid metric".format(data.get("metric").get("name"))
-            raise serializers.ValidationError(error_msg)
-
-        data["cost_type"] = self.validate_cost_type(data.get("metric").get("name"), data.get("cost_type"))
+        data["cost_type"] = self.validate_cost_type(metric_name, data.get("cost_type"))
 
         if any(data.get(rate_key) is not None for rate_key in self.RATE_TYPES):
             if tiered_rates == [] and tag_rates == {}:
@@ -426,13 +436,13 @@ class CostModelSerializer(BaseSerializer):
     def metric_map(self):
         """Map metrics and display names."""
         metric_map_by_source = defaultdict(dict)
-        metric_map = copy.deepcopy(metric_constants.COST_MODEL_METRIC_MAP)
-        for metric in metric_map:
+        metric_map = metric_constants.get_cost_model_metrics_map()
+        for metric, value in metric_map.items():
             try:
-                metric_map_by_source[metric.get("source_type")][metric.get("metric")] = metric
-            except TypeError:
+                metric_map_by_source[value["source_type"]][metric] = value
+            except KeyError as e:
                 LOG.error("Invalid Cost Model Metric Map", exc_info=True)
-                raise CostModelMetricMapJSONException("Internal Server Error.")
+                raise CostModelMetricMapJSONException("Internal Server Error.") from e
         return metric_map_by_source
 
     @property
@@ -477,12 +487,11 @@ class CostModelSerializer(BaseSerializer):
             data["currency"] = get_currency(self.context.get("request"))
 
         if not data.get("distribution_info"):
-            data["distribution_info"] = {
-                "distribution_type": data.get("distribution", metric_constants.CPU_DISTRIBUTION),
-                "platform_cost": True,
-                "worker_cost": True,
-            }
-
+            # TODO: Have this return just the default distribution info after
+            # QE updates tests.
+            distribution_info = deepcopy(metric_constants.DEFAULT_DISTRIBUTION_INFO)
+            distribution_info["distribution_type"] = data.get("distribution", metric_constants.CPU)
+            data["distribution_info"] = distribution_info
         if (
             data.get("markup")
             and not data.get("rates")

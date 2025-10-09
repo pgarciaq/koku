@@ -6,10 +6,11 @@
 import logging
 from unittest.mock import Mock
 from unittest.mock import patch
+from uuid import uuid4
 
 from botocore.exceptions import ClientError
 from django.test import TestCase
-from django.utils.translation import ugettext as _
+from django.utils.translation import gettext
 from faker import Faker
 from rest_framework.exceptions import ValidationError
 
@@ -44,7 +45,7 @@ class AWSProviderTestCase(TestCase):
         """Test the error_obj method."""
         test_key = "tkey"
         test_message = "tmessage"
-        expected = {test_key: [_(test_message)]}
+        expected = {test_key: [gettext(test_message)]}
         error = error_obj(test_key, test_message)
         self.assertEqual(error, expected)
 
@@ -69,7 +70,36 @@ class AWSProviderTestCase(TestCase):
         iam_arn = "arn:aws:s3:::my_s3_bucket"
         credentials = {"role_arn": iam_arn}
         aws_credentials = _get_sts_access(credentials)
-        sts_client.assume_role.assert_called()
+        sts_client.assume_role.assert_called_with(RoleArn=iam_arn, RoleSessionName="AccountCreationSession")
+        self.assertEqual(aws_credentials.get("aws_access_key_id"), expected_access_key)
+        self.assertEqual(aws_credentials.get("aws_secret_access_key"), expected_secret_access_key)
+        self.assertEqual(aws_credentials.get("aws_session_token"), expected_session_token)
+
+    @patch("providers.aws.provider.boto3.client")
+    def test_get_sts_access_with_external_id(self, mock_boto3_client):
+        """Test _get_sts_access success."""
+        expected_access_key = FAKE.md5()
+        expected_secret_access_key = FAKE.md5()
+        expected_session_token = FAKE.md5()
+
+        assume_role = {
+            "Credentials": {
+                "AccessKeyId": expected_access_key,
+                "SecretAccessKey": expected_secret_access_key,
+                "SessionToken": expected_session_token,
+            }
+        }
+        sts_client = Mock()
+        sts_client.assume_role.return_value = assume_role
+        mock_boto3_client.return_value = sts_client
+
+        iam_arn = "arn:aws:s3:::my_s3_bucket"
+        external_id = str(uuid4())
+        credentials = {"role_arn": iam_arn, "external_id": external_id}
+        aws_credentials = _get_sts_access(credentials)
+        sts_client.assume_role.assert_called_with(
+            RoleArn=iam_arn, RoleSessionName="AccountCreationSession", ExternalId=external_id
+        )
         self.assertEqual(aws_credentials.get("aws_access_key_id"), expected_access_key)
         self.assertEqual(aws_credentials.get("aws_secret_access_key"), expected_secret_access_key)
         self.assertEqual(aws_credentials.get("aws_session_token"), expected_session_token)
@@ -92,7 +122,7 @@ class AWSProviderTestCase(TestCase):
         mock_boto3_client.return_value = sts_client
         iam_arn = "arn:aws:s3:::my_s3_bucket"
         credentials = {"role_arn": iam_arn}
-        with self.assertLogs(level=logging.CRITICAL):
+        with self.assertLogs(level=logging.WARNING):
             aws_credentials = _get_sts_access(credentials)
             self.assertIn("aws_access_key_id", aws_credentials)
             self.assertIn("aws_secret_access_key", aws_credentials)

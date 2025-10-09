@@ -36,8 +36,9 @@ INSERT INTO postgres.{{schema | sqlsafe}}.reporting_awscostentrylineitem_daily_s
 )
 with cte_pg_enabled_keys as (
     select array_agg(key order by key) as keys
-      from postgres.{{schema | sqlsafe}}.reporting_awsenabledtagkeys
+      from postgres.{{schema | sqlsafe}}.reporting_enabledtagkeys
      where enabled = true
+     and provider_type = 'AWS'
 )
 SELECT uuid() as uuid,
     INTEGER '{{bill_id | sqlsafe}}' as cost_entry_bill_id,
@@ -93,7 +94,14 @@ FROM (
         costcategory,
         nullif(product_instancetype, '') as instance_type,
         nullif(pricing_unit, '') as unit,
-        sum(lineitem_usageamount) as usage_amount,
+        -- SavingsPlanNegation needs to be negated to prevent duplicate usage COST-5369
+        sum(
+            CASE
+                WHEN lineitem_lineitemtype='SavingsPlanNegation'
+                THEN 0.0
+                ELSE lineitem_usageamount
+            END
+        ) as usage_amount,
         max(lineitem_normalizationfactor) as normalization_factor,
         sum(lineitem_normalizedusageamount) as normalized_usage_amount,
         max(lineitem_currencycode) as currency_code,
@@ -104,10 +112,12 @@ FROM (
         sum(savingsplan_savingsplaneffectivecost) as savingsplan_effective_cost,
         sum(
             CASE
-                WHEN lineitem_lineitemtype='Tax'
-                OR   lineitem_lineitemtype='Usage'
-                THEN lineitem_unblendedcost
-                ELSE savingsplan_savingsplaneffectivecost
+                WHEN lineitem_lineitemtype='SavingsPlanCoveredUsage'
+                OR lineitem_lineitemtype='SavingsPlanNegation'
+                OR lineitem_lineitemtype='SavingsPlanUpfrontFee'
+                OR lineitem_lineitemtype='SavingsPlanRecurringFee'
+                THEN savingsplan_savingsplaneffectivecost
+                ELSE lineitem_unblendedcost
             END
         ) as calculated_amortized_cost,
         sum(pricing_publicondemandcost) as public_on_demand_cost,
@@ -138,6 +148,7 @@ LEFT JOIN postgres.{{schema | sqlsafe}}.reporting_awsaccountalias AS aa
     ON ds.usage_account_id = aa.account_id
 LEFT JOIN postgres.{{schema | sqlsafe}}.reporting_awsorganizationalunit AS ou
     ON aa.id = ou.account_alias_id
+        AND ou.provider_id = UUID '{{source_uuid | sqlsafe}}'
         AND ou.created_timestamp <= ds.usage_start
         AND (
             ou.deleted_timestamp is NULL

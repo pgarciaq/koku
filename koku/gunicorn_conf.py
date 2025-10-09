@@ -1,7 +1,10 @@
 """Gunicorn configuration file."""
+import io
 import multiprocessing
+import traceback
 
 import environ
+from prometheus_client import multiprocess
 
 from koku.feature_flags import UNLEASH_CLIENT
 from koku.probe_server import BasicProbeServer
@@ -34,8 +37,7 @@ bind = f"0.0.0.0:{CLOWDER_PORT}"
 
 # Worker Processes (https://docs.gunicorn.org/en/stable/settings.html#worker-processes)
 cpu_resources = ENVIRONMENT.int("POD_CPU_LIMIT", default=multiprocessing.cpu_count())
-gunicorn_workers = ENVIRONMENT.int("GUNICORN_WORKERS", default=(cpu_resources * 2 + 1))
-workers = 1 if SOURCES else gunicorn_workers
+workers = ENVIRONMENT.int("GUNICORN_WORKERS", default=(cpu_resources * 2 + 1))
 gunicorn_threads = ENVIRONMENT.bool("GUNICORN_THREADS", default=False)
 if gunicorn_threads:
     threads = cpu_resources * 2 + 1
@@ -61,3 +63,17 @@ def worker_exit(server, worker):
     """Called just after a worker has been exited, in the worker process."""
     worker.log.info("Shutting down UNLEASH_CLIENT for gunicorn worker.")
     UNLEASH_CLIENT.destroy()
+
+
+def worker_abort(worker):
+    """Log the stack trace when a worker timeout occurs"""
+    buffer = io.StringIO()
+    traceback.print_stack(file=buffer)
+    data = buffer.getvalue()
+    buffer.close()
+
+    worker.log.error(f"Killing worker {worker.pid}\n{data}")
+
+
+def child_exit(server, worker):
+    multiprocess.mark_process_dead(worker.pid)

@@ -1,10 +1,8 @@
 # Koku README
 
 [![license](https://img.shields.io/github/license/project-koku/koku.svg)](https://github.com/project-koku/koku/blob/main/LICENSE)
-[![Unittests](https://github.com/project-koku/koku/workflows/Unit%20Tests/badge.svg)](https://github.com/project-koku/koku/actions)
+[![CI](https://github.com/project-koku/koku/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/project-koku/koku/actions/workflows/ci.yml)
 [![codecov](https://codecov.io/gh/project-koku/koku/branch/main/graph/badge.svg)](https://codecov.io/gh/project-koku/koku)
-[![Coverage](https://sonarcloud.io/api/project_badges/measure?project=project-koku_koku&metric=coverage)](https://sonarcloud.io/summary/new_code?id=project-koku_koku)
-[![Quality Gate Status](https://sonarcloud.io/api/project_badges/measure?project=project-koku_koku&metric=alert_status)](https://sonarcloud.io/summary/new_code?id=project-koku_koku)
 
 ## About
 
@@ -12,15 +10,15 @@ Koku's goal is to provide an open source solution for cost management of cloud a
 
 Full documentation is available in [docs folder](docs).
 
-To submit an issue please visit [https://issues.redhat.com/projects/COST/]().
+To submit an issue please visit https://issues.redhat.com/projects/COST/.
 
 ## Getting Started
 
-This project is developed using Python 3.9. Make sure you have at least this version installed.
+This project is developed using Python 3.11. Make sure you have at least this version installed.
 
 ### Prerequisites
 
-- Docker
+- Docker or Rancher Desktop
 - (macOS only) [Install Homebrew](https://brew.sh/)
 
 ## Development
@@ -35,17 +33,23 @@ This project is developed using the Django web framework. Many
 configuration settings can be read in from a `.env` file. To configure,
 do the following:
 
-1.  Copy [`.env.example`](.env.example) into a `.env`
+1.  Copy [`.env.example`](.env.example) into a `.env` and update the following in your `.env`:
 
-2.  Obtain AWS values and update the following in your `.env`:
-
-        AWS_ACCESS_KEY_ID=YOUR_AWS_ACCESS_KEY
-        AWS_SECRET_ACCESS_KEY=YOUR_AWS_SECRET_KEY
         AWS_RESOURCE_NAME=YOUR_COST_MANAGEMENT_AWS_ARN
+
+2.  Copy [`dev/credentials/aws.example`](dev/credentials/aws.example) into `dev/credentials/aws`, obtain AWS credentials, then update the credentials file:
+
+        [default]
+        aws_access_key_id=YOUR_AWS_ACCESS_KEY_ID
+        aws_secret_access_key=YOUR_AWS_SECRET_ACCESS_KEY
 
 3.  (macOS only) Install libraries for building wheels on ARM:
 
-        brew install openssl librdkafka postgresql@13
+        brew install openssl librdkafka postgresql@16
+
+3.  (Fedora only) Install libraries for building wheels on Linux:
+
+        dnf install openssl-devel libpq-devel postgresql golang-sigs-k8s-kustomize
 
 3.  (Fedora only) Install libraries for building wheels on Linux:
 
@@ -53,9 +57,9 @@ do the following:
 
 4.  (macOS only) Also add the following to your `.env` or shell profile:
 
-        LDFLAGS="-L$(brew --prefix openssl)/lib -L$(brew --prefix librdkafka)/lib -L$(brew --prefix postgresql@13)/lib"
-        CPPFLAGS="-I$(brew --prefix openssl)/include -I$(brew --prefix librdkafka)/include -I$(brew --prefix postgresql@13)/include"
-        PATH="$PATH:$(brew --prefix postgresql@13)/bin"
+        LDFLAGS="-L$(brew --prefix openssl)/lib -L$(brew --prefix librdkafka)/lib"
+        CPPFLAGS="-I$(brew --prefix openssl)/include -I$(brew --prefix librdkafka)/include"
+        PATH="$PATH:$(brew --prefix postgresql@16)/bin"
 
 5.  Developing inside a virtual environment is recommended. A Pipfile is provided. Pipenv is recommended for combining virtual environment and dependency management. To install `pipenv`:
 
@@ -75,7 +79,7 @@ do the following:
 
 ### Developing with Docker Compose
 
-This will explain how to start the server and its dependencies usin Docker, create AWS/OCP sources, and view reports. This will not cover all API or scenarios but should give you an end-to-end flow.
+This will explain how to start the server and its dependencies using Docker (or Rancher Desktop), create AWS/OCP sources, and view reports. This will not cover all API or scenarios but should give you an end-to-end flow.
 
 #### Starting Koku using Docker Compose
 

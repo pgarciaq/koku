@@ -1,11 +1,3 @@
-DELETE FROM {{schema | sqlsafe}}.reporting_ocpusagelineitem_daily_summary AS lids
-WHERE lids.usage_start >= {{start_date}}::date
-    AND lids.usage_start <= {{end_date}}::date
-    AND lids.report_period_id = {{report_period_id}}
-    AND lids.cost_model_rate_type = {{rate_type}}
-    AND lids.monthly_cost_type = {{cost_type}}
-;
-
 INSERT INTO {{schema | sqlsafe}}.reporting_ocpusagelineitem_daily_summary (
     uuid,
     report_period_id,
@@ -18,6 +10,7 @@ INSERT INTO {{schema | sqlsafe}}.reporting_ocpusagelineitem_daily_summary (
     node,
     resource_id,
     pod_labels,
+    all_labels,
     pod_usage_cpu_core_hours,
     pod_request_cpu_core_hours,
     pod_effective_usage_cpu_core_hours,
@@ -59,6 +52,7 @@ SELECT uuid_generate_v4(),
     node,
     max(resource_id) as resource_id,
     pod_labels,
+    pod_labels as all_labels,
     NULL as pod_usage_cpu_core_hours,
     NULL as pod_request_cpu_core_hours,
     NULL as pod_effective_usage_cpu_core_hours,
@@ -88,6 +82,8 @@ SELECT uuid_generate_v4(),
             THEN sum(pod_effective_usage_cpu_core_hours) / max(cluster_capacity_cpu_core_hours) * {{rate}}::decimal
         WHEN {{cost_type}} = 'Node' AND {{distribution}} = 'cpu'
             THEN sum(pod_effective_usage_cpu_core_hours) / max(node_capacity_cpu_core_hours) * {{rate}}::decimal
+        WHEN {{cost_type}} = 'Node_Core_Month' AND {{distribution}} = 'cpu'
+            THEN sum(pod_effective_usage_cpu_core_hours) / max(node_capacity_cpu_core_hours) * max(node_capacity_cpu_cores) * {{rate}}::decimal
         ELSE 0
     END AS cost_model_cpu_cost,
     CASE
@@ -95,6 +91,8 @@ SELECT uuid_generate_v4(),
             THEN sum(pod_effective_usage_memory_gigabyte_hours) / max(cluster_capacity_memory_gigabyte_hours) * {{rate}}::decimal
         WHEN {{cost_type}} = 'Node' AND {{distribution}} = 'memory'
             THEN sum(pod_effective_usage_memory_gigabyte_hours) / max(node_capacity_memory_gigabyte_hours) * {{rate}}::decimal
+        WHEN {{cost_type}} = 'Node_Core_Month' AND {{distribution}} = 'memory'
+            THEN sum(pod_effective_usage_memory_gigabyte_hours) / max(node_capacity_memory_gigabyte_hours) * max(node_capacity_cpu_cores) * {{rate}}::decimal
         ELSE 0
     END as cost_model_memory_cost,
     0 as cost_model_volume_cost,
@@ -111,5 +109,9 @@ WHERE usage_start >= {{start_date}}::date
     AND node_capacity_cpu_core_hours != 0
     AND cluster_capacity_cpu_core_hours IS NOT NULL
     AND cluster_capacity_cpu_core_hours != 0
+    AND (
+            lids.cost_model_rate_type IS NULL
+            OR lids.cost_model_rate_type NOT IN ('Infrastructure', 'Supplementary')
+        )
 GROUP BY usage_start, source_uuid, cluster_id, node, namespace, pod_labels, cost_category_id
 ;

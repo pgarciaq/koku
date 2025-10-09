@@ -2,6 +2,11 @@
   path: /objects/0/spec/deployments/-
   value:
     name: clowder-scheduler
+    metadata:
+      annotations:
+        ignore-check.kube-linter.io/minimum-three-replicas: This deployment uses 1 pod as currently scheduling is a singleton
+        ignore-check.kube-linter.io/no-readiness-probe: This deployment uses celery beat which does not easily support readiness checks
+        ignore-check.kube-linter.io/no-liveness-probe: This deployment uses celery beat which does not easily support liveness checks
     replicas: ${{SCHEDULER_REPLICAS}}
     webServices:
       public:
@@ -24,16 +29,22 @@
       env:
         - name: CLOWDER_ENABLED
           value: ${CLOWDER_ENABLED}
+        - name: REDEPLOY_HASH
+          value: ${REDEPLOY_HASH_ALL}_${REDEPLOY_HASH_SCHEDULER}
+        - name: SCHEMA_SUFFIX
+          value: ${SCHEMA_SUFFIX}
+        - name: TRINO_S3A_OR_S3
+          value: ${TRINO_S3A_OR_S3}
         - name: AWS_ACCESS_KEY_ID
           valueFrom:
             secretKeyRef:
-              key: aws-access-key-id
+              key: aws_access_key_id
               name: koku-aws
               optional: false
         - name: AWS_SECRET_ACCESS_KEY
           valueFrom:
             secretKeyRef:
-              key: aws-secret-access-key
+              key: aws_secret_access_key
               name: koku-aws
               optional: false
         - name: GOOGLE_APPLICATION_CREDENTIALS
@@ -54,38 +65,32 @@
           value: ${PROMETHEUS_DIR}
         - name: REQUESTED_BUCKET
           value: ${S3_BUCKET_NAME}
-        - name: ENABLE_S3_ARCHIVING
-          value: ${ENABLE_S3_ARCHIVING}
         - name: PARQUET_PROCESSING_BATCH_SIZE
           value: ${PARQUET_PROCESSING_BATCH_SIZE}
         - name: TRINO_DATE_STEP
           value: ${TRINO_DATE_STEP}
-        - name: KOKU_CELERY_ENABLE_SENTRY
-          value: ${ENABLE_CELERY_SENTRY}
+        - name: VALIDATION_RANGE
+          value: ${VALIDATION_RANGE}
+        - name: KOKU_ENABLE_SENTRY
+          value: ${KOKU_ENABLE_SENTRY}
         - name: KOKU_SENTRY_ENVIRONMENT
           value: ${KOKU_SENTRY_ENV}
-        - name: KOKU_CELERY_SENTRY_DSN
+        - name: KOKU_SENTRY_DSN
           valueFrom:
             secretKeyRef:
-              key: celery-sentry-dsn
-              name: koku-sentry
+              key: ${GLITCHTIP_KEY_NAME}
+              name: ${GLITCHTIP_SECRET_NAME}
               optional: true
         - name: DEMO_ACCOUNTS
           value: ${DEMO_ACCOUNTS}
         - name: WORKER_QUEUES
           value: ${SCHEDULER_WORKER_QUEUE}
-        - name: REPORT_DOWNLOAD_SCHEDULE_GCP
-          value: ${REPORT_DOWNLOAD_SCHEDULE_GCP}
-        - name: REPORT_DOWNLOAD_SCHEDULE_AWS
-          value: ${REPORT_DOWNLOAD_SCHEDULE_AWS}
-        - name: REPORT_DOWNLOAD_SCHEDULE_AZURE
-          value: ${REPORT_DOWNLOAD_SCHEDULE_AZURE}
-        - name: REPORT_DOWNLOAD_SCHEDULE_OCI
-          value: ${REPORT_DOWNLOAD_SCHEDULE_OCI}
+        - name: REPORT_DOWNLOAD_SCHEDULE
+          value: ${REPORT_DOWNLOAD_SCHEDULE}
         - name: SCHEDULE_REPORT_CHECKS
           value: ${SCHEDULE_REPORT_CHECKS}
-        - name: SOURCE_STATUS_FREQUENCY_MINUTES
-          value: ${SOURCE_STATUS_FREQUENCY_MINUTES}
+        - name: SOURCE_STATUS_SCHEDULE
+          value: ${SOURCE_STATUS_SCHEDULE}
         - name: REMOVE_EXPIRED_REPORT_DATA_ON_DAY
           value: ${REMOVE_EXPIRED_REPORT_DATA_ON_DAY}
         - name: REMOVE_EXPIRED_REPORT_UTC_TIME
@@ -102,6 +107,16 @@
           value: ${INITIAL_INGEST_NUM_MONTHS}
         - name: INITIAL_INGEST_OVERRIDE
           value: ${INITIAL_INGEST_OVERRIDE}
+        - name: POLLING_TIMER
+          value: ${POLLING_TIMER}
+        - name: POLLING_COUNT
+          value: ${POLLING_COUNT}
+        - name: XL_REPORT_COUNT
+          value: ${XL_REPORT_COUNT}
+        - name: PROCESSING_WAIT_TIMER
+          value: ${PROCESSING_WAIT_TIMER}
+        - name: LARGE_PROCESSING_WAIT_TIMER
+          value: ${LARGE_PROCESSING_WAIT_TIMER}
         - name: TRINO_HOST
           value: ${TRINO_HOST}
         - name: TRINO_PORT
@@ -116,40 +131,18 @@
           value: ${UNLEASH_CACHE_DIR}
         - name: QE_SCHEMA
           value: ${QE_SCHEMA}
-        - name: OCI_CLI_USER
-          valueFrom:
-            secretKeyRef:
-              key: oci-cli-user
-              name: koku-oci
-        - name: OCI_CLI_FINGERPRINT
-          valueFrom:
-            secretKeyRef:
-              key: oci-cli-fingerprint
-              name: koku-oci
-        - name: OCI_CLI_TENANCY
-          valueFrom:
-            secretKeyRef:
-              key: oci-cli-tenancy
-              name: koku-oci
-        - name: OCI_CLI_KEY_FILE
-          value: ${OCI_CLI_KEY_FILE}
-        - name: OCI_PYTHON_SDK_NO_SERVICE_IMPORTS
-          value: 'true'
         - name: ENHANCED_ORG_ADMIN
           value: ${ENHANCED_ORG_ADMIN}
       resources:
         limits:
-          cpu: ${SCHEDULER_CPU_LIMIT}
-          memory: ${SCHEDULER_MEMORY_LIMIT}
+          cpu: ${CPU_LIMIT_SCHEDULER}
+          memory: ${MEMORY_LIMIT_SCHEDULER}
         requests:
-          cpu: ${SCHEDULER_CPU_REQUEST}
-          memory: ${SCHEDULER_MEMORY_REQUEST}
+          cpu: ${CPU_REQUEST_SCHEDULER}
+          memory: ${MEMORY_REQUEST_SCHEDULER}
       volumeMounts:
       - name: gcp-credentials
         mountPath: /etc/gcp
-        readOnly: true
-      - name: oci-credentials
-        mountPath: /etc/oci
         readOnly: true
       - name: tmp-data
         mountPath: ${TMP_DIR}
@@ -162,12 +155,6 @@
           items:
             - key: gcp-credentials
               path: gcp-credentials.json
-      - name: oci-credentials
-        secret:
-          secretName: koku-oci
-          items:
-            - key: oci-credentials
-              path: oci-credentials.pem
 
 - op: add
   path: /parameters/-
@@ -180,28 +167,28 @@
   path: /parameters/-
   value:
     displayName: Memory Request
-    name: SCHEDULER_MEMORY_REQUEST
+    name: MEMORY_REQUEST_SCHEDULER
     required: true
     value: 200Mi
 - op: add
   path: /parameters/-
   value:
     displayName: Memory Limit
-    name: SCHEDULER_MEMORY_LIMIT
+    name: MEMORY_LIMIT_SCHEDULER
     required: true
     value: 400Mi
 - op: add
   path: /parameters/-
   value:
     displayName: CPU Request
-    name: SCHEDULER_CPU_REQUEST
+    name: CPU_REQUEST_SCHEDULER
     required: true
     value: 50m
 - op: add
   path: /parameters/-
   value:
     displayName: CPU Limit
-    name: SCHEDULER_CPU_LIMIT
+    name: CPU_LIMIT_SCHEDULER
     required: true
     value: 100m
 - op: add
@@ -210,7 +197,7 @@
     displayName: Worker Queue
     name: SCHEDULER_WORKER_QUEUE
     required: true
-    value: 'cost_model,cost_model_xl,download,download_xl,hcs,ocp,ocp_xl,priority,priority_xl,refresh,refresh_xl,summary,summary_xl'
+    value: 'cost_model,cost_model_xl,cost_model_penalty,download,download_xl,download_penalty,hcs,ocp,ocp_xl,ocp_penalty,priority,priority_xl,priority_penalty,refresh,refresh_xl,refresh_penalty,summary,summary_xl,summary_penalty'
 - op: add
   path: /parameters/-
   value:
@@ -221,5 +208,11 @@
   path: /parameters/-
   value:
     displayName: Frequency to check sources availability (minutes)
-    name: SOURCE_STATUS_FREQUENCY_MINUTES
-    value: '60'
+    name: SOURCE_STATUS_SCHEDULE
+    value: "0 3 * * *"
+- op: add
+  path: /parameters/-
+  value:
+    description: change this value to restart scheduler
+    name: REDEPLOY_HASH_SCHEDULER
+    value: "000000"

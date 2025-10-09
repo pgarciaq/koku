@@ -15,11 +15,14 @@ INSERT INTO {{schema | sqlsafe}}.reporting_ocpusagelineitem_daily_summary (
     resource_id,
     pod_labels,
     volume_labels,
+    all_labels,
     source_uuid,
     infrastructure_raw_cost,
     infrastructure_project_raw_cost,
     infrastructure_usage_cost,
     supplementary_usage_cost,
+    infrastructure_data_in_gigabytes,
+    infrastructure_data_out_gigabytes,
     pod_usage_cpu_core_hours,
     pod_request_cpu_core_hours,
     pod_limit_cpu_core_hours,
@@ -60,16 +63,20 @@ INSERT INTO {{schema | sqlsafe}}.reporting_ocpusagelineitem_daily_summary (
             THEN ocp_aws.pod_labels
             ELSE '{}'::jsonb
         END as volume_labels,
+        ocp_aws.pod_labels as all_labels,
         rp.provider_id as source_uuid,
-        {% if is_savingsplan_cost %}
-        sum(coalesce(nullif(ocp_aws.savingsplan_effective_cost, 0), ocp_aws.unblended_cost) + coalesce(nullif(ocp_aws.markup_cost_savingsplan, 0), ocp_aws.markup_cost)) AS infrastructure_raw_cost,
-        sum(coalesce(nullif(ocp_aws.savingsplan_effective_cost, 0), ocp_aws.unblended_cost) + coalesce(nullif(ocp_aws.markup_cost_savingsplan, 0), ocp_aws.markup_cost)) AS infrastructure_project_raw_cost,
-        {% else %}
-        sum(ocp_aws.unblended_cost + ocp_aws.markup_cost) AS infrastructure_raw_cost,
-        sum(ocp_aws.unblended_cost + ocp_aws.markup_cost) AS infrastructure_project_raw_cost,
-        {% endif %}
+        sum(calculated_amortized_cost + markup_cost_amortized) AS infrastructure_raw_cost,
+        sum(calculated_amortized_cost + markup_cost_amortized) AS infrastructure_project_raw_cost,
         '{"cpu": 0.000000000, "memory": 0.000000000, "storage": 0.000000000}'::jsonb as infrastructure_usage_cost,
         '{"cpu": 0.000000000, "memory": 0.000000000, "storage": 0.000000000}'::jsonb as supplementary_usage_cost,
+        CASE
+            WHEN upper(data_transfer_direction) = 'IN' THEN sum(infrastructure_data_in_gigabytes)
+            ELSE NULL
+        END as infrastructure_data_in_gigabytes,
+        CASE
+            WHEN upper(data_transfer_direction) = 'OUT' THEN sum(infrastructure_data_out_gigabytes)
+            ELSE NULL
+        END as infrastructure_data_out_gigabytes,
         0 as pod_usage_cpu_core_hours,
         0 as pod_request_cpu_core_hours,
         0 as pod_limit_cpu_core_hours,
@@ -105,5 +112,6 @@ INSERT INTO {{schema | sqlsafe}}.reporting_ocpusagelineitem_daily_summary (
         ocp_aws.persistentvolumeclaim,
         ocp_aws.resource_id,
         ocp_aws.pod_labels,
+        ocp_aws.data_transfer_direction,
         rp.provider_id
 ;

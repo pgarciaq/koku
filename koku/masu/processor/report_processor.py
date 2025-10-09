@@ -4,16 +4,18 @@
 #
 """Report processor external interface."""
 import logging
+from pathlib import Path
 
 from django.db import InterfaceError as DjangoInterfaceError
 from django.db import OperationalError
 from psycopg2 import InterfaceError
 
 from api.common import log_json
-from api.models import Provider
 from koku.database_exc import get_extended_exception_by_type
-from masu.processor.parquet.ocp_cloud_parquet_report_processor import OCPCloudParquetReportProcessor
 from masu.processor.parquet.parquet_report_processor import ParquetReportProcessor
+from masu.processor.parquet.parquet_report_processor import ReportsAlreadyProcessed
+from reporting_common.models import CombinedChoices
+from reporting_common.models import CostUsageReportStatus
 
 LOG = logging.getLogger(__name__)
 
@@ -57,20 +59,6 @@ class ReportProcessor:
         except Exception as err:
             raise ReportProcessorError(str(err)) from err
 
-    @property
-    def ocp_on_cloud_processor(self):
-        """Return the OCP on Cloud processor if one is defined."""
-        if self.provider_type in Provider.OPENSHIFT_ON_CLOUD_PROVIDER_LIST:
-            return OCPCloudParquetReportProcessor(
-                schema_name=self.schema_name,
-                report_path=self.report_path,
-                provider_uuid=self.provider_uuid,
-                provider_type=self.provider_type,
-                manifest_id=self.manifest_id,
-                context=self.context,
-            )
-        return None
-
     def _set_processor(self):
         """
         Create the report processor object.
@@ -106,21 +94,25 @@ class ReportProcessor:
             (List) List of filenames downloaded.
 
         """
-        msg = f"Report processing started for {self.report_path}"
-        LOG.info(log_json(self.tracing_id, msg=msg))
+        msg = f"report processing started for {self.report_path}"
+        report_status = CostUsageReportStatus.objects.get(
+            report_name=Path(self.report_path).name, manifest_id=self.manifest_id
+        )
+        LOG.info(log_json(self.tracing_id, msg=msg, context=self.context))
         try:
-            parquet_base_filename, daily_data_frames = self._processor.process()
-            if self.ocp_on_cloud_processor:
-                self.ocp_on_cloud_processor.process(parquet_base_filename, daily_data_frames)
-            if daily_data_frames != []:
-                return True
-            else:
-                return False
+            return self._processor.process()
+        except ReportsAlreadyProcessed:
+            report_status.update_status(CombinedChoices.DONE)
+            LOG.info(log_json(msg="report already processed", context=self.context))
+            return True
         except (InterfaceError, DjangoInterfaceError) as err:
+            report_status.update_status(CombinedChoices.FAILED)
             raise ReportProcessorDBError(f"Interface error: {err}") from err
         except OperationalError as o_err:
+            report_status.update_status(CombinedChoices.FAILED)
             db_exc = get_extended_exception_by_type(o_err)
             LOG.error(log_json(self.tracing_id, msg=f"Operation error: {db_exc}", context=db_exc.as_dict()))
             raise db_exc from o_err
         except Exception as err:
+            report_status.update_status(CombinedChoices.FAILED)
             raise ReportProcessorError(f"Unknown processor error: {err}") from err

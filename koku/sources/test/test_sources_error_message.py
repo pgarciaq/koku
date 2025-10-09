@@ -51,37 +51,23 @@ class SourcesErrorMessageTest(TestCase):
         test_matrix = [
             {
                 "key": ProviderErrors.AZURE_CLIENT_ERROR,
-                "internal_message": ", AdalError: Get Token request returned http error: 401 and server response:",
-                "expected_message": ProviderErrors.AZURE_INCORRECT_CLIENT_SECRET_MESSAGE,
-            },
-            {
-                "key": ProviderErrors.AZURE_CLIENT_ERROR,
-                "internal_message": "Authentication failed",
-                "expected_message": ProviderErrors.AZURE_INCORRECT_CLIENT_SECRET_MESSAGE,
-            },
-            {
-                "key": ProviderErrors.AZURE_CLIENT_ERROR,
                 "internal_message": (
                     "(401) Unauthorized. Request ID: cca1a5a4-4107-4e7a-b3b4-b88f31e6a674\n"
                     "Code: 401\nMessage: Unauthorized. Request ID: cca1a5a4-4107-4e7a-b3b4-b88f31e6a674"
                 ),
-                "expected_message": ProviderErrors.AZURE_INCORRECT_CLIENT_SECRET_MESSAGE,
             },
             {
                 "key": ProviderErrors.AZURE_CLIENT_ERROR,
                 "internal_message": (
-                    ", AdalError: Get Token request returned http error: 400 and server response:"
-                    ' {"error":"invalid_request","error_description":"AADSTS90002: Tenant'
+                    "The client 'xxxxx' with object id 'xxxxx' does not have authorization to perform action "
+                    "'Microsoft.Storage/storageAccounts/listKeys/action' over scope "
+                    "'/subscriptions/xxxxx/resourceGroups/xxxxx/providers/Microsoft.Storage/storageAccounts/xxxxx' "
+                    "or the scope is invalid. If access was recently granted, please refresh your credentials."
                 ),
-                "expected_message": ProviderErrors.AZURE_INCORRECT_TENANT_ID_MESSAGE,
             },
             {
                 "key": ProviderErrors.AZURE_CLIENT_ERROR,
-                "internal_message": (
-                    ", AdalError: Get Token request returned http error: 400 and server response:"
-                    ' {"error":"unauthorized_client","error_description":"AADSTS700016:'
-                ),
-                "expected_message": ProviderErrors.AZURE_INCORRECT_CLIENT_ID_MESSAGE,
+                "internal_message": "'(RBACAccessDenied) The client does not have authorization to perform action.",
             },
             {
                 "key": ProviderErrors.AZURE_CLIENT_ERROR,
@@ -89,14 +75,12 @@ class SourcesErrorMessageTest(TestCase):
                     "Authentication failed: AADSTS7000222: The provided client secret keys for app"
                     " '84ed5026-61c8-42a3-9511-74735a5c6be2' are expired."
                 ),
-                "expected_message": ProviderErrors.AZURE_EXPIRED_CLIENT_SECRET_KEYS_MESSAGE,
             },
             {
                 "key": ProviderErrors.AZURE_CLIENT_ERROR,
                 "internal_message": (
                     "Azure Error: ResourceGroupNotFound\nMessage: Resource group" "'RG2' could not be found."
                 ),
-                "expected_message": ProviderErrors.AZURE_INCORRECT_RESOURCE_GROUP_MESSAGE,
             },
             {
                 "key": ProviderErrors.AZURE_CLIENT_ERROR,
@@ -105,7 +89,6 @@ class SourcesErrorMessageTest(TestCase):
                     "Resource 'Microsoft.Storage/storageAccounts/mysa5' under "
                     "resource group 'RG1' was not found"
                 ),
-                "expected_message": ProviderErrors.AZURE_INCORRECT_STORAGE_ACCOUNT_MESSAGE,
             },
             {
                 "key": ProviderErrors.AZURE_CLIENT_ERROR,
@@ -114,12 +97,6 @@ class SourcesErrorMessageTest(TestCase):
                     "subscription '2639de71-ca37-4a17-a104-17665a50e7fd'"
                     " could not be found."
                 ),
-                "expected_message": ProviderErrors.AZURE_INCORRECT_SUBSCRIPTION_ID_MESSAGE,
-            },
-            {
-                "key": ProviderErrors.AZURE_CLIENT_ERROR,
-                "internal_message": "Random azure error",
-                "expected_message": ProviderErrors.AZURE_GENERAL_CLIENT_ERROR_MESSAGE,
             },
         ]
         for test in test_matrix:
@@ -128,7 +105,7 @@ class SourcesErrorMessageTest(TestCase):
                 message = test.get("internal_message")
                 error = ValidationError(error_obj(key, message))
                 message_obj = SourcesErrorMessage(error)
-                self.assertEqual(message_obj.display(source_id=1), test.get("expected_message"))
+                self.assertEqual(message_obj.display(source_id=1), message)
 
     def test_general_string_error(self):
         """Test general string error fallback."""

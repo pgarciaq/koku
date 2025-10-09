@@ -12,6 +12,7 @@ from django.db.models import CharField
 from django.db.models import F
 from django.db.models import Q
 from django.db.models import Value
+from django.db.models.fields.json import KT
 from django.db.models.functions import Coalesce
 from django_tenants.utils import tenant_context
 
@@ -56,6 +57,7 @@ class AWSReportQueryHandler(ReportQueryHandler):
             kwargs = {
                 "provider": self.provider,
                 "report_type": parameters.report_type,
+                "schema_name": parameters.tenant.schema_name,
                 "cost_type": parameters.cost_type,
             }
             if markup_cost := AWS_MARKUP_COST.get(parameters.cost_type):
@@ -87,15 +89,19 @@ class AWSReportQueryHandler(ReportQueryHandler):
             annotations["usage_units"] = Coalesce(self._mapper.usage_units_key, Value(units_fallback))
         # { query_param: database_field_name }
         fields = self._mapper.provider_map.get("annotations")
-        prefix_removed_parameters_list = list(
-            map(
-                lambda x: x if ":" not in x else x.split(":", maxsplit=1)[1],
-                self.parameters.get("group_by", {}).keys(),
-            )
-        )
-        for q_param, db_field in fields.items():
-            if q_param in prefix_removed_parameters_list:
-                annotations[q_param] = F(db_field)
+        prefix_removed_parameters_list = [
+            x.split(":", maxsplit=1)[-1] for x in self.parameters.get("group_by", {}).keys()
+        ]
+        for param in prefix_removed_parameters_list:
+            if db_field := fields.get(param):
+                annotations[param] = F(db_field)
+
+        if hasattr(self._mapper, "aws_category_column"):
+            for cat_db_name, _, original_cat in self._aws_category_group_by:
+                annotations[cat_db_name] = KT(f"{self._mapper.aws_category_column}__{original_cat}")
+        for tag_db_name, _, original_tag in self._tag_group_by:
+            annotations[tag_db_name] = KT(f"{self._mapper.tag_column}__{original_tag}")
+
         return annotations
 
     def _contains_disabled_aws_category_keys(self):
@@ -235,8 +241,8 @@ class AWSReportQueryHandler(ReportQueryHandler):
             self.parameters.parameters["access"]["org_unit_id"] = org_unit_list
             self.parameters.parameters["access"]["account"] = acc_group_by_data
 
-            # add a key to parameters used in query filter composition in queries.py
-            self.parameters.set("ou_or_operator", True)
+            # Use OR operator
+            self.parameters.set("aws_use_or_operator", True)
             self.parameters._configure_access_params(self.parameters.caller)
             self.query_filter = self._get_filter()
 
@@ -299,6 +305,9 @@ class AWSReportQueryHandler(ReportQueryHandler):
             # If not CSV output and org unit was applied, then reshape the output
             # structures for the JSON serializer
             query_data = self.format_sub_org_results(query_data_results, query_data, sub_orgs_dict)
+        elif self._report_type == "ec2_compute":
+            # Handle formating EC2 compute response
+            query_data = self.format_ec2_response(query_data)
         else:
             query_data = self._set_csv_output_fields(query_data)
 
@@ -317,8 +326,8 @@ class AWSReportQueryHandler(ReportQueryHandler):
             (Dict): Dictionary response of query params, data, and total
 
         """
-        output = self._initialize_response_output(self.parameters)
 
+        output = self._initialize_response_output(self.parameters)
         output["data"] = self.query_data
         output["total"] = self.query_sum
 
@@ -555,3 +564,63 @@ class AWSReportQueryHandler(ReportQueryHandler):
         except Exception as e:
             LOG.error(f"Error getting sub org units: \n{e}")
             return []
+
+    def format_ec2_response(self, query_data):
+        """
+        Format EC2 response data.
+
+        If CSV output, nests query data under a date key.
+        If not CSV output, tansforming tags in resource data to the desired UI format.
+
+        Example transformation:
+
+        Input:
+        "tags": [
+            {"Map":"c2"},
+            {"Name":"instance_name_3"},
+        ]
+
+
+        Output:
+        "tags": [
+            {
+                "key": "Map",
+                "values": ["c2"]
+            },
+            {
+                "key": "Name",
+                "values": ["instance_name_3"]
+            },
+        ]
+
+        Returns:
+        list: The formatted query data based on the output format.
+        """
+
+        if not self.is_csv_output:
+            for item in query_data:
+                for resource in item["resource_ids"]:
+                    resource_values = resource["values"][0]
+
+                    seen_tags = set()
+                    unique_tags = []
+
+                    for tag in resource_values["tags"]:
+                        if tag:
+                            for key, value in tag.items():
+                                tag_tuple = (key, tuple([value]))
+
+                                if tag_tuple not in seen_tags:
+                                    seen_tags.add(tag_tuple)
+                                    unique_tags.append({"key": key, "values": [value]})
+
+                    resource_values["tags"] = unique_tags
+
+            return query_data
+
+        else:
+            date_string = self.date_to_string(self.time_interval[0])
+            for item in query_data:
+                # exclude tags when exporting to csv
+                item.pop("tags")
+            return [{"date": date_string, "resource_ids": query_data}]

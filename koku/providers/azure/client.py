@@ -3,15 +3,18 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 """Azure Client Configuration."""
+import logging
+
+from azure.core.exceptions import HttpResponseError
 from azure.identity import ClientSecretCredential
 from azure.mgmt.costmanagement import CostManagementClient
-from azure.mgmt.resource import ResourceManagementClient
 from azure.mgmt.storage import StorageManagementClient
 from azure.storage.blob import BlobServiceClient
-from msrestazure.azure_cloud import AZURE_CHINA_CLOUD
-from msrestazure.azure_cloud import AZURE_GERMAN_CLOUD
-from msrestazure.azure_cloud import AZURE_PUBLIC_CLOUD
-from msrestazure.azure_cloud import AZURE_US_GOV_CLOUD
+
+from koku.settings import AZURE_COST_MGMT_CLIENT_API_VERSION
+
+
+LOG = logging.getLogger(__name__)
 
 
 class AzureClientFactory:
@@ -38,17 +41,7 @@ class AzureClientFactory:
         self._subscription_id = subscription_id
         self._scope = scope
         self._export_name = export_name
-
-        clouds = {
-            "china": AZURE_CHINA_CLOUD,
-            "germany": AZURE_GERMAN_CLOUD,
-            "public": AZURE_PUBLIC_CLOUD,
-            "usgov": AZURE_US_GOV_CLOUD,
-        }
-
-        self._credentials = ClientSecretCredential(
-            tenant_id, client_id, client_secret, cloud_environment=clouds.get(cloud, "public")
-        )
+        self._credentials = ClientSecretCredential(tenant_id, client_id, client_secret)
 
     @property
     def credentials(self):
@@ -58,12 +51,7 @@ class AzureClientFactory:
     @property
     def cost_management_client(self):
         """Get cost management client with subscription and credentials."""
-        return CostManagementClient(self.credentials)
-
-    @property
-    def resource_client(self):
-        """Return a resource client."""
-        return ResourceManagementClient(self.credentials, self.subscription_id)
+        return CostManagementClient(self.credentials, api_version=AZURE_COST_MGMT_CLIENT_API_VERSION)
 
     @property
     def storage_client(self):
@@ -75,21 +63,29 @@ class AzureClientFactory:
         """Subscription ID property."""
         return self._subscription_id
 
-    def cloud_storage_account(self, resource_group_name, storage_account_name):
+    def blob_service_client(self, resource_group_name, storage_account_name):
         """Get a BlobServiceClient."""
-        storage_account_keys = self.storage_client.storage_accounts.list_keys(
-            resource_group_name, storage_account_name
-        )
-        # Add check for keys and a get value
-        key = storage_account_keys.keys[0]
+        try:
+            storage_account_keys = self.storage_client.storage_accounts.list_keys(
+                resource_group_name, storage_account_name
+            )
+            # Add check for keys and a get value
+            key = storage_account_keys.keys[0]
 
-        connect_str = (
-            f"DefaultEndpointsProtocol=https;"
-            f"AccountName={storage_account_name};"
-            f"AccountKey={key.value};"
-            f"EndpointSuffix=core.windows.net"
-        )
-        return BlobServiceClient.from_connection_string(connect_str)
+            connect_str = (
+                f"DefaultEndpointsProtocol=https;"
+                f"AccountName={storage_account_name};"
+                f"AccountKey={key.value};"
+                f"EndpointSuffix=core.windows.net"
+            )
+            return BlobServiceClient.from_connection_string(connect_str)
+        except HttpResponseError as httpError:
+            LOG.warning(
+                "falling back to non storage account key access: "
+                f"unable to list storage account keys: {httpError.message}"
+            )
+            account_url = f"https://{storage_account_name}.blob.core.windows.net"
+            return BlobServiceClient(account_url, self.credentials)
 
     @property
     def scope(self):

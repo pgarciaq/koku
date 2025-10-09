@@ -9,19 +9,19 @@ from pprint import pprint
 from celery import Celery
 from celery import Task
 from celery.schedules import crontab
+from celery.schedules import ParseException
 from celery.signals import celeryd_after_setup
 from celery.signals import worker_process_init
 from celery.signals import worker_process_shutdown
-from croniter import croniter
 from django.conf import settings
 from kombu.exceptions import OperationalError
 
+from .database import FKViolation
 from koku import sentry  # noqa: F401
 from koku.env import ENVIRONMENT
 from koku.probe_server import ProbeResponse
 from koku.probe_server import ProbeServer
 from koku.probe_server import start_probe_server
-
 
 LOG = logging.getLogger(__name__)
 
@@ -31,7 +31,10 @@ class LogErrorsTask(Task):  # pragma: no cover
 
     def on_failure(self, exc, task_id, args, kwargs, einfo):
         """Log exceptions when a celery task fails."""
-        LOG.exception("Task failed: %s", exc, exc_info=exc)
+        if fk_violation := FKViolation(exc):
+            LOG.warning("task failed: %s", fk_violation)
+        else:
+            LOG.exception("Task failed: %s", exc, exc_info=exc)
         super().on_failure(exc, task_id, args, kwargs, einfo)
 
 
@@ -81,11 +84,16 @@ class WorkerProbeServer(ProbeServer):  # pragma: no cover
         self._write_response(ProbeResponse(status, msg))
 
 
-def validate_cron_expression(expresssion):
-    if not croniter.is_valid(expresssion):
-        print(f"Invalid report-download-schedule {expresssion}. Falling back to default `0 4,16 * * *`")
-        expresssion = "0 4,16 * * *"
-    return expresssion
+def validate_cron_expression(expression, default="0 * * * *"):
+    if len(expression.split(" ", 5)) != 5:
+        print(f"Invalid cron expression: {expression}. Falling back to default {default}")
+        expression = default
+    try:
+        crontab(*expression.split(" ", 5))
+    except (ValueError, ParseException) as e:
+        print(f"Invalid cron expression: {expression}. Falling back to default {default}, Error: {e}")
+        expression = default
+    return expression
 
 
 os.environ.setdefault("DJANGO_SETTINGS_MODULE", "koku.settings")
@@ -110,50 +118,18 @@ app.conf.worker_proc_alive_timeout = WORKER_PROC_ALIVE_TIMEOUT
 
 # Toggle to enable/disable scheduled checks for new reports.
 if ENVIRONMENT.bool("SCHEDULE_REPORT_CHECKS", default=False):
-    download_expression = "0 4,16 * * *"
+    download_fallback = validate_cron_expression("0 * * * *")
     download_task = "masu.celery.tasks.check_report_updates"
     # The schedule to scan for new reports.
-    REPORT_DOWNLOAD_SCHEDULE_GCP = ENVIRONMENT.get_value("REPORT_DOWNLOAD_SCHEDULE_GCP", default=download_expression)
-    REPORT_DOWNLOAD_SCHEDULE_GCP = validate_cron_expression(REPORT_DOWNLOAD_SCHEDULE_GCP)
-    report_schedule_gcp = crontab(*REPORT_DOWNLOAD_SCHEDULE_GCP.split(" ", 5))
-    CHECK_REPORT_UPDATES_DEF_GCP = {
+    download_expression = ENVIRONMENT.get_value("REPORT_DOWNLOAD_SCHEDULE", default=download_fallback)
+    REPORT_DOWNLOAD_SCHEDULE = validate_cron_expression(download_expression, download_fallback)
+    report_schedule = crontab(*REPORT_DOWNLOAD_SCHEDULE.split(" ", 5))
+    CHECK_REPORT_UPDATES_DEF = {
         "task": download_task,
-        "schedule": report_schedule_gcp,
-        "kwargs": {"provider_type": "GCP"},
+        "schedule": report_schedule,
+        "kwargs": {},
     }
-    app.conf.beat_schedule["check-report-updates-gcp"] = CHECK_REPORT_UPDATES_DEF_GCP
-
-    REPORT_DOWNLOAD_SCHEDULE_AWS = ENVIRONMENT.get_value("REPORT_DOWNLOAD_SCHEDULE_AWS", default=download_expression)
-    REPORT_DOWNLOAD_SCHEDULE_AWS = validate_cron_expression(REPORT_DOWNLOAD_SCHEDULE_AWS)
-    report_schedule_aws = crontab(*REPORT_DOWNLOAD_SCHEDULE_AWS.split(" ", 5))
-    CHECK_REPORT_UPDATES_DEF_AWS = {
-        "task": download_task,
-        "schedule": report_schedule_aws,
-        "kwargs": {"provider_type": "AWS"},
-    }
-    app.conf.beat_schedule["check-report-updates-aws"] = CHECK_REPORT_UPDATES_DEF_AWS
-
-    REPORT_DOWNLOAD_SCHEDULE_AZURE = ENVIRONMENT.get_value(
-        "REPORT_DOWNLOAD_SCHEDULE_AZURE", default=download_expression
-    )
-    REPORT_DOWNLOAD_SCHEDULE_AZURE = validate_cron_expression(REPORT_DOWNLOAD_SCHEDULE_AZURE)
-    report_schedule_azure = crontab(*REPORT_DOWNLOAD_SCHEDULE_AZURE.split(" ", 5))
-    CHECK_REPORT_UPDATES_DEF_AZURE = {
-        "task": download_task,
-        "schedule": report_schedule_azure,
-        "kwargs": {"provider_type": "Azure"},
-    }
-    app.conf.beat_schedule["check-report-updates-azure"] = CHECK_REPORT_UPDATES_DEF_AZURE
-
-    REPORT_DOWNLOAD_SCHEDULE_OCI = ENVIRONMENT.get_value("REPORT_DOWNLOAD_SCHEDULE_OCI", default=download_expression)
-    REPORT_DOWNLOAD_SCHEDULE_OCI = validate_cron_expression(REPORT_DOWNLOAD_SCHEDULE_OCI)
-    report_schedule_oci = crontab(*REPORT_DOWNLOAD_SCHEDULE_OCI.split(" ", 5))
-    CHECK_REPORT_UPDATES_DEF_OCI = {
-        "task": download_task,
-        "schedule": report_schedule_oci,
-        "kwargs": {"provider_type": "OCI"},
-    }
-    app.conf.beat_schedule["check-report-updates-oci"] = CHECK_REPORT_UPDATES_DEF_OCI
+    app.conf.beat_schedule["check-report-updates-batched"] = CHECK_REPORT_UPDATES_DEF
 
 # Specify the day of the month for removal of expired report data.
 REMOVE_EXPIRED_REPORT_DATA_ON_DAY = ENVIRONMENT.int("REMOVE_EXPIRED_REPORT_DATA_ON_DAY", default=1)
@@ -203,8 +179,10 @@ app.conf.beat_schedule["delete_source_beat"] = {
 }
 
 # Specify the frequency for pushing source status.
-SOURCE_STATUS_FREQUENCY_MINUTES = ENVIRONMENT.get_value("SOURCE_STATUS_FREQUENCY_MINUTES", default="30")
-source_status_schedule = crontab(minute=f"*/{SOURCE_STATUS_FREQUENCY_MINUTES}")
+status_fallback = validate_cron_expression("0 3 * * *")
+status_expression = ENVIRONMENT.get_value("SOURCE_STATUS_SCHEDULE", default=status_fallback)
+SOURCE_STATUS_SCHEDULE = validate_cron_expression(status_expression, status_fallback)
+source_status_schedule = crontab(*SOURCE_STATUS_SCHEDULE.split(" ", 5))
 
 # task to push source status`
 app.conf.beat_schedule["source_status_beat"] = {
@@ -212,8 +190,11 @@ app.conf.beat_schedule["source_status_beat"] = {
     "schedule": source_status_schedule,
 }
 
-# Collect prometheus metrics.
-app.conf.beat_schedule["db_metrics"] = {"task": "koku.metrics.collect_metrics", "schedule": crontab(hour=1, minute=0)}
+# Beat used to collect Azure disk capacities
+app.conf.beat_schedule["scrape_azure_storage_capacities"] = {
+    "task": "masu.celery.tasks.scrape_azure_storage_capacities",
+    "schedule": crontab(hour=2, minute=0),
+}
 
 
 # Beat used to crawl the account hierarchy
@@ -233,6 +214,15 @@ app.conf.beat_schedule["finalize_hcs_reports"] = {
     "task": "hcs.tasks.collect_hcs_report_finalization",
     "schedule": crontab(0, 0, day_of_month="15"),
 }
+
+# Specify the frequency for checking delayed summary tasks
+DELAYED_TASK_POLLING_MINUTES = ENVIRONMENT.get_value("DELAYED_TASK_POLLING_MINUTES", default="30")
+trigger_delayed_tasks_schedule = crontab(minute=f"*/{DELAYED_TASK_POLLING_MINUTES}")
+app.conf.beat_schedule["delayed_tasks_trigger"] = {
+    "task": "masu.celery.tasks.trigger_delayed_tasks",
+    "schedule": trigger_delayed_tasks_schedule,
+}
+
 
 # Celery timeout if broker is unavailable to avoid blocking indefinitely
 app.conf.broker_transport_options = {"max_retries": 4, "interval_start": 0, "interval_step": 0.5, "interval_max": 3}
@@ -255,8 +245,9 @@ if "scheduler" in hostname:
 @celeryd_after_setup.connect
 def wait_for_migrations(sender, instance, **kwargs):  # pragma: no cover
     """Wait for migrations to complete before completing worker startup."""
-    from .database import check_migrations
     from masu.celery.tasks import collect_queue_metrics
+
+    from .database import check_migrations
 
     httpd = start_probe_server(WorkerProbeServer)
 
@@ -268,6 +259,13 @@ def wait_for_migrations(sender, instance, **kwargs):  # pragma: no cover
 
     httpd.RequestHandlerClass.ready = True  # Set `ready` to true to indicate migrations are done.
     httpd.RequestHandlerClass._collector = collect_queue_metrics
+
+    if ENVIRONMENT.bool("DEBUG_ATTACH", default=False):
+        import debugpy
+
+        debugpy.listen(("0.0.0.0", 5678))
+        print("Waiting for debugger attach on port 5678")
+        debugpy.wait_for_client()
 
 
 @worker_process_init.connect

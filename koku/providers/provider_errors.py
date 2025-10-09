@@ -16,6 +16,7 @@ class ProviderErrors:
     INVALID_SOURCE_TYPE = "source_type"
     DUPLICATE_AUTH = "source.duplicate"
     BILLING_SOURCE = "billing_source"
+    PROVIDER_NOT_FOUND = "source.provider"
 
     AWS_NO_REPORT_FOUND = "authentication.role_arn.noreportfound"
     AWS_REPORT_CONFIG = "aws.report.configuration"
@@ -37,12 +38,6 @@ class ProviderErrors:
     GCP_INCORRECT_IAM_PERMISSIONS = "gcp.iam.permissions"
     GCP_BUCKET_MISSING = "gcp.billing_source.bucket.missing"
     GCP_REPORT_NOT_FOUND = "billing_source.bucket.noreportfound"
-
-    OCI_NO_REPORT_FOUND = "billing_source.bucket.noreportfound"
-    OCI_REGION_NOT_SUPPORTED = "billing_source.bucket_region.notsupported"
-    OCI_BUCKET_MISSING = "billing_source.bucket.missing"
-    OCI_BUCKET_NAMESPACE_MISSING = "billing_source.bucket_namespace.missing"
-    OCI_BUCKET_REGION_MISSING = "billing_source.bucket_region.missing"
 
     # MESSAGES
     INVALID_SOURCE_TYPE_MESSAGE = "The given source type is not supported."
@@ -96,43 +91,4 @@ class ProviderErrors:
         "Cost management requires a resource group,  storage account"
         " and subscription ID or scope with export name. "
         "Edit your Azure source to include these details."
-    )
-    AZURE_EXPIRED_CLIENT_SECRET_KEYS_MESSAGE = (
-        "The provided client secret keys for this source are expired. "
-        "In Azure, refresh your client secret and try again."
-    )
-    AZURE_INCORRECT_CLIENT_SECRET_MESSAGE = (
-        "A problem has been detected with the Azure client secret for this source. "
-        "Refer to the Microsoft Azure troubleshooting guide in the cost management documentation for details."
-    )
-    AZURE_INCORRECT_CLIENT_ID_MESSAGE = (
-        "The client ID was entered incorrectly for this source. Edit your Azure source and verify the client ID."
-    )
-    AZURE_INCORRECT_TENANT_ID_MESSAGE = (
-        "The tenant ID was entered incorrectly for this source. Edit your Azure source and verify the tenant ID."
-    )
-    AZURE_INCORRECT_RESOURCE_GROUP_MESSAGE = (
-        "The resource group was entered incorrectly for this source. "
-        "Edit your Azure source and verify the resource group."
-    )
-    AZURE_INCORRECT_STORAGE_ACCOUNT_MESSAGE = (
-        "The storage account was entered incorrectly for this source. "
-        "Edit your Azure source and verify the storage account."
-    )
-    AZURE_INCORRECT_SUBSCRIPTION_ID_MESSAGE = (
-        "The subscription ID was entered incorrectly for this source. "
-        "Edit your Azure source and verify the subscription ID."
-    )
-    AZURE_GENERAL_CLIENT_ERROR_MESSAGE = "Azure client configuration error."
-    OCI_BUCKET_MISSING_MESSAGE = (
-        "Cost management requires an OCI bucket to store cost and usage reports. "
-        "Edit your OCI source to include the name of your OCI bucket."
-    )
-    OCI_BUCKET_NAMESPACE_MISSING_MESSAGE = (
-        "Cost management requires the namespace for the OCI bucket storing cost and usage reports. "
-        "Edit your OCI source to include the namespace of your OCI bucket."
-    )
-    OCI_BUCKET_REGION_MISSING_MESSAGE = (
-        "Cost management requires the region for the OCI bucket storing cost and usage reports. "
-        "Edit your OCI source to include the region of your OCI bucket."
     )

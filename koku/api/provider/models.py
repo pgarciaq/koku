@@ -4,6 +4,9 @@
 #
 """Models for provider management."""
 import logging
+import math
+from datetime import datetime
+from datetime import timedelta
 from uuid import uuid4
 
 from django.conf import settings
@@ -13,13 +16,21 @@ from django.db import models
 from django.db import router
 from django.db import transaction
 from django.db.models import JSONField
+from django.db.models.query import QuerySet
 from django.db.models.signals import post_delete
+from django.utils import timezone
 from django_tenants.utils import schema_context
 
 from api.model_utils import RunTextFieldValidators
 from koku.database import get_model
 
 LOG = logging.getLogger(__name__)
+
+
+def check_provider_setup_complete(provider_uuid):
+    """Return setup complete or None if Provider does not exist."""
+    if p := Provider.objects.filter(uuid=provider_uuid).first():
+        return p.setup_complete
 
 
 class ProviderAuthentication(models.Model):
@@ -44,6 +55,52 @@ class ProviderBillingSource(models.Model):
     data_source = JSONField(null=False, default=dict)
 
 
+class ProviderObjectsManager(models.Manager):
+    """Default manager for Provider model."""
+
+    def get_queryset(self) -> QuerySet:
+        """
+        Override the default queryset to select the authentication, billing_source, and customer fields.
+
+        This override gives us access to these other fields without needing extra db queries. This make
+        the `account` property of the Provider table a single db query instead of one for each foreign key
+        lookup. This class should be used as a base class for any new managers created for the Provider model.
+        """
+        return super().get_queryset().select_related("authentication", "billing_source", "customer")
+
+    def get_accounts(self):
+        """Return a list of all accounts."""
+        return [p.account for p in self.all()]
+
+
+class ProviderObjectsPollingManager(ProviderObjectsManager):
+    """
+    Manager for pollable Providers.
+
+    Pollable Providers are all Providers that are not OCP.
+    """
+
+    def get_queryset(self):
+        """Return a Queryset of non-OCP and active and non-paused Providers."""
+        return super().get_queryset().filter(active=True, paused=False).exclude(type=Provider.PROVIDER_OCP)
+
+    def get_polling_batch(self, filters=None):
+        """Return a Queryset of pollable Providers that have not polled in the last 24 hours."""
+        polling_delta = datetime.now(tz=settings.UTC) - timedelta(seconds=settings.POLLING_TIMER)
+        if not filters:
+            filters = {}
+        # Dynamically set batch limit (divide count by 21 (default) hours so we always trigger a few extra + round up)
+        batch_limit = math.ceil(len(self.filter(**filters)) / settings.POLLING_COUNT)
+        if batch_limit <= 1:
+            # If we have less than 21 providers we should collect them all
+            return self.filter(**filters).exclude(polling_timestamp__gt=polling_delta).order_by("polling_timestamp")
+        return (
+            self.filter(**filters)
+            .exclude(polling_timestamp__gt=polling_delta)
+            .order_by("polling_timestamp")[:batch_limit]
+        )
+
+
 class Provider(models.Model):
     """A Koku Provider.
 
@@ -60,14 +117,10 @@ class Provider(models.Model):
     PROVIDER_OCP = "OCP"
     PROVIDER_AZURE = "Azure"
     PROVIDER_GCP = "GCP"
-    PROVIDER_IBM = "IBM"
-    PROVIDER_OCI = "OCI"
     # Local Providers are for local development and testing
     PROVIDER_AWS_LOCAL = "AWS-local"
     PROVIDER_AZURE_LOCAL = "Azure-local"
     PROVIDER_GCP_LOCAL = "GCP-local"
-    PROVIDER_IBM_LOCAL = "IBM-local"
-    PROVIDER_OCI_LOCAL = "OCI-local"
     # The following constants are not provider types
     OCP_ALL = "OCP_All"
     OCP_AWS = "OCP_AWS"
@@ -79,13 +132,9 @@ class Provider(models.Model):
         "ocp": PROVIDER_OCP,
         "azure": PROVIDER_AZURE,
         "gcp": PROVIDER_GCP,
-        "ibm": PROVIDER_IBM,
-        "oci": PROVIDER_OCI,
         "aws-local": PROVIDER_AWS_LOCAL,
         "azure-local": PROVIDER_AZURE_LOCAL,
         "gcp-local": PROVIDER_GCP_LOCAL,
-        "ibm-local": PROVIDER_IBM_LOCAL,
-        "oci-local": PROVIDER_OCI_LOCAL,
         "ocp-aws": OCP_AWS,
         "ocp-azure": OCP_AZURE,
     }
@@ -95,25 +144,17 @@ class Provider(models.Model):
         (PROVIDER_OCP, PROVIDER_OCP),
         (PROVIDER_AZURE, PROVIDER_AZURE),
         (PROVIDER_GCP, PROVIDER_GCP),
-        (PROVIDER_IBM, PROVIDER_IBM),
-        (PROVIDER_OCI, PROVIDER_OCI),
         (PROVIDER_AWS_LOCAL, PROVIDER_AWS_LOCAL),
         (PROVIDER_AZURE_LOCAL, PROVIDER_AZURE_LOCAL),
         (PROVIDER_GCP_LOCAL, PROVIDER_GCP_LOCAL),
-        (PROVIDER_IBM_LOCAL, PROVIDER_IBM_LOCAL),
-        (PROVIDER_OCI_LOCAL, PROVIDER_OCI_LOCAL),
     )
     CLOUD_PROVIDER_CHOICES = (
         (PROVIDER_AWS, PROVIDER_AWS),
         (PROVIDER_AZURE, PROVIDER_AZURE),
         (PROVIDER_GCP, PROVIDER_GCP),
-        (PROVIDER_IBM, PROVIDER_IBM),
-        (PROVIDER_OCI, PROVIDER_OCI),
         (PROVIDER_AWS_LOCAL, PROVIDER_AWS_LOCAL),
         (PROVIDER_AZURE_LOCAL, PROVIDER_AZURE_LOCAL),
         (PROVIDER_GCP_LOCAL, PROVIDER_GCP_LOCAL),
-        (PROVIDER_IBM_LOCAL, PROVIDER_IBM_LOCAL),
-        (PROVIDER_OCI_LOCAL, PROVIDER_OCI_LOCAL),
     )
 
     # These lists are intended for use for provider type checking
@@ -121,6 +162,14 @@ class Provider(models.Model):
     PROVIDER_LIST = [choice[0] for choice in PROVIDER_CHOICES]
     CLOUD_PROVIDER_LIST = [choice[0] for choice in CLOUD_PROVIDER_CHOICES]
     OPENSHIFT_ON_CLOUD_PROVIDER_LIST = [
+        PROVIDER_AWS,
+        PROVIDER_AWS_LOCAL,
+        PROVIDER_AZURE,
+        PROVIDER_AZURE_LOCAL,
+        PROVIDER_GCP,
+        PROVIDER_GCP_LOCAL,
+    ]
+    MANAGED_OPENSHIFT_ON_CLOUD_PROVIDER_LIST = [
         PROVIDER_AWS,
         PROVIDER_AWS_LOCAL,
         PROVIDER_AZURE,
@@ -139,6 +188,7 @@ class Provider(models.Model):
     setup_complete = models.BooleanField(default=False)
 
     created_timestamp = models.DateTimeField(auto_now_add=True, blank=True, null=True)
+    polling_timestamp = models.DateTimeField(blank=True, null=True, default=None)
 
     # We update the record on the provider when we update data.
     # This helps capture events like the updates following a cost model
@@ -153,6 +203,23 @@ class Provider(models.Model):
     # which (if any) cloud provider the cluster is on
     infrastructure = models.ForeignKey("ProviderInfrastructureMap", null=True, on_delete=models.SET_NULL)
     additional_context = JSONField(null=True, default=dict)
+
+    objects = ProviderObjectsManager()
+    polling_objects = ProviderObjectsPollingManager()
+
+    @property
+    def account(self) -> dict:
+        """Return account information in dictionary."""
+        return {
+            "customer_name": getattr(self.customer, "schema_name", None),
+            "credentials": getattr(self.authentication, "credentials", None),
+            "data_source": getattr(self.billing_source, "data_source", None),
+            "provider_type": self.type,
+            "schema_name": getattr(self.customer, "schema_name", None),
+            "account_id": getattr(self.customer, "account_id", None),
+            "org_id": getattr(self.customer, "org_id", None),
+            "provider_uuid": self.uuid,
+        }
 
     def save(self, *args, **kwargs):
         """Save instance and start data ingest task for active Provider."""
@@ -179,6 +246,9 @@ class Provider(models.Model):
         super().save(*args, **kwargs)
 
         if settings.AUTO_DATA_INGEST and should_ingest and self.active:
+            if self.type == Provider.PROVIDER_OCP:
+                # OCP Providers are not pollable, so shouldn't go thru check_report_updates
+                return
             # Local import of task function to avoid potential import cycle.
             from masu.celery.tasks import check_report_updates
 
@@ -194,6 +264,26 @@ class Provider(models.Model):
                 .set(queue="priority")
                 .apply_async()
             )
+
+    def set_additional_context(self, context):
+        """Set the `additional_context` field to the provided context."""
+        self.additional_context = context
+        self.save(update_fields=["additional_context"])
+
+    def set_data_updated_timestamp(self):
+        """Set the data updated timestamp to the current time."""
+        self.data_updated_timestamp = timezone.now()
+        self.save(update_fields=["data_updated_timestamp"])
+
+    def set_infrastructure(self, infra):
+        """Set the infrastructure."""
+        self.infrastructure = infra
+        self.save(update_fields=["infrastructure"])
+
+    def set_setup_complete(self):
+        """Set setup_complete to True."""
+        self.setup_complete = True
+        self.save(update_fields=["setup_complete"])
 
     def delete(self, *args, **kwargs):
         if self.customer:
@@ -322,6 +412,7 @@ select ftn.nspname as "table_schema",
          ft.relname ~ %(rpt_common_fregex)s or
          ft.relname ~ %(rpt_ingress_fregex)s or
          ft.relname ~ %(rpt_provider_fregex)s or
+         ft.relname ~ %(rpt_subs_fregex)s or
          ft.relname ~ %(api_fregex)s
        )
  order
@@ -346,6 +437,7 @@ select ftn.nspname as "table_schema",
                 "rpt_common_fregex": "^reporting_common_",
                 "rpt_ingress_fregex": "^reporting_ingressreports",
                 "rpt_provider_fregex": "^reporting_tenant_api_provider",
+                "rpt_subs_fregex": "^reporting_subs",
                 "api_fregex": "^api_",
                 "tenant_provider_sregex": "^reporting_tenant_api_provider",
                 "tenant_provider_sval": 1,
@@ -380,6 +472,7 @@ delete
 ;
 """
         with transaction.get_connection().cursor() as cur:
+            LOG.info(f"Attempting to delete records from {qual_table_name}")
             cur.execute(_sql, (target_values,))
             LOG.info(f"Deleted {cur.rowcount} records from {qual_table_name}")
 
@@ -471,6 +564,9 @@ class ProviderInfrastructureMap(models.Model):
     Used to determine which underlying instrastructure and
     associated provider the cluster is installed on.
     """
+
+    class Meta:
+        unique_together = ("infrastructure_type", "infrastructure_provider")
 
     infrastructure_type = models.CharField(max_length=50, choices=Provider.CLOUD_PROVIDER_CHOICES, blank=False)
     infrastructure_provider = models.ForeignKey("Provider", on_delete=models.CASCADE)

@@ -6,6 +6,9 @@
 import logging
 from uuid import UUID
 
+from django.conf import settings
+from rest_framework.serializers import ValidationError
+
 from api.common import log_json
 from koku.feature_flags import fallback_development_true
 from koku.feature_flags import UNLEASH_CLIENT
@@ -13,10 +16,21 @@ from masu.external import GZIP_COMPRESSED
 from masu.external import UNCOMPRESSED
 from masu.util.common import convert_account
 
-
 LOG = logging.getLogger(__name__)
 
 ALLOWED_COMPRESSIONS = (UNCOMPRESSED, GZIP_COMPRESSED)
+
+GCP_UNATTRIBUTED_STORAGE_UNLEASH_FLAG = "cost-management.backend.unattributed_storage_gcp"
+
+
+def is_feature_flag_enabled_by_account(account, feature_flag, dev_fallback=False):  # pragma: no cover
+    """Generic method for checking if a feature flag is enabled."""
+    account = convert_account(account)
+    context = {"schema": account}
+    if dev_fallback:
+        return UNLEASH_CLIENT.is_enabled(feature_flag, context, fallback_development_true)
+    else:
+        return UNLEASH_CLIENT.is_enabled(feature_flag, context)
 
 
 def is_purge_trino_files_enabled(account):  # pragma: no cover
@@ -60,28 +74,6 @@ def is_ocp_on_cloud_summary_disabled(account):  # pragma: no cover
     return res
 
 
-def is_gcp_resource_matching_disabled(account):  # pragma: no cover
-    """Disable GCP resource matching for OCP on GCP."""
-    account = convert_account(account)
-    context = {"schema": account}
-    res = UNLEASH_CLIENT.is_enabled("cost-management.backend.disable-gcp-resource-matching", context)
-    if res:
-        LOG.info(log_json(msg="GCP resource matching is disabled", context=context))
-
-    return res
-
-
-def is_summarize_ocp_on_gcp_by_node_enabled(account):  # pragma: no cover
-    """This flag is a temporary stop gap to summarize large ocp on gcp customers by node."""
-    account = convert_account(account)
-    context = {"schema": account}
-    res = UNLEASH_CLIENT.is_enabled("cost-management.backend.summarize-ocp-on-gcp-by-node", context)
-    if res:
-        LOG.info(log_json(msg="OCP on GCP summarize by node is enabled", context=context))
-
-    return res
-
-
 def is_customer_large(account):  # pragma: no cover
     """Flag the customer as large."""
     account = convert_account(account)
@@ -89,29 +81,25 @@ def is_customer_large(account):  # pragma: no cover
     return UNLEASH_CLIENT.is_enabled("cost-management.backend.large-customer", context)
 
 
-def is_ocp_savings_plan_cost_enabled(account):  # pragma: no cover
-    """Enable the use of savings plan cost for OCP on AWS -> OCP."""
+def is_customer_penalty(account):  # pragma: no cover
+    """Flag the customer as penalised."""
     account = convert_account(account)
     context = {"schema": account}
-    return UNLEASH_CLIENT.is_enabled(
-        "cost-management.backend.enable-ocp-savings-plan-cost", context, fallback_development_true
-    )
+    return UNLEASH_CLIENT.is_enabled("cost-management.backend.penalty-customer", context)
 
 
-def is_ocp_amortized_monthly_cost_enabled(account):  # pragma: no cover
-    """Enable the use of savings plan cost for OCP on AWS -> OCP."""
+def is_rate_limit_customer_large(account):  # pragma: no cover
+    """Flag the customer as large and to be rate limited."""
     account = convert_account(account)
     context = {"schema": account}
-    return UNLEASH_CLIENT.is_enabled("cost-management.backend.enable-ocp-amortized-monthly-cost", context)
+    return UNLEASH_CLIENT.is_enabled("cost-management.backend.large-customer.rate-limit", context)
 
 
-def is_aws_category_settings_enabled(account):  # pragma: no cover
-    """Enable aws category settings."""
+def is_validation_enabled(account):  # pragma: no cover
+    """Flag if customer is enabled to run validation."""
     account = convert_account(account)
     context = {"schema": account}
-    return UNLEASH_CLIENT.is_enabled(
-        "cost-management.backend.enable_aws_category_settings", context, fallback_development_true
-    )
+    return UNLEASH_CLIENT.is_enabled("cost-management.backend.enable_data_validation", context)
 
 
 def is_source_disabled(source_uuid):  # pragma: no cover
@@ -136,3 +124,58 @@ def is_ingress_rate_limiting_disabled():  # pragma: no cover
     if res:
         LOG.info(log_json(msg="ingress rate limiting disabled"))
     return res
+
+
+def check_group_by_limit(account, group_by_length):
+    """
+    Checks to see if the customer has exceeded the group by limit.
+
+    Raises a ValidationError if they have exceeded or returns false
+    """
+    limit = 2  # default
+    if group_by_length <= limit:
+        return
+    account = convert_account(account)
+    context = {"schema": account}
+    if UNLEASH_CLIENT.is_enabled("cost-management.backend.override_customer_group_by_limit", context):
+        limit = settings.MAX_GROUP_BY
+        if group_by_length <= limit:
+            return
+    raise ValidationError({"group_by": (f"Cost Management supports a max of {limit} group_by options.")})
+
+
+def is_feature_cost_4403_ec2_compute_cost_enabled(account):  # pragma: no cover
+    """Should EC2 individual VM compute cost be enabled."""
+    unleash_flag = "cost-management.backend.feature-4403-enable-ec2-compute-processing"
+    account = convert_account(account)
+    context = {"schema": account}
+    return UNLEASH_CLIENT.is_enabled(unleash_flag, context, fallback_development_true)
+
+
+def is_feature_cost_20_openshift_vms_enabled(account):  # pragma: no cover
+    """Should Openshift vms cost be enabled."""
+    unleash_flag = "cost-management.backend.feature_cost_20_openshift_vms"
+    account = convert_account(account)
+    context = {"schema": account}
+    return UNLEASH_CLIENT.is_enabled(unleash_flag, context, fallback_development_true)
+
+
+def is_customer_cost_model_large(account):  # pragma: no cover
+    """Flag the customer as having a large amount of data for cost model updates."""
+    account = convert_account(account)
+    context = {"schema": account}
+    return UNLEASH_CLIENT.is_enabled("cost-management.backend.large-customer-cost-model", context)
+
+
+def is_tag_processing_disabled(account):  # pragma: no cover
+    """Flag the customer as tag processing disabled."""
+    account = convert_account(account)
+    context = {"schema": account}
+    return UNLEASH_CLIENT.is_enabled("cost-management.backend.is_tag_processing_disabled", context)
+
+
+def is_status_api_update_enabled(account):  # pragma: no cover
+    """Flag to enable the new source status retrieval method."""
+    account = convert_account(account)
+    context = {"schema": account}
+    return UNLEASH_CLIENT.is_enabled("cost-management.backend.is_status_api_update_enabled", context)

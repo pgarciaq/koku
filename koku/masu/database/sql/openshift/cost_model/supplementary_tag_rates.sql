@@ -18,6 +18,7 @@ INSERT INTO {{schema | sqlsafe}}.reporting_ocpusagelineitem_daily_summary (
     cost_model_volume_cost,
     cost_model_rate_type,
     {{labels_field | sqlsafe}},
+    all_labels,
     monthly_cost_type,
     cost_category_id
 )
@@ -52,6 +53,7 @@ SELECT uuid_generate_v4() as uuid,
     END as cost_model_volume_cost,
     'Supplementary' as cost_model_rate_type,
     {{k_v_pair}}::jsonb as {{labels_field | sqlsafe}},
+    {{k_v_pair}}::jsonb as all_labels,
     'Tag' as monthly_cost_type, -- We are borrowing the monthly field here, although this is a daily usage cost
     cost_category_id
 FROM (
@@ -83,6 +85,10 @@ FROM (
         AND lids.cluster_id = {{cluster_id}}
         AND lids.usage_start >= {{start_date}}
         AND lids.usage_start <= {{end_date}}
+        AND (
+            lids.cost_model_rate_type IS NULL
+            OR lids.cost_model_rate_type NOT IN ('Infrastructure', 'Supplementary')
+        )
     GROUP BY lids.report_period_id,
         lids.cluster_id,
         lids.cluster_alias,

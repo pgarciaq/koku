@@ -15,6 +15,7 @@ from functools import reduce
 import numpy as np
 import statsmodels.api as sm
 from django.conf import settings
+from django.core.exceptions import FieldDoesNotExist
 from django.db.models import Case
 from django.db.models import CharField
 from django.db.models import DecimalField
@@ -39,14 +40,12 @@ from api.report.azure.openshift.provider_map import OCPAzureProviderMap
 from api.report.azure.provider_map import AzureProviderMap
 from api.report.gcp.openshift.provider_map import OCPGCPProviderMap
 from api.report.gcp.provider_map import GCPProviderMap
-from api.report.oci.provider_map import OCIProviderMap
 from api.report.ocp.provider_map import OCPProviderMap
 from api.utils import DateHelper
 from api.utils import get_cost_type
 from cost_models.models import CostModel
 from cost_models.models import CostModelMap
 from reporting.provider.aws.models import AWSOrganizationalUnit
-
 
 LOG = logging.getLogger(__name__)
 COST_FIELD_NAMES = ["total_cost", "infrastructure_cost", "supplementary_cost"]
@@ -123,8 +122,10 @@ class Forecast:
     def provider_map(self):
         """Return the provider map instance."""
         if self.provider in (Provider.PROVIDER_AWS, Provider.OCP_AWS):
-            return self.provider_map_class(self.provider, self.REPORT_TYPE, self.cost_type)
-        return self.provider_map_class(self.provider, self.REPORT_TYPE)
+            return self.provider_map_class(
+                self.provider, self.REPORT_TYPE, self.params.tenant.schema_name, self.cost_type
+            )
+        return self.provider_map_class(self.provider, self.REPORT_TYPE, self.params.tenant.schema_name)
 
     @property
     def cost_units(self):
@@ -267,7 +268,7 @@ class Forecast:
         days = self.dh.list_days(
             datetime.combine(date_list[0], self.dh.midnight), datetime.combine(date_list[-1], self.dh.midnight)
         )
-        out = [i for i, day in enumerate(days) if day.date() in date_list]
+        out = [i for i, day in enumerate(days) if day in date_list]
         return out
 
     def _remove_outliers(self, data):
@@ -430,14 +431,16 @@ class Forecast:
         returns:
             None
         """
-        if isinstance(filt, list):
-            for _filt in filt:
-                _filt["operation"] = "in"
-                q_filter = QueryFilter(parameter=access, **_filt)
-                filters.add(q_filter)
-        else:
-            filt["operation"] = "in"
-            q_filter = QueryFilter(parameter=access, **filt)
+        if not isinstance(filt, list):
+            filt = [filt]
+        for _filt in filt:
+            check_field_type = None
+            try:
+                check_field_type = self.cost_summary_table._meta.get_field(_filt["field"]).get_internal_type()
+            except FieldDoesNotExist:
+                pass
+            _filt["operation"] = "contains" if check_field_type == "ArrayField" else "in"
+            q_filter = QueryFilter(parameter=access, **_filt)
             filters.add(q_filter)
 
 
@@ -659,10 +662,3 @@ class GCPForecast(Forecast):
 
     provider = Provider.PROVIDER_GCP
     provider_map_class = GCPProviderMap
-
-
-class OCIForecast(Forecast):
-    """OCI forecasting class."""
-
-    provider = Provider.PROVIDER_OCI
-    provider_map_class = OCIProviderMap

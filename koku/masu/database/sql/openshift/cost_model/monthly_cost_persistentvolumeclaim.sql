@@ -1,12 +1,3 @@
-DELETE FROM {{schema | sqlsafe}}.reporting_ocpusagelineitem_daily_summary AS lids
-WHERE lids.usage_start >= {{start_date}}::date
-    AND lids.usage_start <= {{end_date}}::date
-    AND lids.report_period_id = {{report_period_id}}
-    AND lids.cost_model_rate_type = {{rate_type}}
-    AND lids.monthly_cost_type = 'PVC'
-;
-
-
 INSERT INTO {{schema | sqlsafe}}.reporting_ocpusagelineitem_daily_summary (
     uuid,
     report_period_id,
@@ -37,6 +28,7 @@ INSERT INTO {{schema | sqlsafe}}.reporting_ocpusagelineitem_daily_summary (
     persistentvolume,
     storageclass,
     volume_labels,
+    all_labels,
     persistentvolumeclaim_capacity_gigabyte,
     persistentvolumeclaim_capacity_gigabyte_months,
     volume_request_storage_gigabyte_months,
@@ -90,6 +82,7 @@ SELECT uuid_generate_v4(),
     lids.persistentvolume,
     max(lids.storageclass) as storageclass,
     lids.volume_labels,
+    lids.volume_labels as all_labels,
     NULL as persistentvolumeclaim_capacity_gigabyte,
     NULL as persistentvolumeclaim_capacity_gigabyte_months,
     NULL as volume_request_storage_gigabyte_months,
@@ -116,6 +109,10 @@ WHERE lids.usage_start >= {{start_date}}::date
     AND lids.persistentvolumeclaim IS NOT NULL
     AND lids.data_source = 'Storage'
     AND monthly_cost_type IS NULL
+    AND (
+        lids.cost_model_rate_type IS NULL
+        OR lids.cost_model_rate_type NOT IN ('Infrastructure', 'Supplementary')
+    )
     AND persistentvolumeclaim_capacity_gigabyte_months IS NOT NULL
     AND persistentvolumeclaim_capacity_gigabyte_months != 0
 GROUP BY lids.usage_start, lids.source_uuid, lids.cluster_id, lids.node, lids.namespace, lids.persistentvolumeclaim, lids.persistentvolume, lids.volume_labels, vc.pvc_count, lids.cost_category_id

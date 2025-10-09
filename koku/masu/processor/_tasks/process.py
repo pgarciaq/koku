@@ -4,16 +4,21 @@
 #
 """Asynchronous tasks."""
 import logging
+from pathlib import Path
 
 import psutil
 
 from api.common import log_json
-from masu.database.provider_db_accessor import ProviderDBAccessor
+from api.provider.models import Provider
 from masu.database.report_manifest_db_accessor import ReportManifestDBAccessor
-from masu.database.report_stats_db_accessor import ReportStatsDBAccessor
+from masu.processor.parquet.parquet_report_processor import ParquetReportProcessorError
 from masu.processor.report_processor import ReportProcessor
 from masu.processor.report_processor import ReportProcessorDBError
 from masu.processor.report_processor import ReportProcessorError
+from reporting_common.models import CombinedChoices
+from reporting_common.models import CostUsageReportStatus
+from reporting_common.states import ManifestState
+from reporting_common.states import ManifestStep
 
 LOG = logging.getLogger(__name__)
 
@@ -31,7 +36,6 @@ def _process_report_file(schema_name, provider, report_dict, ingress_reports=Non
         None
 
     """
-    start_date = report_dict.get("start_date")
     report_path = report_dict.get("file")
     compression = report_dict.get("compression")
     manifest_id = report_dict.get("manifest_id")
@@ -41,19 +45,20 @@ def _process_report_file(schema_name, provider, report_dict, ingress_reports=Non
         "schema": schema_name,
         "provider_type": provider,
         "provider_uuid": provider_uuid,
-        "start_date": start_date,
         "compression": compression,
         "file": report_path,
+        "ocp_files_to_process": report_dict.get("ocp_files_to_process"),
     }
     LOG.info(log_json(tracing_id, msg="processing report", context=context))
     mem = psutil.virtual_memory()
     mem_msg = f"Avaiable memory: {mem.free} bytes ({mem.percent}%)"
     LOG.debug(log_json(tracing_id, msg=mem_msg, context=context))
 
-    file_name = report_path.split("/")[-1]
-    with ReportStatsDBAccessor(file_name, manifest_id) as stats_recorder:
-        stats_recorder.log_last_started_datetime()
-
+    file_name = Path(report_path).name
+    report_status = CostUsageReportStatus.objects.get(report_name=file_name, manifest_id=manifest_id)
+    report_status.update_status(CombinedChoices.PROCESSING)
+    report_status.set_started_datetime()
+    ReportManifestDBAccessor().update_manifest_state(ManifestStep.PROCESSING, ManifestState.START, manifest_id)
     try:
         processor = ReportProcessor(
             schema_name=schema_name,
@@ -68,30 +73,22 @@ def _process_report_file(schema_name, provider, report_dict, ingress_reports=Non
         )
 
         result = processor.process()
-    except (ReportProcessorError, ReportProcessorDBError) as processing_error:
-        with ReportStatsDBAccessor(file_name, manifest_id) as stats_recorder:
-            stats_recorder.clear_last_started_datetime()
+    except (ReportProcessorError, ParquetReportProcessorError, ReportProcessorDBError) as processing_error:
+        report_status.clear_started_datetime()
+        report_status.update_status(CombinedChoices.FAILED)
+        ReportManifestDBAccessor().update_manifest_state(ManifestStep.PROCESSING, ManifestState.FAILED, manifest_id)
         raise processing_error
     except NotImplementedError as err:
-        with ReportStatsDBAccessor(file_name, manifest_id) as stats_recorder:
-            stats_recorder.log_last_completed_datetime()
+        report_status.set_completed_datetime()
+        report_status.update_status(CombinedChoices.FAILED)
+        ReportManifestDBAccessor().update_manifest_state(ManifestStep.PROCESSING, ManifestState.FAILED, manifest_id)
         raise err
 
-    with ReportStatsDBAccessor(file_name, manifest_id) as stats_recorder:
-        stats_recorder.log_last_completed_datetime()
+    report_status.set_completed_datetime()
 
-    with ReportManifestDBAccessor() as manifest_accesor:
-        manifest = manifest_accesor.get_manifest_by_id(manifest_id)
-        if manifest:
-            manifest_accesor.mark_manifest_as_updated(manifest)
-        else:
-            LOG.error(
-                log_json(
-                    tracing_id, msg=f"Unable to find manifest for ID: {manifest_id}, file {file_name}", context=context
-                )
-            )
+    p = Provider.objects.get(uuid=provider_uuid)
+    p.set_setup_complete()
 
-    with ProviderDBAccessor(provider_uuid=provider_uuid) as provider_accessor:
-        provider_accessor.setup_complete()
-
+    report_status.update_status(CombinedChoices.DONE)
+    ReportManifestDBAccessor().update_manifest_state(ManifestStep.PROCESSING, ManifestState.END, manifest_id)
     return result

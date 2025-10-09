@@ -558,6 +558,9 @@ class OCPAWSCostLineItemProjectDailySummaryP(models.Model):
     cost_entry_bill = models.ForeignKey("AWSCostEntryBill", on_delete=models.CASCADE, null=True)
     product_code = models.TextField(null=False)
     product_family = models.CharField(max_length=150, null=True)
+    infrastructure_data_in_gigabytes = models.DecimalField(max_digits=33, decimal_places=15, null=True)
+    infrastructure_data_out_gigabytes = models.DecimalField(max_digits=33, decimal_places=15, null=True)
+    data_transfer_direction = models.TextField(null=True)
     instance_type = models.CharField(max_length=50, null=True)
     usage_account_id = models.CharField(max_length=50, null=False)
     account_alias = models.ForeignKey("AWSAccountAlias", on_delete=models.SET_NULL, null=True)
@@ -577,8 +580,6 @@ class OCPAWSCostLineItemProjectDailySummaryP(models.Model):
     markup_cost_savingsplan = models.DecimalField(max_digits=33, decimal_places=15, null=True)
     calculated_amortized_cost = models.DecimalField(max_digits=33, decimal_places=9, null=True)
     markup_cost_amortized = models.DecimalField(max_digits=33, decimal_places=9, null=True)
-    project_markup_cost = models.DecimalField(max_digits=30, decimal_places=15, null=True)
-    pod_cost = models.DecimalField(max_digits=30, decimal_places=15, null=True)  # this field is no longer used
     tags = JSONField(null=True)
     aws_cost_category = JSONField(null=True)
     source_uuid = models.UUIDField(unique=False, null=True)

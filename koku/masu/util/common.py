@@ -16,6 +16,7 @@ from tempfile import gettempdir
 from threading import RLock
 from uuid import uuid4
 
+import pandas as pd
 from dateutil import parser
 from dateutil.rrule import DAILY
 from dateutil.rrule import rrule
@@ -23,13 +24,19 @@ from django.conf import settings
 from django_tenants.utils import schema_context
 
 import koku.trino_database as trino_db
-from api.models import Provider
+from api.common import log_json
 from api.utils import DateHelper
 from masu.config import Config
-from masu.external import LISTEN_INGEST
-from masu.external import POLL_INGEST
+from masu.database.report_manifest_db_accessor import ReportManifestDBAccessor
+from reporting.provider.all.models import EnabledTagKeys
+from reporting_common.models import CostUsageReportManifest
+from reporting_common.states import ManifestStep
 
 LOG = logging.getLogger(__name__)
+
+
+class CreateDailyArchivesError(Exception):
+    """Unable to create daily archives."""
 
 
 def extract_uuids_from_string(source_string):
@@ -60,24 +67,6 @@ def stringify_json_data(data):
         return str(data)
 
     return data
-
-
-def ingest_method_for_provider(provider):
-    """Return the ingest method for provider."""
-    ingest_map = {
-        Provider.PROVIDER_AWS: POLL_INGEST,
-        Provider.PROVIDER_AWS_LOCAL: POLL_INGEST,
-        Provider.PROVIDER_AZURE: POLL_INGEST,
-        Provider.PROVIDER_AZURE_LOCAL: POLL_INGEST,
-        Provider.PROVIDER_GCP: POLL_INGEST,
-        Provider.PROVIDER_GCP_LOCAL: POLL_INGEST,
-        Provider.PROVIDER_IBM: POLL_INGEST,
-        Provider.PROVIDER_IBM_LOCAL: POLL_INGEST,
-        Provider.PROVIDER_OCI: POLL_INGEST,
-        Provider.PROVIDER_OCI_LOCAL: POLL_INGEST,
-        Provider.PROVIDER_OCP: LISTEN_INGEST,
-    }
-    return ingest_map.get(provider)
 
 
 def month_date_range_tuple(for_date_time):
@@ -324,65 +313,84 @@ def batch(iterable, start=0, stop=None, _slice=1):
         yield res
 
 
-def create_enabled_keys(schema, enabled_keys_model, enabled_keys):
+def populate_enabled_tag_rows_with_false(schema: str, tags: set[str, ...], provider_type: str) -> None:
     """
-    Creates enabled key records.
+    Creates enabled tag records always as false.
     """
-
-    if not enabled_keys:
-        LOG.info("No enabled keys found")
+    ctx = {"schema": schema, "tags": tags, "provider_type": provider_type}
+    LOG.info(log_json(msg="checking tag enabled population with false", context=ctx))
+    if not tags:
+        LOG.info(log_json(msg="skipping tag enablement no tags found", context=ctx))
         return
-    LOG.info(f"Creating enabled key records: {str(enabled_keys_model._meta.model_name)}.")
-    changed = False
 
     with schema_context(schema):
-        new_keys = list(set(enabled_keys) - {k for k in enabled_keys_model.objects.values_list("key", flat=True)})
-        if new_keys:
-            changed = True
-            # Processing in batches for increased efficiency
-            for batch_num, new_batch in enumerate(batch(new_keys, _slice=500)):
-                batch_size = len(new_batch)
-                LOG.info(f"Create batch {batch_num + 1}: batch_size {batch_size}")
-                for ix in range(batch_size):
-                    new_batch[ix] = enabled_keys_model(key=new_batch[ix])
-                enabled_keys_model.objects.bulk_create(new_batch, ignore_conflicts=True)
-    if not changed:
-        LOG.info("No enabled keys added")
+        new_tags = tags.difference(
+            k for k in EnabledTagKeys.objects.filter(provider_type=provider_type).values_list("key", flat=True)
+        )
+        if not new_tags:
+            LOG.info(log_json(msg="skipping tag enablement no new tags found", context=ctx))
+            return
+        for batch_num, new_batch in enumerate(batch(new_tags, _slice=500)):
+            batch_size = len(new_batch)
+            LOG.info(
+                log_json(
+                    msg="create tag batch with false", batch_number=(batch_num + 1), batch_size=batch_size, context=ctx
+                )
+            )
+            new_records = [EnabledTagKeys(key=key, provider_type=provider_type, enabled=False) for key in new_batch]
+            EnabledTagKeys.objects.bulk_create(new_records, ignore_conflicts=True)
 
-    return changed
 
-
-def update_enabled_keys(schema, enabled_keys_model, enabled_keys):
-    LOG.info("Updating enabled tag keys records")
-    changed = False
-
-    enabled_keys_set = set(enabled_keys)
-    update_keys_enabled = []
-    update_keys_disabled = []
+def populate_enabled_tag_rows_with_limit(schema: str, tags: set[str, ...], provider_type: str) -> None:
+    """
+    Creates enabled tag records checking limit.
+    """
+    ctx = {"schema": schema, "tags": tags, "provider_type": provider_type}
+    LOG.info(log_json(msg="checking tag enabled population with limit", context=ctx))
+    if not tags:
+        LOG.info(log_json(msg="skipping tag enablement no tags found", context=ctx))
+        return
 
     with schema_context(schema):
-        for key in enabled_keys_model.objects.all():
-            if key.key in enabled_keys_set:
-                if not key.enabled:
-                    update_keys_enabled.append(key.key)
+        new_tags = tags.difference(
+            k for k in EnabledTagKeys.objects.filter(provider_type=provider_type).values_list("key", flat=True)
+        )
+        if not new_tags:
+            LOG.info(log_json(msg="skipping tag enablement no new tags found", context=ctx))
+            return
+
+        if Config.ENABLED_TAG_LIMIT > 0:
+            # Early check if limit is enabled to grab enabled tag count once and only once
+            enabled_tag_count = EnabledTagKeys.objects.filter(enabled=True).count()
+            delta_to_limit = max((Config.ENABLED_TAG_LIMIT - enabled_tag_count), 0)
+            ctx["enabled_tag_limit"] = Config.ENABLED_TAG_LIMIT
+            ctx["delta_to_limit"] = delta_to_limit
+
+        for batch_num, new_batch in enumerate(batch(new_tags, _slice=500)):
+            batch_size = len(new_batch)
+            LOG.info(
+                log_json(
+                    msg="create tag batch with limit", batch_number=(batch_num + 1), batch_size=batch_size, context=ctx
+                )
+            )
+            if Config.ENABLED_TAG_LIMIT > 0:
+                new_records = [
+                    EnabledTagKeys(key=key, provider_type=provider_type, enabled=True)
+                    for key in new_batch[:delta_to_limit]
+                ]
+                enabled_records_count = len(new_records)
+                # disable records past our limit
+                new_records.extend(
+                    EnabledTagKeys(key=key, provider_type=provider_type, enabled=False)
+                    for key in new_batch[delta_to_limit:]
+                )
+                # update delta for next batch
+                delta_to_limit -= enabled_records_count
+                ctx["delta_to_limit"] = delta_to_limit
             else:
-                update_keys_disabled.append(key.key)
-
-        # When we are in create mode, we do not want to change the state of existing keys
-        if update_keys_enabled or update_keys_disabled:
-            changed = True
-            if update_keys_enabled:
-                LOG.info(f"Updating {len(update_keys_enabled)} keys to ENABLED")
-                enabled_keys_model.objects.filter(key__in=update_keys_enabled).update(enabled=True)
-
-            if update_keys_disabled:
-                LOG.info(f"Updating {len(update_keys_disabled)} keys to DISABLED")
-                enabled_keys_model.objects.filter(key__in=update_keys_disabled).update(enabled=False)
-
-    if not changed:
-        LOG.info("No enabled keys updated.")
-
-    return changed
+                # tag limit is disabled or default is False
+                new_records = (EnabledTagKeys(key=key, provider_type=provider_type, enabled=True) for key in new_batch)
+            EnabledTagKeys.objects.bulk_create(new_records, ignore_conflicts=True)
 
 
 def execute_trino_query(schema_name, sql, params=None):
@@ -400,7 +408,8 @@ def execute_trino_query(schema_name, sql, params=None):
 
 def trino_table_exists(schema_name, table_name):
     """Given a schema and table name, check for an existing table in Trino."""
-    LOG.info(f"Checking for Trino table {schema_name}.{table_name}")
+
+    LOG.info(log_json(msg="checking for Trino table", schema=schema_name, table=table_name))
     table_check_sql = f"SHOW TABLES LIKE '{table_name}'"
     table, _ = execute_trino_query(schema_name, table_check_sql)
     return bool(table)
@@ -441,3 +450,54 @@ class SingletonMeta(type):
                 instance = super().__call__(*args, **kwargs)
                 cls._instances[cls] = instance
         return cls._instances[cls]
+
+
+def fetch_optional_columns(local_file, current_columns, fetch_columns, tracing_id, context):
+    """Add optional columns to columns list if they exists in files"""
+    for fetch_column in fetch_columns:
+        try:
+            data_frame = pd.read_csv(
+                local_file, usecols=lambda col: col.lower().startswith(fetch_column.lower()), nrows=0
+            )
+            header_chunks = chunk_columns(data_frame.columns, settings.PANDAS_COLUMN_BATCH_SIZE)
+            # Chunk out the headers for excessive tag git statcolumn counts
+            for header_chunk in header_chunks:
+                data_frame = pd.read_csv(local_file, usecols=header_chunk)
+                data_frame = data_frame.dropna(axis=1, how="all")
+                fetch_cols = data_frame.columns
+                for col in fetch_cols:
+                    current_columns.add(col)
+        except ValueError:
+            LOG.info(log_json(tracing_id, msg=f"customer has no {fetch_column} data to parse", context=context))
+    return current_columns
+
+
+def chunk_columns(col_list, chunk_count):
+    for i in range(0, len(col_list), chunk_count):
+        yield list(col_list[i : i + chunk_count])
+
+
+def set_summary_timestamp(state, manifest_id):
+    """Function for setting last summary for given manifest"""
+    if manifest_id:
+        LOG.info(f"setting summary {state} for manifest: {manifest_id}")
+        ReportManifestDBAccessor().update_manifest_state(ManifestStep.SUMMARY, state, manifest_id)
+
+
+def get_latest_openshift_on_cloud_manifest(start_date, provider_uuid):
+    """Function for getting latest manifest for given openshift provider (ocp on cloud)"""
+    start_date = parser.parse(str(start_date))
+    manifest_id = None
+    # We need to update previous manifests for customer filtered flows
+    billing_period = DateHelper().month_start_utc(start_date)
+    if provider_uuid:
+        try:
+            manifest = CostUsageReportManifest.objects.filter(
+                provider=provider_uuid,
+                billing_period_start_datetime=billing_period,
+                creation_datetime__isnull=False,
+            ).latest("creation_datetime")
+            manifest_id = manifest.id
+        except CostUsageReportManifest.DoesNotExist:
+            pass
+    return manifest_id

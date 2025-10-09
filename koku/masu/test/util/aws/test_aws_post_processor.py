@@ -10,10 +10,11 @@ from unittest.mock import patch
 from django_tenants.utils import schema_context
 from pandas import DataFrame
 
+from api.provider.models import Provider
 from masu.test import MasuTestCase
 from masu.util.aws.aws_post_processor import AWSPostProcessor
+from reporting.provider.all.models import EnabledTagKeys
 from reporting.provider.aws.models import AWSEnabledCategoryKeys
-from reporting.provider.aws.models import AWSEnabledTagKeys
 from reporting.provider.aws.models import TRINO_REQUIRED_COLUMNS
 
 
@@ -42,11 +43,16 @@ class TestAWSPostProcessor(MasuTestCase):
                 "lineitem_productcode": "ec2",
                 "lineitem_availabilityzone": "us-east-1a",
                 "lineitem_lineitemtype": "SavingsPlanCoveredUsage",
+                "lineitem_usagetype": "DataTransfer-Out-Bytes",
+                "lineitem_operation": "Operation",
                 "bill_billingentity": "AWS Marketplace",
                 "product_productfamily": "compute",
                 "product_productname": "AmazonEC2",
                 "product_instancetype": "t2.micro",
                 "product_region": "us-east-1",
+                "product_vcpu": "8",
+                "product_memory": "8 GiB",
+                "product_operatingsystem": "Linux",
                 "pricing_unit": "hours",
                 "resourcetags": '{"key": "value"}',
                 "costcategory": '{"cat": "egory"}',
@@ -73,11 +79,16 @@ class TestAWSPostProcessor(MasuTestCase):
                 "lineitem_productcode": "ec2",
                 "lineitem_availabilityzone": "us-east-1a",
                 "lineitem_lineitemtype": "SavingsPlanCoveredUsage",
+                "lineitem_usagetype": "DataTransfer-Out-Bytes",
+                "lineitem_operation": "Operation",
                 "bill_billingentity": "AWS Marketplace",
                 "product_productfamily": "compute",
                 "product_productname": "AmazonEC2",
                 "product_instancetype": "t2.micro",
                 "product_region": "us-east-1",
+                "product_vcpu": "4",
+                "product_memory": "8 GiB",
+                "product_operatingsystem": "Linux",
                 "pricing_unit": "hours",
                 "resourcetags": '{"key": "value"}',
                 "costcategory": '{"cat": "egory"}',
@@ -104,12 +115,17 @@ class TestAWSPostProcessor(MasuTestCase):
                 "lineitem_productcode": "ec2",
                 "lineitem_availabilityzone": "us-east-1a",
                 "lineitem_lineitemtype": "SavingsPlanCoveredUsage",
+                "lineitem_usagetype": "DataTransfer-Out-Bytes",
+                "lineitem_operation": "Operation",
                 "bill_billingentity": "AWS Marketplace",
                 "product_productfamily": "compute",
                 "product_productname": "AmazonEC2",
                 "product_instancetype": "t2.micro",
                 "product_region": "us-east-1",
                 "pricing_unit": "hours",
+                "product_vcpu": "8",
+                "product_memory": "8 GiB",
+                "product_operatingsystem": "Linux",
                 "resourcetags": '{"key": "value"}',
                 "costcategory": '{"cat": "egory"}',
                 "lineitem_usageamount": lineitem_usageamount,
@@ -137,13 +153,13 @@ class TestAWSPostProcessor(MasuTestCase):
         self.assertEqual(first_day.shape[0], 1)
         self.assertEqual(second_day.shape[0], 1)
 
-        self.assertTrue((first_day["lineitem_usageamount"] == lineitem_usageamount * 2).bool())
-        self.assertTrue((first_day["lineitem_unblendedcost"] == lineitem_unblendedcost * 2).bool())
-        self.assertTrue((first_day["lineitem_unblendedrate"] == lineitem_unblendedrate).bool())
+        self.assertTrue((first_day["lineitem_usageamount"] == lineitem_usageamount * 2).any(bool_only=True))
+        self.assertTrue((first_day["lineitem_unblendedcost"] == lineitem_unblendedcost * 2).any(bool_only=True))
+        self.assertTrue((first_day["lineitem_unblendedrate"] == lineitem_unblendedrate).any(bool_only=True))
 
-        self.assertTrue((second_day["lineitem_usageamount"] == lineitem_usageamount).bool())
-        self.assertTrue((second_day["lineitem_unblendedcost"] == lineitem_unblendedcost).bool())
-        self.assertTrue((second_day["lineitem_unblendedrate"] == lineitem_unblendedrate).bool())
+        self.assertTrue((second_day["lineitem_usageamount"] == lineitem_usageamount).any(bool_only=True))
+        self.assertTrue((second_day["lineitem_unblendedcost"] == lineitem_unblendedcost).any(bool_only=True))
+        self.assertTrue((second_day["lineitem_unblendedrate"] == lineitem_unblendedrate).any(bool_only=True))
 
     def test_aws_process_dataframe(self):
         """Test that missing columns in a report end up in the data frame."""
@@ -240,5 +256,9 @@ class TestAWSPostProcessor(MasuTestCase):
         with schema_context(self.schema):
             cat_key_count = AWSEnabledCategoryKeys.objects.filter(key__in=expected_cat_keys).count()
             self.assertEqual(cat_key_count, len(expected_cat_keys))
-            tag_key_count = AWSEnabledTagKeys.objects.filter(key__in=expected_tag_keys).count()
+            tag_key_count = (
+                EnabledTagKeys.objects.filter(provider_type=Provider.PROVIDER_AWS)
+                .filter(key__in=expected_tag_keys)
+                .count()
+            )
             self.assertEqual(tag_key_count, len(expected_tag_keys))

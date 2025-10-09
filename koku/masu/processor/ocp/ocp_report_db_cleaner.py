@@ -6,12 +6,12 @@
 import logging
 from datetime import date
 
-from django_tenants.utils import schema_context
-
+from api.common import log_json
 from koku.database import cascade_delete
 from koku.database import execute_delete_sql
 from masu.database.ocp_report_db_accessor import OCPReportDBAccessor
 from reporting.models import PartitionedTable
+from reporting.models import TRINO_MANAGED_TABLES
 from reporting.provider.ocp.models import UI_SUMMARY_TABLES
 
 LOG = logging.getLogger(__name__)
@@ -45,7 +45,7 @@ class OCPReportDBCleaner:
             ([{}]) List of dictionaries containing 'usage_period_id' and 'interval_start'
 
         """
-        LOG.info("Calling purge_expired_report_data for ocp")
+        LOG.info(log_json(msg="calling purge_expired_report_data for OCP"))
 
         with OCPReportDBAccessor(self._schema) as accessor:
             if (expired_date is not None and provider_uuid is not None) or (  # noqa: W504
@@ -62,39 +62,38 @@ class OCPReportDBCleaner:
                 return self.purge_expired_report_data_by_date(expired_date, simulate=simulate)
 
             usage_period_objs = accessor.get_usage_period_query_by_provider(provider_uuid)
-
-            with schema_context(self._schema):
-                for usage_period in usage_period_objs.all():
-                    removed_items.append(
-                        {"usage_period_id": usage_period.id, "interval_start": str(usage_period.report_period_start)}
-                    )
-                    all_report_periods.append(usage_period.id)
-                    all_cluster_ids.add(usage_period.cluster_id)
-                    all_period_starts.add(str(usage_period.report_period_start))
-
-                all_report_periods.sort()
-                LOG.info(
-                    f"Removing all data related to report_period_ids: {all_report_periods}; "
-                    f"cluster_ids: {all_cluster_ids}; starting periods {all_period_starts}"
+            for usage_period in usage_period_objs.all():
+                removed_items.append(
+                    {"usage_period_id": usage_period.id, "interval_start": str(usage_period.report_period_start)}
                 )
+                all_report_periods.append(usage_period.id)
+                all_cluster_ids.add(usage_period.cluster_id)
+                all_period_starts.add(str(usage_period.report_period_start))
 
-                if not simulate:
-                    cascade_delete(usage_period_objs.query.model, usage_period_objs)
+            LOG.info(
+                log_json(
+                    msg="deleting provider billing data",
+                    schema=self._schema,
+                    provider_uuid=provider_uuid,
+                    report_periods=all_report_periods,
+                    cluster_ids=all_cluster_ids,
+                    period_starts=all_period_starts,
+                )
+            )
+
+            if not simulate:
+                cascade_delete(usage_period_objs.query.model, usage_period_objs)
 
         return removed_items
 
     def purge_expired_report_data_by_date(self, expired_date, simulate=False):
-        LOG.info("Executing purge_expired_report_data_by_date")
+        LOG.info(log_json(msg="executing purge_expired_report_data_by_date"))
         partition_from = str(date(expired_date.year, expired_date.month, 1))
         removed_items = []
         all_report_periods = []
-        all_cluster_ids = set()
-        all_period_starts = set()
 
         with OCPReportDBAccessor(self._schema) as accessor:
-            all_usage_periods = accessor._get_db_obj_query(accessor._table_map["report_period"]).filter(
-                report_period_start__lte=expired_date
-            )
+            all_usage_periods = accessor.get_report_periods_before_date(expired_date)
 
             table_names = [
                 # accessor._aws_table_map["ocp_on_aws_daily_summary"],
@@ -103,27 +102,21 @@ class OCPReportDBCleaner:
             ]
             table_names.extend(UI_SUMMARY_TABLES)
 
-        with schema_context(self._schema):
             # Iterate over the remainder as they could involve much larger amounts of data
             for usage_period in all_usage_periods:
                 removed_items.append(
                     {"usage_period_id": usage_period.id, "interval_start": str(usage_period.report_period_start)}
                 )
                 all_report_periods.append(usage_period.id)
-                all_cluster_ids.add(usage_period.cluster_id)
-                all_period_starts.add(str(usage_period.report_period_start))
-
-            all_report_periods.sort()
-            LOG.info(
-                f"Removing all data related to "
-                f"cluster_ids: {all_cluster_ids}; starting periods {all_period_starts}"
-            )
 
             if not simulate:
                 # Will call trigger to detach, truncate, and drop partitions
                 LOG.info(
-                    "Deleting table partitions total for the following tables: "
-                    + f"{table_names} with partitions <= {partition_from}"
+                    log_json(
+                        msg="deleting table partitions total for tables",
+                        tables=table_names,
+                        partitions=partition_from,
+                    )
                 )
                 del_count = execute_delete_sql(
                     PartitionedTable.objects.filter(
@@ -133,6 +126,35 @@ class OCPReportDBCleaner:
                         partition_parameters__from__lte=partition_from,
                     )
                 )
-                LOG.info(f"Deleted {del_count} table partitions")
+                LOG.info(log_json(msg="deleted table partitions", count=del_count, schema=self._schema))
+
+                # Remove all data related to the report period
+                cascade_delete(all_usage_periods.query.model, all_usage_periods)
+                LOG.info(
+                    log_json(
+                        msg="deleted ocp-usage-report-periods",
+                        report_periods=all_report_periods,
+                        schema=self._schema,
+                    )
+                )
 
         return removed_items
+
+    def purge_expired_trino_partitions(self, expired_date, simulate=False):
+        """Removes expired trino partitions."""
+        LOG.debug(f"purge_expired_trino_partitions: {expired_date}, {simulate}")
+
+        with OCPReportDBAccessor(self._schema) as accessor:
+            for table, source_column in TRINO_MANAGED_TABLES.items():
+                LOG.debug(f"{table}, {source_column}")
+                results = accessor.find_expired_trino_partitions(table, source_column, str(expired_date.date()))
+                if results:
+                    LOG.info(f"Discovered {len(results)} expired partitions")
+                else:
+                    LOG.info("No expired partitions")
+                    return
+                for partition in results:
+                    LOG.info(f"partition_info: {partition}")
+                    if not simulate:
+                        year, month, source_value = partition
+                        accessor.delete_hive_partition_by_month(table, source_value, year, month, source_column)

@@ -9,6 +9,8 @@ from unittest.mock import patch
 from uuid import uuid4
 
 import requests_mock
+from confluent_kafka import KafkaError
+from confluent_kafka import KafkaException
 from django.db import IntegrityError
 from django.db import InterfaceError
 from django.db import OperationalError
@@ -16,7 +18,6 @@ from django.db.models.signals import post_save
 from django.forms.models import model_to_dict
 from django.test.utils import override_settings
 from faker import Faker
-from kafka.errors import KafkaError
 from rest_framework.exceptions import ValidationError
 
 import sources.kafka_listener as source_integration
@@ -26,7 +27,6 @@ from api.provider.models import Sources
 from api.provider.provider_builder import ProviderBuilder
 from api.provider.provider_builder import ProviderBuilderError
 from koku.middleware import IdentityHeaderMiddleware
-from masu.prometheus_stats import WORKER_REGISTRY
 from providers.provider_access import ProviderAccessor
 from providers.provider_errors import SkipStatusPush
 from sources import storage
@@ -61,9 +61,9 @@ from sources.test.test_sources_http_client import COST_MGMT_APP_TYPE_ID
 from sources.test.test_sources_http_client import MOCK_PREFIX
 from sources.test.test_sources_http_client import MOCK_URL
 
-
 faker = Faker()
 FAKE_AWS_ARN = "arn:aws:iam::111111111111:role/CostManagement"
+FAKE_EXTERNAL_ID = str(uuid4())
 FAKE_AWS_ARN2 = "arn:aws:iam::22222222222:role/CostManagement"
 FAKE_CLUSTER_ID_1 = str(uuid4())
 FAKE_CLUSTER_ID_2 = str(uuid4())
@@ -106,7 +106,7 @@ class MockKafkaConsumer:
     def getone(self):
         for msg in self.preloaded_messages:
             return msg
-        raise KafkaError("Closing Mock Consumer")
+        raise KafkaException(KafkaError._PARTITION_EOF)
 
     def __aiter__(self):
         return self
@@ -126,7 +126,7 @@ class SourcesKafkaMsgHandlerTest(IamTestCase):
         post_save.disconnect(storage_callback, sender=Sources)
         account = "10001"
         org_id = "1234567"
-        IdentityHeaderMiddleware.create_customer(account, org_id)
+        IdentityHeaderMiddleware.create_customer(account, org_id, "POST")
 
     def setUp(self):
         """Setup the test method."""
@@ -161,7 +161,7 @@ class SourcesKafkaMsgHandlerTest(IamTestCase):
                 "source_uuid": self.uuids.get(Provider.PROVIDER_AWS),
                 "name": "Provider AWS",
                 "source_type": "AWS",
-                "authentication": {"credentials": {"role_arn": FAKE_AWS_ARN}},
+                "authentication": {"credentials": {"role_arn": FAKE_AWS_ARN, "external_id": FAKE_EXTERNAL_ID}},
                 "billing_source": {"data_source": {"bucket": "test_bucket"}},
                 "auth_header": Config.SOURCES_FAKE_HEADER,
                 "account_id": "10001",
@@ -186,7 +186,7 @@ class SourcesKafkaMsgHandlerTest(IamTestCase):
                 "source_uuid": self.uuids.get(Provider.PROVIDER_AWS),
                 "name": "Provider AWS - PATCHED",
                 "source_type": "AWS",
-                "authentication": {"credentials": {"role_arn": FAKE_AWS_ARN2}},
+                "authentication": {"credentials": {"role_arn": FAKE_AWS_ARN2, "external_id": FAKE_EXTERNAL_ID}},
                 "billing_source": {"data_source": {"bucket": "test_bucket_2"}},
                 "auth_header": Config.SOURCES_FAKE_HEADER,
                 "account_id": "10001",
@@ -225,7 +225,15 @@ class SourcesKafkaMsgHandlerTest(IamTestCase):
                 {
                     "url": f"{MOCK_URL}/{MOCK_PREFIX}/{ENDPOINT_AUTHENTICATIONS}?filter[source_id]={self.source_ids.get(Provider.PROVIDER_AWS)}",  # noqa: E501
                     "status": 200,
-                    "json": {"data": [{"id": self.source_ids.get(Provider.PROVIDER_AWS), "username": FAKE_AWS_ARN}]},
+                    "json": {
+                        "data": [
+                            {
+                                "id": self.source_ids.get(Provider.PROVIDER_AWS),
+                                "username": FAKE_AWS_ARN,
+                                "extra": {"external_id": FAKE_EXTERNAL_ID},
+                            }
+                        ]
+                    },
                 },
                 {
                     "url": f"{MOCK_URL}/{MOCK_PREFIX}/{ENDPOINT_SOURCES}/{self.source_ids.get(Provider.PROVIDER_AWS)}",  # noqa: E501
@@ -280,7 +288,15 @@ class SourcesKafkaMsgHandlerTest(IamTestCase):
                 {
                     "url": f"{MOCK_URL}/{MOCK_PREFIX}/{ENDPOINT_AUTHENTICATIONS}?filter[source_id]={self.source_ids.get(Provider.PROVIDER_AWS)}",  # noqa: E501
                     "status": 200,
-                    "json": {"data": [{"id": self.source_ids.get(Provider.PROVIDER_AWS), "username": FAKE_AWS_ARN2}]},
+                    "json": {
+                        "data": [
+                            {
+                                "id": self.source_ids.get(Provider.PROVIDER_AWS),
+                                "username": FAKE_AWS_ARN2,
+                                "extra": {"external_id": FAKE_EXTERNAL_ID},
+                            }
+                        ]
+                    },
                 },
                 {
                     "url": f"{MOCK_URL}/{MOCK_PREFIX}/{ENDPOINT_SOURCES}/{self.source_ids.get(Provider.PROVIDER_AWS)}",  # noqa: E501
@@ -332,7 +348,7 @@ class SourcesKafkaMsgHandlerTest(IamTestCase):
             ],
         }
 
-    def test_listen_for_messages_aws_create_update_pause_unpause_delete_AWS(self):
+    def test_listen_for_messages_create_update_pause_unpause_delete_AWS(self):
         """Test for app/auth create, app/auth update, app pause/unpause, app/source delete."""
         # First, test the create pathway:
         msgs = [
@@ -452,7 +468,7 @@ class SourcesKafkaMsgHandlerTest(IamTestCase):
                 source = Sources.objects.get(source_id=self.source_ids.get(Provider.PROVIDER_AWS))
                 self.assertTrue(source.pending_delete, msg="failed delete")
 
-    def test_listen_for_messages_aws_create_update_pause_unpause_delete_OCP(self):
+    def test_listen_for_messages_create_update_pause_unpause_delete_OCP(self):
         """Test for app/auth create, app/auth update, app pause/unpause, app/source delete."""
         # First, test the create pathway:
         msgs = [
@@ -714,7 +730,7 @@ class SourcesKafkaMsgHandlerTest(IamTestCase):
         self.assertTrue(Sources.objects.filter(source_id=source_id).exists())
 
         with patch.object(ProviderAccessor, "cost_usage_source_ready", returns=True):
-            builder = SourcesProviderCoordinator(source_id, provider.auth_header)
+            builder = SourcesProviderCoordinator(source_id, provider.auth_header, provider.account_id, provider.org_id)
             builder.create_account(provider)
 
         self.assertTrue(Provider.objects.filter(uuid=provider.source_uuid).exists())
@@ -749,7 +765,7 @@ class SourcesKafkaMsgHandlerTest(IamTestCase):
             with patch.object(ProviderAccessor, "cost_usage_source_ready", returns=True):
                 source_integration.execute_koku_provider_op(msg)
 
-        builder = SourcesProviderCoordinator(source_id, provider.auth_header)
+        builder = SourcesProviderCoordinator(source_id, provider.auth_header, provider.account_id, provider.org_id)
 
         source = storage.get_source_instance(source_id)
         uuid = source.koku_uuid
@@ -837,15 +853,6 @@ class SourcesKafkaMsgHandlerTest(IamTestCase):
 
         response = source_integration._collect_pending_items()
         self.assertEqual(len(response), 3)
-
-    @patch("time.sleep", side_effect=None)
-    @patch("sources.kafka_listener.check_kafka_connection", side_effect=[bool(0), bool(1)])
-    def test_kafka_connection_metrics_listen_for_messages(self, mock_start, mock_sleep):
-        """Test check_kafka_connection increments kafka connection errors on KafkaError."""
-        connection_errors_before = WORKER_REGISTRY.get_sample_value("kafka_connection_errors_total")
-        source_integration.is_kafka_connected()
-        connection_errors_after = WORKER_REGISTRY.get_sample_value("kafka_connection_errors_total")
-        self.assertEqual(connection_errors_after - connection_errors_before, 1)
 
     # @patch.object(Config, "SOURCES_API_URL", "http://www.sources.com")
     # def test_process_message_application_unsupported_source_type(self):
@@ -948,8 +955,9 @@ class SourcesKafkaMsgHandlerTest(IamTestCase):
         local_source = Sources(**self.aws_local_source, koku_uuid=uuid, pending_update=True)
         local_source.save()
 
-        with patch("sources.kafka_listener.execute_process_queue"), patch(
-            "sources.storage.screen_and_build_provider_sync_create_event", return_value=False
+        with (
+            patch("sources.kafka_listener.execute_process_queue"),
+            patch("sources.storage.screen_and_build_provider_sync_create_event", return_value=False),
         ):
             storage_callback("", local_source)
             _, msg = PROCESS_QUEUE.get_nowait()
@@ -961,8 +969,9 @@ class SourcesKafkaMsgHandlerTest(IamTestCase):
         local_source = Sources(**self.aws_local_source, koku_uuid=uuid, pending_update=True, pending_delete=True)
         local_source.save()
 
-        with patch("sources.kafka_listener.execute_process_queue"), patch(
-            "sources.storage.screen_and_build_provider_sync_create_event", return_value=False
+        with (
+            patch("sources.kafka_listener.execute_process_queue"),
+            patch("sources.storage.screen_and_build_provider_sync_create_event", return_value=False),
         ):
             storage_callback("", local_source)
             _, msg = PROCESS_QUEUE.get_nowait()

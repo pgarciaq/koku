@@ -9,30 +9,27 @@ from unittest.mock import patch
 from kafka_utils import utils
 from masu.prometheus_stats import WORKER_REGISTRY
 
-TEST_HOST = "fake-host"
-TEST_PORT = "0000"
-
 
 class KafkaUtilsTest(TestCase):
     """Test Cases for the Kafka utilities."""
 
     def test_check_kafka_connection(self):
         """Test check kafka connections."""
-        with patch("kafka.BrokerConnection.connect_blocking", return_value=False):
-            result = utils.check_kafka_connection(TEST_HOST, TEST_PORT)
+        with patch("kafka_utils.utils.get_admin_client") as mock_client:
+            mock_client.return_value.list_topics.return_value.topics = []
+            result = utils.check_kafka_connection()
             self.assertFalse(result)
-        with patch("kafka.BrokerConnection.connect_blocking", return_value=True):
-            with patch("kafka.BrokerConnection.close") as mock_close:
-                result = utils.check_kafka_connection(TEST_HOST, TEST_PORT)
-                mock_close.assert_called()
-                self.assertTrue(result)
+        with patch("kafka_utils.utils.get_admin_client") as mock_client:
+            mock_client.return_value.list_topics.return_value.topics = [1]
+            result = utils.check_kafka_connection()
+            self.assertTrue(result)
 
     @patch("time.sleep", side_effect=None)
     @patch("kafka_utils.utils.check_kafka_connection", side_effect=[bool(0), bool(1)])
     def test_kafka_connection_metrics_listen_for_messages(self, mock_start, mock_sleep):
         """Test check_kafka_connection increments kafka connection errors on KafkaError."""
         connection_errors_before = WORKER_REGISTRY.get_sample_value("kafka_connection_errors_total")
-        utils.is_kafka_connected(TEST_HOST, TEST_PORT)
+        utils.is_kafka_connected()
         connection_errors_after = WORKER_REGISTRY.get_sample_value("kafka_connection_errors_total")
         self.assertEqual(connection_errors_after - connection_errors_before, 1)
 
@@ -80,4 +77,16 @@ class ProducerSingletonTest(TestCase):
         self.assertNotEqual(id(pfake), id(pfake2))
         p1 = utils.ProducerSingleton({})
         p2 = utils.ProducerSingleton({})
+        self.assertEqual(id(p1), id(p2))
+
+
+class AdminClientSingletonTest(TestCase):
+    def test_producer_singleton(self):
+        """Tests that the ID of two created ProducerSingletons are in fact the same whereas two Producers are not."""
+        # no provided bootstrap.servers create a producer that doesn't connect to anything.
+        pfake = utils.AdminClient({})
+        pfake2 = utils.AdminClient({})
+        self.assertNotEqual(id(pfake), id(pfake2))
+        p1 = utils.AdminClientSingleton({})
+        p2 = utils.AdminClientSingleton({})
         self.assertEqual(id(p1), id(p2))

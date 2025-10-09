@@ -19,7 +19,6 @@ from django.db import transaction
 from django.db.utils import IntegrityError
 from django.db.utils import InterfaceError
 from django.db.utils import OperationalError
-from django.db.utils import ProgrammingError
 from django.http import HttpResponse
 from django.http import JsonResponse
 from django.urls import reverse
@@ -28,10 +27,9 @@ from django_prometheus.middleware import Metrics
 from django_prometheus.middleware import PrometheusAfterMiddleware
 from django_prometheus.middleware import PrometheusBeforeMiddleware
 from django_tenants.middleware import TenantMainMiddleware
-from django_tenants.utils import schema_exists
 from prometheus_client import Counter
-from rest_framework.exceptions import ValidationError
 
+from api.common import log_json
 from api.common import RH_IDENTITY_HEADER
 from api.common.pagination import EmptyResultsSetPagination
 from api.iam.models import Customer
@@ -39,13 +37,11 @@ from api.iam.models import Tenant
 from api.iam.models import User
 from api.iam.serializers import create_schema_name
 from api.iam.serializers import extract_header
-from api.iam.serializers import UserSerializer
-from api.settings.utils import generate_doc_link
 from api.utils import DateHelper
+from koku.cache import CacheEnum
 from koku.metrics import DB_CONNECTION_ERRORS_COUNTER
 from koku.rbac import RbacConnectionError
 from koku.rbac import RbacService
-
 
 MAX_CACHE_SIZE = 10000
 USER_CACHE = TTLCache(maxsize=MAX_CACHE_SIZE, ttl=settings.MIDDLEWARE_TIME_TO_LIVE)
@@ -78,6 +74,13 @@ def is_no_entitled(request):
     return no_auth
 
 
+def is_no_access(request):
+    """Check condition for user access."""
+    no_access_list = ["aws-s3-regions"]
+    no_auth = any(no_auth_path in request.path for no_auth_path in no_access_list)
+    return no_auth
+
+
 class HttpResponseUnauthorizedRequest(HttpResponse):
     """A subclass of HttpResponse to return a 401.
     Used if identity header is not sent.
@@ -96,7 +99,7 @@ class HttpResponseFailedDependency(JsonResponse):
         data = {
             "errors": [
                 {
-                    "detail": f'{dikt.get("source")} unavailable. Error: {dikt.get("exception")}',
+                    "detail": f"{dikt.get('source')} unavailable. Error: {dikt.get('exception')}",
                     "status": self.status_code,
                     "title": "Failed Dependency",
                 }
@@ -109,27 +112,11 @@ class KokuTenantSchemaExistsMiddleware(MiddlewareMixin):
     """A middleware to check if schema exists for Tenant."""
 
     def process_exception(self, request, exception):
-        if isinstance(exception, (Tenant.DoesNotExist, ProgrammingError)):
-            if (
-                settings.ROOT_URLCONF == "koku.urls"
-                and request.path in reverse("settings")
-                and (not schema_exists(request.tenant.schema_name) or request.tenant.schema_name == "public")
-            ):
-
-                doc_link = generate_doc_link("/")
-
-                err_page = {
-                    "name": "middleware.settings.err",
-                    "component": "error-state",
-                    "errorTitle": "Configuration Error",
-                    "errorDescription": f"Before adding settings you must create a Source for Cost Management. "
-                    f"<br /><span><a href={doc_link}>[Learn more]</a></span>",
-                }
-
-                return JsonResponse(
-                    [{"fields": [err_page], "formProps": {"showFormControls": False}}], safe=False, status=200
-                )
-
+        # double check if the Tenant exists
+        schema_name = request.user.customer.schema_name
+        try:
+            Tenant.objects.get(schema_name=schema_name)
+        except Tenant.DoesNotExist:
             paginator = EmptyResultsSetPagination([], request)
             return paginator.get_paginated_response()
 
@@ -179,11 +166,13 @@ class KokuTenantMiddleware(TenantMainMiddleware):
         connection.set_schema_to_public()
 
         if not is_no_auth(request):
-            if hasattr(request, "user") and hasattr(request.user, "username"):
+            if hasattr(request, "user") and hasattr(request.user, "username") and hasattr(request.user, "customer"):
                 username = request.user.username
-                if username not in USER_CACHE:
-                    USER_CACHE[username] = request.user
-                    LOG.debug(f"User added to cache: {username}")
+                org_id = request.user.customer.org_id
+                user_key = f"{org_id}_{username}"
+                if user_key not in USER_CACHE:
+                    USER_CACHE[user_key] = request.user
+                    LOG.debug(f"User added to cache: {user_key}")
                 self._check_user_has_access(request)
 
             else:
@@ -191,7 +180,7 @@ class KokuTenantMiddleware(TenantMainMiddleware):
 
         try:
             # Inherited from superclass. Set the tenant for the request
-            request.tenant = self._get_or_create_tenant(request)
+            request.tenant = self._get_tenant(request)
             connection.set_tenant(request.tenant)
 
         except OperationalError as err:
@@ -209,65 +198,40 @@ class KokuTenantMiddleware(TenantMainMiddleware):
             PermissionDenied: If the user does not have permissions for Cost Management.
 
         """
-
-        username = request.user.username
-        if not request.user.admin and request.user.access is None:
-            msg = f"User {username} does not have permissions for Cost Management."
+        if is_no_access(request):
+            return
+        if not request.user.admin and not request.user.access:
+            msg = f"User {request.user.username} does not have permissions for Cost Management."
             LOG.warning(msg)
             # For /user-access we do not want to raise the exception since the API will
             # return a false boolean response that the platfrom frontend code is expecting.
             if request.path != reverse("user-access"):
                 raise PermissionDenied(msg)
 
-    def _get_or_create_tenant(self, request):
-        """Get or create tenant based on the user's schema.
-
+    def _get_tenant(self, request):
+        """Get user or public schema.
         Args:
             request(HttpRquest): The incoming request object.
-
         Returns:
             Tenant: The tenant object.
-
         """
-
-        if tenant := self._get_tenant_from_tenant_cache(request):
+        tenant_username = request.user.username
+        if tenant := KokuTenantMiddleware.tenant_cache.get(tenant_username):
             return tenant
 
-        tenant_username = request.user.username
-        schema_name = request.user.customer.schema_name if not is_no_auth(request) else "public"
-
-        try:
-            return self._get_tenant_from_db(tenant_username, schema_name)
-        except Tenant.DoesNotExist:
-            LOG.info("No tenant found. Creating new tenant with public schema.")
-            return self._create_tenant()
-
-    def _get_tenant_from_tenant_cache(self, request):
-        """Get tenant from tenant cache."""
-
-        tenant_username = request.user.username
-        tenant = KokuTenantMiddleware.tenant_cache.get(tenant_username)
-        return tenant
-
-    def _get_tenant_from_db(self, tenant_username, schema_name):
-        """Get tenant with the schema from the database."""
-
+        schema_name = "public" if is_no_auth(request) else request.user.customer.schema_name
         try:
             tenant = Tenant.objects.get(schema_name=schema_name)
         except Tenant.DoesNotExist:
             LOG.info(f"Tenant does not exist. username: {tenant_username}. schema: {schema_name}.")
-            raise
+            # the `create` here is only necessary for local dev
+            tenant, _ = Tenant.objects.get_or_create(schema_name="public")
+            return tenant
 
         if schema_name != "public":
             with KokuTenantMiddleware.tenant_lock:
                 KokuTenantMiddleware.tenant_cache[tenant_username] = tenant
                 LOG.debug(f"Tenant added to cache: {tenant_username}")
-        return tenant
-
-    def _create_tenant(self):
-        """Create tenant"""
-
-        tenant, __ = Tenant.objects.get_or_create(schema_name="public")
         return tenant
 
 
@@ -281,59 +245,42 @@ class IdentityHeaderMiddleware(MiddlewareMixin):
     customer_cache = TTLCache(maxsize=MAX_CACHE_SIZE, ttl=settings.MIDDLEWARE_TIME_TO_LIVE)
 
     @staticmethod
-    def create_customer(account, org_id):
+    def create_customer(account, org_id, request_method):
         """Create a customer.
         Args:
-            account (str): The account identifier
-            org_id (str): The org_id identifier
+            account (str): The account identifier.
+            org_id (str): The org_id identifier.
+            request_method (str): The HTTP request method.
         Returns:
-            (Customer) The created customer
+            Customer : The created  or retrieved customer.
         """
         try:
             with transaction.atomic():
                 schema_name = create_schema_name(org_id)
                 customer = Customer(account_id=account, org_id=org_id, schema_name=schema_name)
-                customer.save()
-                UNIQUE_ACCOUNT_COUNTER.inc()
-                LOG.info("Created new customer from account_id %s and org_id %s.", account, org_id)
-        except IntegrityError:
+                if request_method and request_method not in ["GET", "HEAD"]:
+                    customer.save()
+                    UNIQUE_ACCOUNT_COUNTER.inc()
+                    LOG.info("Created new customer from account_id %s and org_id %s.", account, org_id)
+
+        except IntegrityError as err:
+            LOG.warning(
+                log_json(
+                    msg="IntegrityError when creating customer. Attempting to fetch existing record",
+                    account=account,
+                    org_id=org_id,
+                ),
+                exc_info=err,
+            )
             customer = Customer.objects.filter(org_id=org_id).get()
 
         return customer
 
-    @staticmethod
-    def create_user(username, email, customer, request):
-        """Create a user for a customer.
-        Args:
-            username (str): The username
-            email (str): The email for the user
-            customer (Customer): The customer the user is associated with
-            request (object): The incoming request
-        Returns:
-            (User) The created user
-        """
-        new_user = None
-        try:
-            with transaction.atomic():
-                user_data = {"username": username, "email": email}
-                context = {"request": request, "customer": customer}
-                serializer = UserSerializer(data=user_data, context=context)
-                if serializer.is_valid(raise_exception=True):
-                    new_user = serializer.save()
-
-                UNIQUE_USER_COUNTER.labels(account=customer.account_id, user=username).inc()
-                LOG.info("Created new user %s for customer(org_id %s).", username, customer.org_id)
-        except (IntegrityError, ValidationError):
-            new_user = User.objects.get(username=username)
-        return new_user
-
     def _get_access(self, user):
         """Obtain access for given user from RBAC service."""
-        access = None
         if settings.ENHANCED_ORG_ADMIN and user.admin:
-            return access
-        access = self.rbac.get_access_for_user(user)
-        return access
+            return {}
+        return self.rbac.get_access_for_user(user)
 
     def process_request(self, request):  # noqa: C901
         """Process request for csrf checks.
@@ -363,19 +310,30 @@ class IdentityHeaderMiddleware(MiddlewareMixin):
 
         account = json_rh_auth.get("identity", {}).get("account_number")
         org_id = json_rh_auth.get("identity", {}).get("org_id")
-        user = json_rh_auth.get("identity", {}).get("user", {})
-        username = user.get("username")
-        email = user.get("email")
-        is_admin = user.get("is_org_admin")
+        token_type = str(json_rh_auth.get("identity", {}).get("type", "user")).lower()
+        user = None
+        email = None
+        is_admin = False
         req_id = None
+        if token_type == "user":
+            user = json_rh_auth.get("identity", {}).get("user", {})
+            username = user.get("username")
+            email = user.get("email")
+            is_admin = user.get("is_org_admin")
+        else:
+            service_account = json_rh_auth.get("identity", {}).get("service_account", {})
+            username = service_account.get("username")
+            email = ""
 
-        if username and email and org_id:
+        if username and email is not None and org_id:
             # Get request ID
             req_id = request.META.get("HTTP_X_RH_INSIGHTS_REQUEST_ID")
             # Check for customer creation & user creation
             query_string = ""
             if request.META["QUERY_STRING"]:
-                query_string = "?{}".format(request.META["QUERY_STRING"])
+                query_string = f"?{request.META['QUERY_STRING']}"
+            if not org_id.endswith(settings.SCHEMA_SUFFIX):
+                org_id = f"{org_id}{settings.SCHEMA_SUFFIX}"
             stmt = {
                 "method": request.method,
                 "path": request.path + query_string,
@@ -392,35 +350,34 @@ class IdentityHeaderMiddleware(MiddlewareMixin):
                     if not customer.account_id and account:
                         customer.account_id = account
                         customer.date_updated = DateHelper().now_utc
-                        customer.save()
-                        LOG.info(f"adding account_id {account} to Customer (org_id {org_id})")
+                        if request.method not in ["GET", "HEAD"]:
+                            customer.save()
+                            LOG.info(f"adding account_id {account} to Customer (org_id {org_id})")
                     IdentityHeaderMiddleware.customer_cache[org_id] = customer
                     LOG.debug(f"Customer added to cache: {org_id}")
                 else:
                     customer = IdentityHeaderMiddleware.customer_cache[org_id]
             except Customer.DoesNotExist:
-                customer = IdentityHeaderMiddleware.create_customer(account, org_id)
+                customer = IdentityHeaderMiddleware.create_customer(account, org_id, request.method)
             except OperationalError as err:
                 LOG.error("IdentityHeaderMiddleware exception: %s", err)
                 DB_CONNECTION_ERRORS_COUNTER.inc()
                 return HttpResponseFailedDependency({"source": "Database", "exception": err})
 
-            try:
-                if username not in USER_CACHE:
-                    user = User.objects.get(username=username)
-                    USER_CACHE[username] = user
-                    LOG.debug(f"User added to cache: {username}")
-                else:
-                    user = USER_CACHE[username]
-            except User.DoesNotExist:
-                user = IdentityHeaderMiddleware.create_user(username, email, customer, request)
+            user_key = f"{org_id}_{username}"
+            if user_key not in USER_CACHE:
+                user = User(username=username, email=email, customer=customer)
+                USER_CACHE[user_key] = user
+                LOG.debug(f"User added to cache: {user_key}")
+            else:
+                user = USER_CACHE[user_key]
 
             user.identity_header = {"encoded": rh_auth_header, "decoded": json_rh_auth}
             user.admin = is_admin
             user.req_id = req_id
 
-            cache = caches["rbac"]
-            user_access = cache.get(user.uuid)
+            cache = caches[CacheEnum.rbac]
+            user_access = cache.get(f"{user.uuid}_{org_id}")
 
             if not user_access:
                 if settings.DEVELOPMENT and request.user.req_id == "DEVELOPMENT":
@@ -432,7 +389,7 @@ class IdentityHeaderMiddleware(MiddlewareMixin):
                         user_access = self._get_access(user)
                     except RbacConnectionError as err:
                         return HttpResponseFailedDependency({"source": "Rbac", "exception": err})
-                cache.set(user.uuid, user_access, self.rbac.cache_ttl)
+                cache.set(f"{user.uuid}_{org_id}", user_access, self.rbac.cache_ttl)
             user.access = user_access
 
             user.beta = False
@@ -482,7 +439,7 @@ class IdentityHeaderMiddleware(MiddlewareMixin):
 class RequestTimingMiddleware(MiddlewareMixin):
     """A class to add total time taken to a request/response."""
 
-    def process_request(self, request):  # noqa: C901
+    def process_request(self, request):
         """Process request to add start time.
         Args:
             request (object): The request object
