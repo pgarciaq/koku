@@ -14,6 +14,7 @@ from api.forecast.views import OCPAWSCostForecastView
 from api.forecast.views import OCPAzureCostForecastView
 from api.forecast.views import OCPCostForecastView
 from api.forecast.views import OCPGCPCostForecastView
+from api.forecast.views import OCPOnPremiseCostForecastView
 from api.ingress.reports.view import IngressReportsDetailView
 from api.ingress.reports.view import IngressReportsView
 from api.metrics.views import metrics
@@ -22,6 +23,9 @@ from api.organizations.aws.view import AWSOrgView
 from api.report.all.openshift.view import OCPAllCostView
 from api.report.all.openshift.view import OCPAllInstanceTypeView
 from api.report.all.openshift.view import OCPAllStorageView
+from api.report.all.openshift.view import OCPOnPremiseCostView
+from api.report.all.openshift.view import OCPOnPremiseInstanceTypeView
+from api.report.all.openshift.view import OCPOnPremiseStorageView
 from api.report.aws.openshift.view import OCPAWSCostView
 from api.report.aws.openshift.view import OCPAWSInstanceTypeView
 from api.report.aws.openshift.view import OCPAWSStorageView

@@ -17,7 +17,7 @@ class CurrencyUtilsTest(IamTestCase):
         ExchangeRateDictionary.objects.all().delete()
 
     def test_build_exchange_dictionary(self):
-        """Test that a list GET call returns the supported currencies."""
+        """Test that build_exchange_dictionary creates the correct exchange rate dictionary."""
         expected = {
             "USD": {"USD": Decimal(1.0), "AUD": Decimal(2.0), "CAD": Decimal(1.25)},
             "AUD": {"USD": Decimal(0.5), "AUD": Decimal(1.0), "CAD": Decimal(0.625)},

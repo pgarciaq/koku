@@ -12,3 +12,4 @@ from .forecast import OCPAWSForecast  # noqa: F401
 from .forecast import OCPAzureForecast  # noqa: F401
 from .forecast import OCPForecast  # noqa: F401
 from .forecast import OCPGCPForecast  # noqa: F401
+from .forecast import OCPOnPremiseForecast  # noqa: F401

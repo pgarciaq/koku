@@ -81,6 +81,10 @@ from api.views import OCPGpuView
 from api.views import OCPMemoryView
 from api.views import OCPNetworkView
 from api.views import OCPNodesView
+from api.views import OCPOnPremiseCostForecastView
+from api.views import OCPOnPremiseCostView
+from api.views import OCPOnPremiseInstanceTypeView
+from api.views import OCPOnPremiseStorageView
 from api.views import OCPProjectsView
 from api.views import OCPReportVirtualMachinesView
 from api.views import OCPTagView
@@ -351,6 +355,27 @@ urlpatterns = [
         name="reports-openshift-all-instance-type",
     ),
     path(
+        "reports/openshift/infrastructures/on-premise/costs/",
+        cache_page(
+            timeout=settings.CACHE_MIDDLEWARE_SECONDS, cache=CacheEnum.api, key_prefix=OPENSHIFT_ALL_CACHE_PREFIX
+        )(OCPOnPremiseCostView.as_view()),
+        name="reports-openshift-on-premise-costs",
+    ),
+    path(
+        "reports/openshift/infrastructures/on-premise/storage/",
+        cache_page(
+            timeout=settings.CACHE_MIDDLEWARE_SECONDS, cache=CacheEnum.api, key_prefix=OPENSHIFT_ALL_CACHE_PREFIX
+        )(OCPOnPremiseStorageView.as_view()),
+        name="reports-openshift-on-premise-storage",
+    ),
+    path(
+        "reports/openshift/infrastructures/on-premise/instance-types/",
+        cache_page(
+            timeout=settings.CACHE_MIDDLEWARE_SECONDS, cache=CacheEnum.api, key_prefix=OPENSHIFT_ALL_CACHE_PREFIX
+        )(OCPOnPremiseInstanceTypeView.as_view()),
+        name="reports-openshift-on-premise-instance-type",
+    ),
+    path(
         "reports/openshift/infrastructures/aws/costs/",
         cache_page(
             timeout=settings.CACHE_MIDDLEWARE_SECONDS, cache=CacheEnum.api, key_prefix=OPENSHIFT_AWS_CACHE_PREFIX
@@ -500,6 +525,11 @@ urlpatterns = [
         "forecasts/openshift/infrastructures/all/costs/",
         OCPAllCostForecastView.as_view(),
         name="openshift-all-cost-forecasts",
+    ),
+    path(
+        "forecasts/openshift/infrastructures/on-premise/costs/",
+        OCPOnPremiseCostForecastView.as_view(),
+        name="openshift-on-premise-cost-forecasts",
     ),
     path(
         "reports/gcp/costs/",

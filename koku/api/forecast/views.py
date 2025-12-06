@@ -26,6 +26,7 @@ from api.forecast.serializers import OCPAWSCostForecastParamSerializer
 from api.forecast.serializers import OCPAzureCostForecastParamSerializer
 from api.forecast.serializers import OCPCostForecastParamSerializer
 from api.forecast.serializers import OCPGCPCostForecastParamSerializer
+from api.forecast.serializers import OCPOnPremiseCostForecastParamSerializer
 from api.provider.models import Provider
 from api.query_params import QueryParameters
 from forecast import AWSForecast
@@ -36,6 +37,7 @@ from forecast import OCPAWSForecast
 from forecast import OCPAzureForecast
 from forecast import OCPForecast
 from forecast import OCPGCPForecast
+from forecast import OCPOnPremiseForecast
 
 LOG = logging.getLogger(__name__)
 

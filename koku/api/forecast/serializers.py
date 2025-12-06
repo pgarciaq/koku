@@ -89,4 +89,10 @@ class OCPGCPCostForecastParamSerializer(ForecastParamSerializer):
 
 
 class OCPAllCostForecastParamSerializer(ForecastParamSerializer):
+    """OCP All Cost Forecast Serializer."""
+
+
+class OCPOnPremiseCostForecastParamSerializer(ForecastParamSerializer):
+    """OCP On-Premise Cost Forecast Serializer."""
+
     """OCP+All Cost Forecast Serializer."""

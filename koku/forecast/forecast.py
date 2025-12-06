@@ -657,6 +657,13 @@ class OCPAllForecast(Forecast):
     provider_map_class = OCPAllProviderMap
 
 
+class OCPOnPremiseForecast(Forecast):
+    """OCP On-Premise forecasting class."""
+
+    provider = Provider.OCP_ALL
+    provider_map_class = OCPAllProviderMap
+
+
 class GCPForecast(Forecast):
     """GCP forecasting class."""
 
