@@ -130,6 +130,15 @@ class OCPAllCostForecastView(ForecastView):
     tag_providers = [Provider.PROVIDER_AWS, Provider.PROVIDER_AZURE, Provider.PROVIDER_GCP]
 
 
+class OCPOnPremiseCostForecastView(ForecastView):
+    """OCP On-Premise Cost Forecast View."""
+
+    permission_classes = (OpenshiftAllAccessPermission,)
+    query_handler = OCPOnPremiseForecast
+    serializer = OCPOnPremiseCostForecastParamSerializer
+    tag_providers = [Provider.PROVIDER_OCP]
+
+
 class GCPCostForecastView(ForecastView):
     """GCP Cost Forecast View."""
 
