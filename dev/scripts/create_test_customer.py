@@ -128,6 +128,7 @@ class KokuCustomerOnboarder:
             )
             print(f"Response: [{response.status_code}] {response.reason}")
             if response.status_code not in [200, 201]:
+                print(f"Error details: {response.text}")
                 time.sleep(SLEEP)
 
     def create_provider_source(self, source):
