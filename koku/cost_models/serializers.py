@@ -211,6 +211,7 @@ class RateSerializer(serializers.Serializer):
     DECIMALS = ("value", "usage_start", "usage_end")
     RATE_TYPES = ("tiered_rates", "tag_rates")
 
+    name = serializers.CharField(max_length=50, required=True)
     metric = serializers.DictField(required=True)
     cost_type = serializers.ChoiceField(choices=metric_constants.COST_TYPE_CHOICES)
     description = serializers.CharField(allow_blank=True, max_length=500, required=False)
@@ -318,8 +319,25 @@ class RateSerializer(serializers.Serializer):
         cost_type = choices[cost_type.lower()]
         return cost_type
 
+    @staticmethod
+    def _validate_rate_name(data):
+        """Validate the name field.
+
+        Performed explicitly because to_internal_value() is overridden
+        and bypasses DRF's per-field processing.
+        """
+        name = data.get("name")
+        if not name or (isinstance(name, str) and not name.strip()):
+            raise serializers.ValidationError({"name": ["This field is required."]})
+        name = str(name).strip()
+        if len(name) > 50:
+            raise serializers.ValidationError({"name": [f"Ensure this field has no more than {50} characters."]})
+        data["name"] = name
+
     def validate(self, data):
         """Validate that a rate must be defined."""
+        self._validate_rate_name(data)
+
         metric_name = data.get("metric").get("name")
         if metric_name in TAG_RATE_ONLY and data.get("tiered_rates"):
             error_msg = f"{metric_name} is only available as a tag based rate."
@@ -356,6 +374,7 @@ class RateSerializer(serializers.Serializer):
     def to_representation(self, rate_obj):
         """Create external representation of a rate."""
         out = {
+            "name": rate_obj.get("name", ""),
             "metric": {"name": rate_obj.get("metric", {}).get("name")},
             "description": rate_obj.get("description", ""),
         }
@@ -580,6 +599,17 @@ class CostModelSerializer(BaseSerializer):
                 tag_rates.append(rate)
         if tag_rates:
             CostModelSerializer._validate_one_unique_tag_key_per_metric_per_cost_type(tag_rates)
+
+        # Validate rate name uniqueness within the cost model
+        used_names = set()
+        for rate in validated_rates:
+            name = rate.get("name", "").strip()
+            if name in used_names:
+                raise serializers.ValidationError(
+                    f"Rate names must be unique within a cost model. Duplicate: '{name}'"
+                )
+            used_names.add(name)
+
         return validated_rates
 
     def validate_distribution(self, distribution):

@@ -65,7 +65,12 @@ class CostModelViewTests(IamTestCase):
             "source_type": self.ocp_source_type,
             "source_uuids": [self.provider.uuid],
             "rates": [
-                {"metric": {"name": self.ocp_metric}, "cost_type": "Infrastructure", "tiered_rates": tiered_rates}
+                {
+                    "metric": {"name": self.ocp_metric},
+                    "cost_type": "Infrastructure",
+                    "tiered_rates": tiered_rates,
+                    "name": "CPU core usage (Infra)",
+                }
             ],
             "currency": "USD",
         }
@@ -608,7 +613,9 @@ class CostModelViewTests(IamTestCase):
             "description": "Test",
             "source_type": self.ocp_source_type,
             "source_uuids": [],
-            "rates": [{"metric": {"name": self.ocp_metric}, "tiered_rates": tiered_rates}],
+            "rates": [
+                {"metric": {"name": self.ocp_metric}, "tiered_rates": tiered_rates, "name": "CPU core usage (Supp)"}
+            ],
             "currency": "USD",
         }
 

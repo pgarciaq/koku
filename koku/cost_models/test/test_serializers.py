@@ -78,7 +78,7 @@ class CostModelSerializerTest(IamTestCase):
             "source_type": ocp_source_type,
             "providers": [{"uuid": self.provider.uuid, "name": self.provider.name}],
             "markup": {"value": 10, "unit": "percent"},
-            "rates": [{"metric": {"name": ocp_metric}, "tiered_rates": tiered_rates}],
+            "rates": [{"name": "CPU usage rate", "metric": {"name": ocp_metric}, "tiered_rates": tiered_rates}],
             "currency": "USD",
         }
         self.basic_model = {
@@ -87,7 +87,7 @@ class CostModelSerializerTest(IamTestCase):
             "source_type": Provider.PROVIDER_OCP,
             "providers": [{"uuid": self.provider.uuid, "name": self.provider.name}],
             "markup": {"value": 10, "unit": "percent"},
-            "rates": [{"metric": {"name": ocp_metric}}],
+            "rates": [{"name": "CPU usage rate", "metric": {"name": ocp_metric}}],
             "currency": "USD",
         }
 
@@ -316,6 +316,9 @@ class CostModelSerializerTest(IamTestCase):
                 "providers": [{"uuid": self.provider.uuid, "name": self.provider.name}],
                 "rates": [
                     {
+                        "name": "Storage request rate"
+                        if storage_rate == metric_constants.OCP_METRIC_STORAGE_GB_REQUEST_MONTH
+                        else "Storage usage rate",
                         "metric": {"name": storage_rate},
                         "tiered_rates": [
                             {"unit": "USD", "value": 0.22, "usage": {"usage_start": None, "usage_end": 10.0}},
@@ -346,7 +349,15 @@ class CostModelSerializerTest(IamTestCase):
                 "description": "Test",
                 "source_type": Provider.PROVIDER_OCP,
                 "providers": [{"uuid": self.provider.uuid, "name": self.provider.name}],
-                "rates": [{"metric": {"name": storage_rate}, "tiered_rates": [{"unit": "USD", "value": 0.22}]}],
+                "rates": [
+                    {
+                        "name": "Storage request rate"
+                        if storage_rate == metric_constants.OCP_METRIC_STORAGE_GB_REQUEST_MONTH
+                        else "Storage usage rate",
+                        "metric": {"name": storage_rate},
+                        "tiered_rates": [{"unit": "USD", "value": 0.22}],
+                    }
+                ],
                 "currency": "USD",
             }
 
@@ -407,7 +418,9 @@ class CostModelSerializerTest(IamTestCase):
         expected_metric_count = 2
         self.assertIsNotNone(expected_metric_name)
         # Add another tiered rate entry for the same metric
-        self.ocp_data["rates"].append(rate)
+        rate_copy = dict(rate)
+        rate_copy["name"] = "CPU usage rate 2"
+        self.ocp_data["rates"].append(rate_copy)
         result_metric_count = 0
         with tenant_context(self.tenant):
             serializer = CostModelSerializer(data=self.ocp_data, context=self.request_context)
@@ -535,7 +548,11 @@ class CostModelSerializerTest(IamTestCase):
         tag_rates_list = []
         cost_types = ["Infrastructure", "Supplementary"]
         for cost_type in cost_types:
-            rate = {"metric": {"name": metric_constants.OCP_METRIC_CPU_CORE_USAGE_HOUR}, "cost_type": cost_type}
+            rate = {
+                "name": "CPU usage rate 1" if cost_type == "Infrastructure" else "CPU usage rate 2",
+                "metric": {"name": metric_constants.OCP_METRIC_CPU_CORE_USAGE_HOUR},
+                "cost_type": cost_type,
+            }
             rate["tag_rates"] = format_tag_rate(tag_values=value_kwargs)
             tag_rates_list.append(rate)
         self.basic_model["rates"] = tag_rates_list
@@ -603,8 +620,8 @@ class CostModelSerializerTest(IamTestCase):
             "providers": [{"uuid": self.provider.uuid, "name": self.provider.name}],
             "markup": {"value": 10, "unit": "percent"},
             "rates": [
-                {"metric": {"name": metric_constants.OCP_METRIC_CPU_CORE_USAGE_HOUR}},
-                {"metric": {"name": metric_constants.OCP_METRIC_CPU_CORE_USAGE_HOUR}},
+                {"name": "CPU usage rate 1", "metric": {"name": metric_constants.OCP_METRIC_CPU_CORE_USAGE_HOUR}},
+                {"name": "CPU usage rate 2", "metric": {"name": metric_constants.OCP_METRIC_CPU_CORE_USAGE_HOUR}},
             ],
         }
         cost_model["rates"][0]["tag_rates"] = format_tag_rate(tag_values=tag_values_kwargs)
@@ -627,8 +644,8 @@ class CostModelSerializerTest(IamTestCase):
             "providers": [{"uuid": self.provider.uuid, "name": self.provider.name}],
             "markup": {"value": 10, "unit": "percent"},
             "rates": [
-                {"metric": {"name": metric_constants.OCP_METRIC_CPU_CORE_USAGE_HOUR}},
-                {"metric": {"name": metric_constants.OCP_METRIC_CPU_CORE_USAGE_HOUR}},
+                {"name": "CPU usage rate 1", "metric": {"name": metric_constants.OCP_METRIC_CPU_CORE_USAGE_HOUR}},
+                {"name": "CPU usage rate 2", "metric": {"name": metric_constants.OCP_METRIC_CPU_CORE_USAGE_HOUR}},
             ],
             "currency": "USD",
         }
@@ -647,6 +664,7 @@ class CostModelSerializerTest(IamTestCase):
         rates = {
             "tiered_rates": self.ocp_data["rates"][0],
             "tag_rates": {
+                "name": "CPU usage rate",
                 "metric": {"name": metric_constants.OCP_METRIC_CPU_CORE_USAGE_HOUR},
                 "tag_rates": format_tag_rate(tag_values=[{"value": 1}]),
             },
@@ -756,7 +774,7 @@ class CostModelSerializerTest(IamTestCase):
             "source_type": ocp_source_type,
             "providers": [{"uuid": self.provider.uuid, "name": self.provider.name}],
             "markup": {"value": 10, "unit": "percent"},
-            "rates": [{"metric": {"name": ocp_metric}, "tiered_rates": tiered_rates}],
+            "rates": [{"name": "CPU usage rate", "metric": {"name": ocp_metric}, "tiered_rates": tiered_rates}],
         }
         with tenant_context(self.tenant):
             instance = None
