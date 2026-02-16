@@ -43,7 +43,7 @@ This document describes the technical design for the "Cost Breakdown for Custom 
 | Summary table strategy | New parallel breakdown tables | Zero regression risk; existing tables, dashboards, CSVs, and forecasting untouched |
 | Overhead breakdown | Per-rate distribution in SQL (split CTE: distribution + negation) | Accurate attribution required; naive single-CTE fails because cost model rows lack usage hours |
 | Tiered rate refactoring | Per-rate execution of `usage_costs.sql` | Required to attribute each rate to its own `cost_model_rate_name` |
-| Multiple rates per metric | Supported via list-based rate structures | Real use case: users may define separate named rates for the same metric |
+| Multiple rates per metric | Supported for all rate types (tiered, monthly, tag) via list-based rate structures + per-rate SQL execution | Real use case: users may define separate named rates for the same metric |
 | Accessor refactoring | New parallel properties (no breaking change) | Existing `infrastructure_rates` etc. kept as-is; new `infrastructure_rates_by_name` added |
 | Markup breakdown | Deferred to Phase 2 | Markup applies to infrastructure raw cost (cloud), which needs per-service granularity |
 | GPU rate name | Covered in Phase 1 | GPU cost goes through `populate_tag_based_costs()` which already threads `metric_to_tag_params_map` |
@@ -60,7 +60,7 @@ This document describes the technical design for the "Cost Breakdown for Custom 
 - Rate name threading through all cost application SQL (cloud PostgreSQL, Trino, self-hosted PostgreSQL)
 - New breakdown summary tables for cluster, project, node, and VM perspectives
 - API response extension with `breakdown` array on cost categories
-- Query-time computation of overhead proportional breakdown
+- Pre-computed per-rate overhead breakdown via distribution SQL (not query-time approximation)
 - Frontend: cost model editor `name` field, Sankey diagram per-rate nodes
 
 ### Out of Scope (Phase 1)
@@ -320,8 +320,8 @@ class OCPUsageLineItemDailySummary(models.Model):
 
 The column is `TextField(null=True)` — nullable because:
 - Existing rows won't have a name until re-processed
-- Distribution rows (`platform_distributed`, `worker_distributed`, etc.) intentionally have no rate name
 - Source data rows (raw cloud cost, `cost_model_rate_type IS NULL`) have no rate name
+- Distribution rows are initially NULL; after PR 5, they carry `cost_model_rate_name` from the source cost (rate name for cost-model-attributed cost, NULL for cloud-sourced cost)
 
 ### 6.2 Index
 
@@ -402,10 +402,14 @@ These return a **list** structure (not a dict keyed by metric) to support multip
 def infrastructure_rates_by_name(self):
     """Return infrastructure rates with names, supporting multiple rates per metric.
 
+    Captures both tiered usage rates and monthly rates (all use tiered_rates in JSON).
+
     Returns: [
         {"metric": "cpu_core_usage_per_hour", "value": Decimal("0.05"), "name": "CPU charge"},
         {"metric": "cpu_core_usage_per_hour", "value": Decimal("0.10"), "name": "Premium CPU"},
         {"metric": "memory_gb_usage_per_hour", "value": Decimal("0.03"), "name": "Memory charge"},
+        {"metric": "node_cost_per_month", "value": Decimal("50.00"), "name": "Base node charge"},
+        {"metric": "node_cost_per_month", "value": Decimal("30.00"), "name": "Premium node surcharge"},
     ]
     """
     rates = []
@@ -491,18 +495,9 @@ def tag_rate_names(self):
 
 #### 7.1.6 Monthly Rates
 
-The `_update_monthly_cost()` method in `OCPCostModelCostUpdater` iterates over `MONTHLY_COST_RATE_MAP` to look up rate values from `self._infra_rates` / `self._supplementary_rates`. For rate names, it will use the new `infrastructure_rates_by_name` / `supplementary_rates_by_name` lists to look up the name by metric.
+The current `_update_monthly_cost()` method looks up rate values from `self._infra_rates` / `self._supplementary_rates` (dicts keyed by metric). This is lossy when multiple rates target the same metric — the second overwrites the first.
 
-Helper to find rate name by metric from the by-name list:
-
-```python
-def _find_rate_name(self, rates_by_name, metric):
-    """Find rate name for a given metric from the rates_by_name list."""
-    for rate in rates_by_name:
-        if rate["metric"] == metric:
-            return rate["name"]
-    return ""
-```
+**Fix:** `_update_monthly_cost()` iterates directly over `infrastructure_rates_by_name` / `supplementary_rates_by_name` (the list-based properties), filtering by the metric names in `MONTHLY_COST_RATE_MAP`. This way, ALL rates for a given metric are applied, each with its own `cost_model_rate_name`. This is the same per-rate execution approach used for tiered usage rates in PR 4. No `_find_rate_name` helper is needed — the loop provides both the value and the name directly.
 
 ### 7.2 OCPCostModelCostUpdater Changes
 
@@ -528,25 +523,35 @@ def __init__(self, schema, provider):
 
 #### 7.2.2 `_update_monthly_cost()`
 
-Currently (lines 256-295) iterates over `MONTHLY_COST_RATE_MAP`. Add rate name lookup:
+Currently (lines 256-295) iterates over `MONTHLY_COST_RATE_MAP` and looks up a single rate value per metric from the dict. **Refactored** to iterate over the list-based `rates_by_name` properties, executing SQL once per rate entry. This correctly handles multiple rates for the same metric:
 
 ```python
 def _update_monthly_cost(self, start_date, end_date):
-    for cost_type, rate_type in OCPUsageLineItemDailySummary.MONTHLY_COST_RATE_MAP.items():
-        for rate_kind, rates, rates_by_name in [
-            ("Infrastructure", self._infra_rates, self._infra_rates_by_name),
-            ("Supplementary", self._supplementary_rates, self._supplementary_rates_by_name),
-        ]:
-            rate = rates.get(rate_type)
-            if rate:
-                name = self._find_rate_name(rates_by_name, rate_type)
-                # ... existing amortization logic ...
-                self._accessor.populate_monthly_cost_sql(
-                    cost_type, rate_type, amortized_rate, start_date, end_date,
-                    self._distribution, self._provider_uuid,
-                    rate_name=name,  # NEW parameter
-                )
+    # Build a set of monthly metrics from MONTHLY_COST_RATE_MAP for filtering
+    monthly_metrics = set(OCPUsageLineItemDailySummary.MONTHLY_COST_RATE_MAP.values())
+    # Reverse map: metric -> cost_type (e.g., "node_cost_per_month" -> "Node")
+    metric_to_cost_type = {v: k for k, v in OCPUsageLineItemDailySummary.MONTHLY_COST_RATE_MAP.items()}
+
+    for rate_kind, rates_by_name in [
+        ("Infrastructure", self._infra_rates_by_name),
+        ("Supplementary", self._supplementary_rates_by_name),
+    ]:
+        for rate_entry in rates_by_name:
+            metric = rate_entry["metric"]
+            if metric not in monthly_metrics:
+                continue
+            rate = rate_entry["value"]
+            name = rate_entry["name"]
+            cost_type = metric_to_cost_type[metric]
+            # ... existing amortization logic (prorate monthly rate by days) ...
+            self._accessor.populate_monthly_cost_sql(
+                cost_type, metric, amortized_rate, start_date, end_date,
+                self._distribution, self._provider_uuid,
+                rate_name=name,
+            )
 ```
+
+This ensures that if a user defines two `node_cost_per_month` Infrastructure rates with different names (e.g., "Base node charge" at $50 and "Premium node surcharge" at $30), both are applied as separate rows with distinct `cost_model_rate_name` values.
 
 #### 7.2.3 `_update_monthly_tag_based_cost()`
 
@@ -1820,7 +1825,7 @@ def _inject_breakdown_into_cost(self, row, breakdown_entries):
             for e in sorted(usage_entries, key=lambda x: x["total_cost"], reverse=True)
         ]
 
-    # Overhead breakdown
+    # Overhead breakdown (same Cloud cost aggregation as total)
     overhead_map = {
         "platform_distributed": "platform_distributed",
         "worker_distributed": "worker_unallocated_distributed",
@@ -1829,16 +1834,27 @@ def _inject_breakdown_into_cost(self, row, breakdown_entries):
         "gpu_distributed": "gpu_unallocated_distributed",
     }
     for rate_type, cost_key in overhead_map.items():
-        oh_entries = [
-            e for e in breakdown_entries
-            if e["cost_model_rate_type"] == rate_type and e["cost_model_rate_name"]
-        ]
-        if oh_entries and cost_key in cost:
-            cost[cost_key]["breakdown"] = [
-                {"name": e["cost_model_rate_name"], "source": "rate",
-                 "value": e["total_distributed"], "units": e.get("currency", "USD")}
-                for e in sorted(oh_entries, key=lambda x: x["total_distributed"], reverse=True)
-            ]
+        type_entries = [e for e in breakdown_entries if e["cost_model_rate_type"] == rate_type]
+        if type_entries and cost_key in cost:
+            oh_breakdown = []
+            cloud_total = Decimal("0")
+            currency = "USD"
+            for e in sorted(type_entries, key=lambda x: x["total_distributed"] or 0, reverse=True):
+                currency = e.get("currency", "USD")
+                if e["cost_model_rate_name"]:
+                    oh_breakdown.append({
+                        "name": e["cost_model_rate_name"], "source": "rate",
+                        "value": e["total_distributed"], "units": currency,
+                    })
+                else:
+                    cloud_total += e["total_distributed"] or Decimal("0")
+            if cloud_total:
+                oh_breakdown.append({
+                    "name": "Cloud cost", "source": "cloud",
+                    "value": cloud_total, "units": currency,
+                })
+            if oh_breakdown:
+                cost[cost_key]["breakdown"] = oh_breakdown
 ```
 
 **Performance:** Single query against the breakdown summary table (partitioned, indexed on `usage_start` and `cost_model_rate_name`). For 30 days × 50 projects × 5 rates × 6 rate_types = ~45,000 rows. With the index, this query completes in milliseconds. The in-memory index build and lookup are O(n) and O(1) respectively.
@@ -2146,7 +2162,7 @@ The `breakdown` array gains `"source": "service"` entries alongside `"source": "
 | Cost model with 3 tiered rates (CPU, memory, volume) | 3 separate rows with distinct `cost_model_rate_name` in line item table |
 | Cost model with tag-based rates | Tag cost rows carry `cost_model_rate_name` from parent rate |
 | Cost model with monthly rates (node, cluster, PVC, VM) | Monthly cost rows carry `cost_model_rate_name` |
-| Distribution after cost application | Distributed rows have `cost_model_rate_name = NULL` |
+| Distribution after cost application | Distributed rows carry `cost_model_rate_name` from source (rate name for cost-model cost, NULL for cloud cost). Sum of distribution = 0 per rate_name. |
 | Breakdown summary tables populated correctly | Row counts match expectation (rate_type × rate_name × entity) |
 | API response includes `breakdown` on usage | Array of {name, source, value, units} entries |
 | API response includes `breakdown` on overhead | Proportional computation matches manual calculation |
@@ -2234,3 +2250,4 @@ All questions have been resolved. This section serves as a decision record.
 | 15 | Cross-cost-model rate name collisions | Not possible — only one cost model can be applied per cluster. No disambiguation logic needed. |
 | 16 | Distribution SQL JOIN on `cost_model_rate_name` | Split into two CTEs: `cte_user_distribution` (no rate_name JOIN, correct usage proportions) + `cte_source_negation` (GROUP BY `filtered.cost_model_rate_name`, correct per-rate negation). UNION ALL for INSERT. Naive single-CTE approach fails because cost model rows lack usage hours. |
 | 17 | CSV breakdown semantics | `breakdown_limit` acts as boolean trigger for CSV — include `cost_model_rate_name` column, no top-N limiting. CSV always returns full data for spreadsheet analysis. |
+| 18 | Multiple monthly rates per metric | Fully supported. `_update_monthly_cost()` iterates over `rates_by_name` lists (same approach as tiered rates in PR 4), executing SQL once per rate entry. All rates for the same metric are applied with distinct `cost_model_rate_name`. |
