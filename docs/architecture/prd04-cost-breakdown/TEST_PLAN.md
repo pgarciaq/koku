@@ -2125,7 +2125,7 @@ E2E tests (T-E2E.1–T-E2E.4)      → full pipeline verification
 | PR 4 | 8 | Per-rate execution, multiple rates, delete-once, cluster_cost_per_hour, updater integration |
 | PR 5 | 5 | Distribution rate-name tracking, conservation, negation |
 | PR 6 | 9 | Model existence, population, cleanup, group-by, VM names, tag cost type |
-| PR 7 | 21 | Serializer params, JSON breakdown, CSV, OCP-on-cloud, tag/node/project/VM perspectives, provider map, breakdown_views, per-row limit |
+| PR 7 | 20 | Serializer params, JSON breakdown, CSV, OCP-on-cloud, tag/node/project/VM perspectives, provider map, breakdown_views, per-row limit |
 | PR 8 | 3 | SQL file content verification |
 | E2E | 4 | Full pipeline, backward compat |
-| **Total** | **80** | |
+| **Total** | **79** | |
