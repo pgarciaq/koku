@@ -241,6 +241,7 @@ class OCPCostQueryParamSerializer(OCPQueryParamSerializer):
     )
 
     delta = serializers.ChoiceField(choices=DELTA_CHOICES, required=False)
+    breakdown_limit = serializers.IntegerField(required=False, min_value=1, max_value=100)
 
 
 class OCPVirtualMachinesFilterSerializer(BaseFilterSerializer):
@@ -331,6 +332,8 @@ class OCPVirtualMachinesQueryParamSerializer(OCPQueryParamSerializer):
     ORDER_BY_SERIALIZER = OCPVirtualMachinesOrderBySerializer
     EXCLUDE_SERIALIZER = OCPVirtualMachinesExcludeSerializer
     GROUP_BY_SERIALIZER = OCPVirtualMachinesGroupBySerializer
+
+    breakdown_limit = serializers.IntegerField(required=False, min_value=1, max_value=100)
 
     # override start_date and end_date params in the base `ParamSerializer` class.
     # Not valid for this endpoint.

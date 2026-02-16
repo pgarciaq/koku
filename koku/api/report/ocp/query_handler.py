@@ -15,6 +15,8 @@ from django.db.models import Case
 from django.db.models import CharField
 from django.db.models import DecimalField
 from django.db.models import F
+from django.db.models import Max
+from django.db.models import Sum
 from django.db.models import Value
 from django.db.models import When
 from django.db.models.fields.json import KT
@@ -229,7 +231,229 @@ class OCPReportQueryHandler(ReportQueryHandler):
         if self._delta:
             output["delta"] = self.query_delta
 
+        breakdown_table = self._breakdown_table
+        if breakdown_table and not self.is_csv_output:
+            breakdown_limit = self.parameters.get("breakdown_limit")
+            with tenant_context(self.tenant):
+                self._attach_total_breakdown(output, breakdown_table, breakdown_limit)
+                self._attach_data_row_breakdown(output, breakdown_table, breakdown_limit)
+
         return output
+
+    # --- Cost Breakdown Methods ---
+
+    @cached_property
+    def _breakdown_table(self):
+        """Select the breakdown table based on report type and group-by."""
+        breakdown_views = getattr(self._mapper, "breakdown_views", {})
+        if not breakdown_views:
+            return None
+
+        report_group = "default"
+        key_tuple = tuple(
+            sorted(
+                self.query_table_filter_keys.union(
+                    self.query_table_group_by_keys, self.query_table_access_keys, self.query_table_exclude_keys
+                )
+            )
+        )
+        if key_tuple:
+            report_group = key_tuple
+
+        try:
+            return breakdown_views[self._report_type][report_group]
+        except KeyError:
+            return breakdown_views.get(self._report_type, {}).get("default")
+
+    def _query_breakdown_aggregate(self, breakdown_table, extra_group_fields=None):
+        """Query the breakdown table and aggregate by rate type and name.
+
+        Returns a QuerySet of dicts with total_cost, total_distributed, etc.
+        """
+        breakdown_qs = breakdown_table.objects.filter(self.query_filter)
+        if self.query_exclusions:
+            breakdown_qs = breakdown_qs.exclude(self.query_exclusions)
+
+        group_fields = ["cost_model_rate_type", "cost_model_rate_name"]
+        if extra_group_fields:
+            group_fields = list(extra_group_fields) + group_fields
+
+        return breakdown_qs.values(*group_fields).annotate(
+            total_cost=Sum(
+                Coalesce(F("cost_model_cpu_cost"), Value(0))
+                + Coalesce(F("cost_model_memory_cost"), Value(0))
+                + Coalesce(F("cost_model_volume_cost"), Value(0))
+                + Coalesce(F("cost_model_gpu_cost"), Value(0))
+            ),
+            total_distributed=Sum(Coalesce(F("distributed_cost"), Value(0))),
+            total_raw_cost=Sum(Coalesce(F("infrastructure_raw_cost"), Value(0))),
+            total_markup_cost=Sum(Coalesce(F("infrastructure_markup_cost"), Value(0))),
+            currency=Max("raw_currency"),
+        )
+
+    def _attach_total_breakdown(self, output, breakdown_table, breakdown_limit):
+        """Attach breakdown arrays to the total cost structure."""
+        total = output.get("total", {})
+        cost = total.get("cost", {})
+        if not cost:
+            return
+
+        breakdown_entries = list(self._query_breakdown_aggregate(breakdown_table))
+        self._inject_breakdown_into_cost(cost, breakdown_entries, breakdown_limit)
+
+    def _attach_data_row_breakdown(self, output, breakdown_table, breakdown_limit):
+        """Attach breakdown arrays to each data row using a single prefetch query."""
+        data = output.get("data", [])
+        if not data:
+            return
+
+        group_by_value = self._get_group_by()
+        group_by_field = self._resolve_breakdown_group_field(group_by_value)
+        extra_group = ["date"]
+        if group_by_field:
+            extra_group.append(group_by_field)
+
+        breakdown_qs = breakdown_table.objects.filter(self.query_filter)
+        if self.query_exclusions:
+            breakdown_qs = breakdown_qs.exclude(self.query_exclusions)
+
+        qs_fields = ["cost_model_rate_type", "cost_model_rate_name"]
+        annotate_fields = {
+            "date": self.date_trunc("usage_start"),
+        }
+        raw_data = (
+            breakdown_qs.annotate(**annotate_fields)
+            .values(*extra_group, *qs_fields)
+            .annotate(
+                total_cost=Sum(
+                    Coalesce(F("cost_model_cpu_cost"), Value(0))
+                    + Coalesce(F("cost_model_memory_cost"), Value(0))
+                    + Coalesce(F("cost_model_volume_cost"), Value(0))
+                    + Coalesce(F("cost_model_gpu_cost"), Value(0))
+                ),
+                total_distributed=Sum(Coalesce(F("distributed_cost"), Value(0))),
+                currency=Max("raw_currency"),
+            )
+        )
+
+        breakdown_index = defaultdict(list)
+        for entry in raw_data:
+            date_key = str(entry["date"])
+            group_key = str(entry.get(group_by_field, "__all__")) if group_by_field else "__all__"
+            breakdown_index[(date_key, group_key)].append(entry)
+
+        api_group_key = self._get_api_group_key(group_by_value)
+        self._walk_data_rows(data, breakdown_index, api_group_key, group_by_field, breakdown_limit)
+
+    def _resolve_breakdown_group_field(self, group_by_value):
+        """Map the first group-by value to the breakdown table column name."""
+        if not group_by_value:
+            return None
+        api_to_db = {
+            "project": "namespace",
+            "node": "node",
+            "cluster": "cluster_id",
+            "vm_name": "vm_name",
+        }
+        for gb in group_by_value:
+            if gb in api_to_db:
+                return api_to_db[gb]
+            if gb.startswith("tag:"):
+                return None
+        return None
+
+    def _get_api_group_key(self, group_by_value):
+        """Get the API-level group-by key used in the transformed data."""
+        if not group_by_value:
+            return None
+        return group_by_value[0] if group_by_value else None
+
+    def _walk_data_rows(self, data, breakdown_index, api_group_key, db_group_field, breakdown_limit):
+        """Walk the nested data structure and inject breakdown into each row's cost."""
+        for date_entry in data:
+            date_str = str(date_entry.get("date", ""))
+            if api_group_key:
+                plural_key = api_group_key + "s"
+                rows = date_entry.get(plural_key, [])
+                for row in rows:
+                    group_value = str(row.get(api_group_key, "__all__"))
+                    row_entries = breakdown_index.get((date_str, group_value), [])
+                    if row_entries:
+                        cost = row.get("cost", {})
+                        if cost:
+                            self._inject_breakdown_into_cost(cost, row_entries, breakdown_limit)
+            else:
+                row_entries = breakdown_index.get((date_str, "__all__"), [])
+                if row_entries:
+                    cost = date_entry.get("cost", {})
+                    if cost:
+                        self._inject_breakdown_into_cost(cost, row_entries, breakdown_limit)
+
+    def _inject_breakdown_into_cost(self, cost, breakdown_entries, breakdown_limit):
+        """Inject breakdown arrays into a cost structure (total or per-row)."""
+        usage = cost.get("usage")
+        if usage and isinstance(usage, dict):
+            usage_entries = [
+                {
+                    "name": e["cost_model_rate_name"],
+                    "source": "rate",
+                    "value": e["total_cost"],
+                    "units": e.get("currency") or "USD",
+                }
+                for e in breakdown_entries
+                if e.get("cost_model_rate_type") in ("Infrastructure", "Supplementary")
+                and e.get("cost_model_rate_name")
+            ]
+            if usage_entries:
+                usage_entries.sort(key=lambda x: x.get("value") or 0, reverse=True)
+                usage["breakdown"] = self._apply_breakdown_limit(usage_entries, breakdown_limit)
+
+        overhead_map = {
+            "platform_distributed": "platform_distributed",
+            "worker_unallocated_distributed": "worker_distributed",
+            "storage_unattributed_distributed": "unattributed_storage",
+            "network_unattributed_distributed": "unattributed_network",
+            "gpu_unallocated_distributed": "gpu_distributed",
+        }
+        for cost_key, rate_type in overhead_map.items():
+            cost_obj = cost.get(cost_key)
+            if cost_obj and isinstance(cost_obj, dict):
+                type_entries = [e for e in breakdown_entries if e.get("cost_model_rate_type") == rate_type]
+                if type_entries:
+                    oh_breakdown = self._build_overhead_breakdown(type_entries)
+                    if oh_breakdown:
+                        cost_obj["breakdown"] = self._apply_breakdown_limit(oh_breakdown, breakdown_limit)
+
+    def _build_overhead_breakdown(self, entries):
+        """Build breakdown for an overhead type from pre-computed distribution data."""
+        breakdown = []
+        cloud_total = Decimal("0")
+        currency = "USD"
+        for e in entries:
+            name = e.get("cost_model_rate_name")
+            currency = e.get("currency") or "USD"
+            dist = e.get("total_distributed") or Decimal("0")
+            if name:
+                breakdown.append({"name": name, "source": "rate", "value": dist, "units": currency})
+            else:
+                cloud_total += dist
+        if cloud_total:
+            breakdown.append({"name": "Cloud cost", "source": "cloud", "value": cloud_total, "units": currency})
+        breakdown.sort(key=lambda x: x.get("value") or 0, reverse=True)
+        return breakdown
+
+    def _apply_breakdown_limit(self, breakdown, limit):
+        """Apply top-N limiting with 'Other' aggregation."""
+        if limit is None or len(breakdown) <= limit:
+            return breakdown
+        breakdown.sort(key=lambda x: x.get("value") or 0, reverse=True)
+        top_entries = breakdown[:limit]
+        rest = breakdown[limit:]
+        other_total = sum((e.get("value") or Decimal("0") for e in rest), Decimal("0"))
+        units = breakdown[0].get("units", "USD") if breakdown else "USD"
+        if other_total:
+            top_entries.append({"name": "Other", "source": "other", "value": other_total, "units": units})
+        return top_entries
 
     def execute_query(self):  # noqa: C901
         """Execute query and return provided data.
@@ -291,6 +515,18 @@ class OCPReportQueryHandler(ReportQueryHandler):
                 if self._report_type == "virtual_machines":
                     date_string = self.date_to_string(self.time_interval[0])
                     data = [{"date": date_string, "vm_names": query_data}]
+                elif self.parameters.get("breakdown_limit") is not None and self._breakdown_table:
+                    csv_breakdown_table = self._breakdown_table
+                    csv_query = csv_breakdown_table.objects.filter(self.query_filter)
+                    if self.query_exclusions:
+                        csv_query = csv_query.exclude(self.query_exclusions)
+                    csv_query = csv_query.annotate(**self.annotations)
+                    csv_group_by = query_group_by + ["cost_model_rate_name"]
+                    csv_data = csv_query.values(*csv_group_by).annotate(
+                        **{k: v for k, v in self.report_annotations.items() if k not in csv_group_by}
+                    )
+                    csv_data = self.order_by(csv_data, query_order_by)
+                    data = list(csv_data)
                 else:
                     data = list(query_data)
             else:

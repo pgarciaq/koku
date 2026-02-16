@@ -25,6 +25,9 @@ from api.models import Provider
 from api.report.provider_map import ProviderMap
 from providers.provider_access import ProviderAccessor
 from reporting.models import OCPUsageLineItemDailySummary
+from reporting.provider.ocp.models import OCPCostBreakdownByNodeP
+from reporting.provider.ocp.models import OCPCostBreakdownByProjectP
+from reporting.provider.ocp.models import OCPCostBreakdownP
 from reporting.provider.ocp.models import OCPCostSummaryByNodeP
 from reporting.provider.ocp.models import OCPCostSummaryByProjectP
 from reporting.provider.ocp.models import OCPCostSummaryP
@@ -36,6 +39,7 @@ from reporting.provider.ocp.models import OCPPodSummaryByNodeP
 from reporting.provider.ocp.models import OCPPodSummaryByProjectP
 from reporting.provider.ocp.models import OCPPodSummaryP
 from reporting.provider.ocp.models import OCPVirtualMachineSummaryP
+from reporting.provider.ocp.models import OCPVMBreakdownP
 from reporting.provider.ocp.models import OCPVolumeSummaryByProjectP
 from reporting.provider.ocp.models import OCPVolumeSummaryP
 
@@ -1157,6 +1161,22 @@ class OCPProviderMap(ProviderMap):
             },
             "gpu": {
                 "default": OCPGpuSummaryP,
+            },
+        }
+        self.breakdown_views = {
+            "costs": {
+                "default": OCPCostBreakdownP,
+                ("cluster",): OCPCostBreakdownP,
+                ("node",): OCPCostBreakdownByNodeP,
+                ("cluster", "node"): OCPCostBreakdownByNodeP,
+            },
+            "costs_by_project": {
+                "default": OCPCostBreakdownByProjectP,
+                ("project",): OCPCostBreakdownByProjectP,
+                ("cluster", "project"): OCPCostBreakdownByProjectP,
+            },
+            "virtual_machines": {
+                "default": OCPVMBreakdownP,
             },
         }
         super().__init__(provider, report_type, schema_name)
