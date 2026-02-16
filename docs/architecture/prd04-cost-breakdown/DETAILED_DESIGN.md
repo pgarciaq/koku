@@ -561,7 +561,7 @@ This method (lines 297-353) already iterates per tag rate. The `name` is now ava
 def _update_monthly_tag_based_cost(self, start_date, end_date):
     for metric, tag_params_list in self.metric_to_tag_params_map.items():
         for tag_params in tag_params_list:
-            name = tag_params.get("name", "")  # NEW — from updated metric_to_tag_params_map
+            name = tag_params.get("name")  # NEW — from updated metric_to_tag_params_map
             # ... existing case statement building ...
             self._accessor.populate_tag_cost_sql(
                 cost_type, rate_type, tag_key, case_dict,
@@ -589,13 +589,15 @@ Same pattern for `_update_tag_usage_default_costs()`.
 
 **File:** `koku/masu/database/ocp_report_db_accessor.py`
 
-All cost population methods gain a `rate_name` keyword parameter (default `""`) and pass it to SQL params. This is a backward-compatible signature change — existing callers that don't pass `rate_name` get the default empty string.
+All cost population methods gain a `rate_name` keyword parameter (default `None`) and pass it to SQL params. This is a backward-compatible signature change — existing callers that don't pass `rate_name` get `NULL` in the database.
+
+**Why `None` and not `""`:** The column is `TextField(null=True)`. Cloud-sourced costs naturally have `NULL`. PostgreSQL treats `NULL` and `''` as different groups in `GROUP BY`, so using `None` (→ SQL `NULL`) keeps cost-model rows without a name in the same group as cloud-sourced rows. The API aggregates all `NULL`-named entries as `{"name": "Cloud cost", "source": "cloud"}`. In the SQL templates, the parameter is passed as `%(rate_name)s`, and psycopg2 correctly translates Python `None` to SQL `NULL`.
 
 #### 7.3.1 `populate_monthly_cost_sql()`
 
 ```python
 def populate_monthly_cost_sql(self, cost_type, rate_type, rate, start_date, end_date,
-                               distribution, provider_uuid, rate_name=""):
+                               distribution, provider_uuid, rate_name=None):
     # ... existing logic ...
     sql_params = {
         # ... existing params ...
@@ -607,7 +609,7 @@ def populate_monthly_cost_sql(self, cost_type, rate_type, rate, start_date, end_
 
 ```python
 def populate_tag_cost_sql(self, cost_type, rate_type, tag_key, case_dict, start_date, end_date,
-                           distribution, provider_uuid, rate_name=""):
+                           distribution, provider_uuid, rate_name=None):
     sql_params = {
         # ... existing params ...
         "rate_name": rate_name,  # NEW
@@ -620,7 +622,7 @@ def populate_tag_cost_sql(self, cost_type, rate_type, tag_key, case_dict, start_
 def populate_tag_usage_costs(self, infrastructure_rates, supplementary_rates,
                               start_date, end_date, cluster_id, tag_rate_names=None):
     # ... inner loop per (metric, tag_key, tag_value) ...
-    rate_name = (tag_rate_names or {}).get(metric, {}).get(tag_key, "")
+    rate_name = (tag_rate_names or {}).get(metric, {}).get(tag_key)
     sql_params["rate_name"] = rate_name
 ```
 
@@ -633,7 +635,7 @@ def populate_tag_based_costs(self, start_date, end_date, provider_uuid,
                               metric_to_tag_params_map, cluster_params):
     # ... existing iteration over metric_to_tag_params_map ...
     for tag_params in param_list:
-        rate_name = tag_params.get("name", "")  # NEW — from updated metric_to_tag_params_map
+        rate_name = tag_params.get("name")  # NEW — from updated metric_to_tag_params_map
         sql_params["rate_name"] = rate_name
 ```
 
@@ -1515,33 +1517,66 @@ Add a new report type or extend the existing `costs` / `costs_by_project` report
 
 Since the existing `ProviderMap` pattern works with a single `query_table`, and we need to query **two** tables (existing summary for aggregate + new breakdown for detail), the breakdown query is best handled as a **secondary query** in the query handler, not in the provider map annotations.
 
-However, we still need to define the breakdown table in the provider map so the query handler knows which table to use:
+The existing code dynamically selects the query table via `self._mapper.views[report_type][report_group]` (see `queries.py` line 220). The breakdown table must also vary by group-by, since node group-by needs `OCPCostBreakdownByNodeP` (which has the `node` column), not `OCPCostBreakdownP` (which doesn't).
+
+**Approach:** Add a parallel `breakdown_views` dict in the provider map, following the same `(group_by_tuple) → table` pattern as `self.views`:
 
 ```python
-# In the 'costs' report type mapping:
-"costs": {
-    "default": {
-        "default": {
-            "tables": {
-                "query": OCPCostSummaryP,
-                "breakdown": OCPCostBreakdownP,  # NEW
-            },
-            # ... existing annotations, filters, group_by ...
-        }
-    }
-},
-"costs_by_project": {
-    "default": {
-        "default": {
-            "tables": {
-                "query": OCPCostSummaryByProjectP,
-                "breakdown": OCPCostBreakdownByProjectP,  # NEW
-            },
-            # ...
-        }
-    }
-},
+# In self.views — existing, unchanged:
+self.views = {
+    "costs": {
+        "default": OCPCostSummaryP,
+        ("node",): OCPCostSummaryByNodeP,
+        ("cluster", "node"): OCPCostSummaryByNodeP,
+    },
+    "costs_by_project": {
+        "default": OCPCostSummaryByProjectP,
+        ("project",): OCPCostSummaryByProjectP,
+        ("cluster", "project"): OCPCostSummaryByProjectP,
+    },
+    "virtual_machines": {
+        "default": OCPVirtualMachineSummaryP,
+    },
+    # ...
+}
+
+# NEW — parallel breakdown_views:
+self.breakdown_views = {
+    "costs": {
+        "default": OCPCostBreakdownP,
+        ("node",): OCPCostBreakdownByNodeP,
+        ("cluster", "node"): OCPCostBreakdownByNodeP,
+    },
+    "costs_by_project": {
+        "default": OCPCostBreakdownByProjectP,
+        ("project",): OCPCostBreakdownByProjectP,
+        ("cluster", "project"): OCPCostBreakdownByProjectP,
+    },
+    "virtual_machines": {
+        "default": OCPVMBreakdownP,
+    },
+}
 ```
+
+The query handler resolves the breakdown table using the same group-by logic:
+
+```python
+def _get_breakdown_table(self):
+    """Select the breakdown table based on report type and group-by, mirroring self.views."""
+    report_type = self.query_parameters.get("report_type", "costs")
+    report_group = self._get_group_by()  # same tuple used for self.views
+    try:
+        return self._mapper.breakdown_views[report_type][report_group]
+    except KeyError:
+        return self._mapper.breakdown_views.get(report_type, {}).get("default")
+```
+
+This ensures that:
+- `costs` (no group-by or cluster group-by) → `OCPCostBreakdownP`
+- `costs` with `group_by[node]=*` → `OCPCostBreakdownByNodeP`
+- `costs_by_project` → `OCPCostBreakdownByProjectP`
+- `virtual_machines` → `OCPVMBreakdownP`
+- Tag group-by → falls back to `OCPUsageLineItemDailySummary` (handled separately in Section 11.4)
 
 #### 11.1.2 Breakdown PACK_DEFINITIONS
 
@@ -1566,7 +1601,7 @@ Add a method to query the breakdown table and attach results to the response:
 ```python
 def _get_breakdown_data(self, date_filter, group_filter=None):
     """Query the breakdown summary table for per-rate-name data."""
-    breakdown_table = self._mapper.report_type_map.get("tables", {}).get("breakdown")
+    breakdown_table = self._get_breakdown_table()
     if not breakdown_table:
         return {}
 
@@ -1706,7 +1741,8 @@ def _format_query_response(self):
                     cost[cost_key]["breakdown"] = self._apply_breakdown_limit(oh_breakdown, breakdown_limit)
 
     # Also attach breakdown to each data row (per date, per group-by value)
-    self._attach_breakdown_to_data_rows(output.get("data", []))
+    # Apply the same breakdown_limit to per-row breakdown for consistency
+    self._attach_breakdown_to_data_rows(output.get("data", []), breakdown_limit)
 
     return output
 
@@ -1760,12 +1796,13 @@ The breakdown should also appear on each row in the `data` array (each date's da
 **Concrete design:**
 
 ```python
-def _attach_breakdown_to_data_rows(self, data):
+def _attach_breakdown_to_data_rows(self, data, breakdown_limit=None):
     """Attach breakdown arrays to each data row.
 
     Strategy: single query, index by (date, group_by_value), attach in O(1) per row.
+    The same breakdown_limit applied to the total breakdown is also applied here.
     """
-    breakdown_table = self._mapper.report_type_map.get("tables", {}).get("breakdown")
+    breakdown_table = self._get_breakdown_table()
     if not breakdown_table:
         return
 
@@ -1806,10 +1843,13 @@ def _attach_breakdown_to_data_rows(self, data):
             group_value = row.get(group_by_field, "__all__") if group_by_field else "__all__"
             row_breakdown = breakdown_index.get((date_str, group_value), [])
             if row_breakdown:
-                self._inject_breakdown_into_cost(row, row_breakdown)
+                self._inject_breakdown_into_cost(row, row_breakdown, breakdown_limit)
 
-def _inject_breakdown_into_cost(self, row, breakdown_entries):
-    """Inject breakdown arrays into a row's cost structure."""
+def _inject_breakdown_into_cost(self, row, breakdown_entries, breakdown_limit=None):
+    """Inject breakdown arrays into a row's cost structure.
+
+    Applies the same breakdown_limit (top-N with "Other" aggregation) as the total.
+    """
     cost = row.get("cost", {})
 
     # Usage breakdown
@@ -1819,11 +1859,12 @@ def _inject_breakdown_into_cost(self, row, breakdown_entries):
         and e["cost_model_rate_name"]
     ]
     if usage_entries and "usage" in cost:
-        cost["usage"]["breakdown"] = [
+        usage_breakdown = [
             {"name": e["cost_model_rate_name"], "source": "rate",
              "value": e["total_cost"], "units": e.get("currency", "USD")}
             for e in sorted(usage_entries, key=lambda x: x["total_cost"], reverse=True)
         ]
+        cost["usage"]["breakdown"] = self._apply_breakdown_limit(usage_breakdown, breakdown_limit)
 
     # Overhead breakdown (same Cloud cost aggregation as total)
     overhead_map = {
@@ -1854,7 +1895,7 @@ def _inject_breakdown_into_cost(self, row, breakdown_entries):
                     "value": cloud_total, "units": currency,
                 })
             if oh_breakdown:
-                cost[cost_key]["breakdown"] = oh_breakdown
+                cost[cost_key]["breakdown"] = self._apply_breakdown_limit(oh_breakdown, breakdown_limit)
 ```
 
 **Performance:** Single query against the breakdown summary table (partitioned, indexed on `usage_start` and `cost_model_rate_name`). For 30 days × 50 projects × 5 rates × 6 rate_types = ~45,000 rows. With the index, this query completes in milliseconds. The in-memory index build and lookup are O(n) and O(1) respectively.
@@ -1913,7 +1954,7 @@ def execute_query(self):
     if self.is_csv_output:
         if self.parameters.get("breakdown_limit") is not None:
             # Use breakdown table — adds cost_model_rate_name as a dimension
-            breakdown_table = self._mapper.report_type_map.get("tables", {}).get("breakdown")
+            breakdown_table = self._get_breakdown_table()
             if breakdown_table:
                 query_data = breakdown_table.objects.filter(self.query_filter)
                 query_data = query_data.values(
@@ -2049,7 +2090,7 @@ Code triage confirms the GPU cost flow:
 4. It does NOT currently set `cost_model_rate_name`
 
 **Required changes (covered in PRs 3 + 8):**
-- `populate_tag_based_costs()` reads `tag_params.get("name", "")` and passes it to `monthly_cost_gpu.sql` as `{{rate_name}}` — this is already designed in PR 3
+- `populate_tag_based_costs()` reads `tag_params.get("name")` (returns `None` if absent) and passes it to `monthly_cost_gpu.sql` as `{{rate_name}}` — this is already designed in PR 3
 - `monthly_cost_gpu.sql` (both Trino and self-hosted) adds `cost_model_rate_name` to INSERT and SELECT — covered in PR 8
 - `OCPGpuSummaryP` model does NOT need `cost_model_rate_name` because GPU breakdown goes through the new breakdown summary tables, not the existing GPU summary table
 - GPU distribution (`distribute_unallocated_gpu_cost.sql`) gets per-rate-name tracking — covered in PR 5
@@ -2251,3 +2292,6 @@ All questions have been resolved. This section serves as a decision record.
 | 16 | Distribution SQL JOIN on `cost_model_rate_name` | Split into two CTEs: `cte_user_distribution` (no rate_name JOIN, correct usage proportions) + `cte_source_negation` (GROUP BY `filtered.cost_model_rate_name`, correct per-rate negation). UNION ALL for INSERT. Naive single-CTE approach fails because cost model rows lack usage hours. |
 | 17 | CSV breakdown semantics | `breakdown_limit` acts as boolean trigger for CSV — include `cost_model_rate_name` column, no top-N limiting. CSV always returns full data for spreadsheet analysis. |
 | 18 | Multiple monthly rates per metric | Fully supported. `_update_monthly_cost()` iterates over `rates_by_name` lists (same approach as tiered rates in PR 4), executing SQL once per rate entry. All rates for the same metric are applied with distinct `cost_model_rate_name`. |
+| 19 | Breakdown table selection by group-by | Use `self._mapper.breakdown_views` — a parallel dict to `self.views` that maps `(report_type, group_by_tuple) → breakdown_table`. Resolved via `_get_breakdown_table()` using the same group-by logic as existing table selection. This ensures node group-by gets `OCPCostBreakdownByNodeP` (which has the `node` column), not `OCPCostBreakdownP`. |
+| 20 | `breakdown_limit` applied to per-row data | Yes. The same `breakdown_limit` (top-N with "Other" aggregation) is applied to both the total breakdown and each per-row breakdown, for consistency. Passed through `_attach_breakdown_to_data_rows()` → `_inject_breakdown_into_cost()`. |
+| 21 | `rate_name` default: `None` vs `""` | Use `None` (→ SQL `NULL`), not `""` (→ SQL `''`). The column is `TextField(null=True)` and cloud-sourced costs naturally have `NULL`. PostgreSQL treats `NULL` and `''` as different `GROUP BY` buckets. Using `None` keeps all unnamed rows in one bucket. JinjaSql + psycopg2 correctly translates Python `None` to SQL `NULL`. |

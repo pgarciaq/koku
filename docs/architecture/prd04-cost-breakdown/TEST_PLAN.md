@@ -689,12 +689,12 @@ class OCPReportDBAccessorRateNameTest(MasuTestCase):
 
 **Fails because:** `populate_monthly_cost_sql` doesn't accept `rate_name`.
 
-#### T3.11 `test_populate_monthly_cost_sql_rate_name_defaults_empty`
+#### T3.11 `test_populate_monthly_cost_sql_rate_name_defaults_none`
 
 ```python
     @patch("masu.database.ocp_report_db_accessor.OCPReportDBAccessor._prepare_and_execute_raw_sql_query")
-    def test_populate_monthly_cost_sql_rate_name_defaults_empty(self, mock_execute):
-        """rate_name defaults to empty string when not provided (backward compat)."""
+    def test_populate_monthly_cost_sql_rate_name_defaults_none(self, mock_execute):
+        """rate_name defaults to None (→ SQL NULL) when not provided (backward compat)."""
         with OCPReportDBAccessor(self.schema) as acc:
             acc.populate_monthly_cost_sql(
                 "Node", "node_cost_per_month", Decimal("100"),
@@ -702,7 +702,7 @@ class OCPReportDBAccessorRateNameTest(MasuTestCase):
                 self.provider_uuid,
             )
         sql_params = mock_execute.call_args[0][2]
-        self.assertEqual(sql_params["rate_name"], "")
+        self.assertIsNone(sql_params["rate_name"])
 ```
 
 **Fails because:** `rate_name` not in SQL params.
@@ -1538,6 +1538,29 @@ class OCPCostQueryHandlerBreakdownTest(IamTestCase):
 
 **Fails because:** Per-row breakdown not attached.
 
+#### T7.8b `test_per_row_breakdown_respects_limit`
+
+```python
+    def test_per_row_breakdown_respects_limit(self):
+        """Per-row breakdown also applies breakdown_limit top-N with 'Other'."""
+        # Setup: breakdown data with 5+ rate names per date
+        url = reverse("reports-openshift-costs") + "?breakdown_limit=2"
+        client = APIClient()
+        response = client.get(url, **self.headers)
+        data = response.json()["data"]
+        for date_entry in data:
+            values = date_entry.get("values", date_entry.get("clusters", []))
+            for val in values if isinstance(values, list) else []:
+                cost = val.get("cost", {})
+                usage = cost.get("usage", {})
+                breakdown = usage.get("breakdown", [])
+                if breakdown:
+                    # At most 3 entries: 2 top + "Other"
+                    self.assertLessEqual(len(breakdown), 3)
+```
+
+**Fails because:** Per-row breakdown doesn't apply `breakdown_limit`.
+
 #### T7.9 `test_null_named_entries_aggregated_as_cloud_cost`
 
 ```python
@@ -1631,23 +1654,59 @@ class OCPCostQueryHandlerBreakdownTest(IamTestCase):
 
 ### RED phase — All required perspectives (PRD)
 
-#### T7.13b `test_provider_map_has_breakdown_table_entries`
+#### T7.13b `test_provider_map_has_breakdown_views`
 
 ```python
-    def test_provider_map_has_breakdown_table_entries(self):
-        """Provider map defines breakdown table for costs and costs_by_project."""
+    def test_provider_map_has_breakdown_views(self):
+        """Provider map defines breakdown_views for costs, costs_by_project, and VMs."""
         from api.report.ocp.provider_map import OCPProviderMap
-        provider_map = OCPProviderMap(self.provider, "costs")
-        tables = provider_map.report_type_map.get("tables", {})
-        self.assertIn("breakdown", tables)
-        self.assertIsNotNone(tables["breakdown"])
+        from reporting.provider.ocp.models import (
+            OCPCostBreakdownP, OCPCostBreakdownByProjectP,
+            OCPCostBreakdownByNodeP, OCPVMBreakdownP,
+        )
 
-        provider_map_project = OCPProviderMap(self.provider, "costs_by_project")
-        tables_proj = provider_map_project.report_type_map.get("tables", {})
-        self.assertIn("breakdown", tables_proj)
+        provider_map = OCPProviderMap(self.provider, "costs")
+        self.assertIn("costs", provider_map.breakdown_views)
+        self.assertEqual(provider_map.breakdown_views["costs"]["default"], OCPCostBreakdownP)
+        self.assertEqual(
+            provider_map.breakdown_views["costs"][("node",)], OCPCostBreakdownByNodeP
+        )
+
+        self.assertIn("costs_by_project", provider_map.breakdown_views)
+        self.assertEqual(
+            provider_map.breakdown_views["costs_by_project"]["default"],
+            OCPCostBreakdownByProjectP,
+        )
+
+        self.assertIn("virtual_machines", provider_map.breakdown_views)
+        self.assertEqual(
+            provider_map.breakdown_views["virtual_machines"]["default"], OCPVMBreakdownP
+        )
 ```
 
-**Fails because:** Provider map doesn't have `breakdown` key in tables.
+**Fails because:** Provider map doesn't define `breakdown_views`.
+
+#### T7.13f `test_get_breakdown_table_resolves_by_group_by`
+
+```python
+    def test_get_breakdown_table_resolves_by_group_by(self):
+        """Query handler selects correct breakdown table based on group-by."""
+        from reporting.provider.ocp.models import (
+            OCPCostBreakdownP, OCPCostBreakdownByNodeP,
+        )
+
+        # No group-by → default breakdown table
+        url = "?filter[time_scope_value]=-1&filter[time_scope_units]=month"
+        handler = OCPReportQueryHandler(url, self.tenant, **self.query_params)
+        self.assertEqual(handler._get_breakdown_table(), OCPCostBreakdownP)
+
+        # Node group-by → node breakdown table
+        url = "?filter[time_scope_value]=-1&filter[time_scope_units]=month&group_by[node]=*"
+        handler = OCPReportQueryHandler(url, self.tenant, **self.query_params)
+        self.assertEqual(handler._get_breakdown_table(), OCPCostBreakdownByNodeP)
+```
+
+**Fails because:** `_get_breakdown_table()` method doesn't exist yet.
 
 #### T7.13c `test_costs_by_project_includes_breakdown`
 
@@ -1732,11 +1791,12 @@ class OCPCostQueryHandlerBreakdownTest(IamTestCase):
 ### GREEN phase
 
 1. Add `breakdown_limit` to serializer → T7.1–T7.3 pass
-2. Add `_get_breakdown_data()`, `_build_usage_breakdown()`, `_build_overhead_breakdown()`, `_apply_breakdown_limit()` to query handler → T7.4–T7.7, T7.9 pass
-3. Add `_attach_breakdown_to_data_rows()` → T7.8 passes
-4. Add CSV breakdown path in `execute_query()` → T7.11 passes
-5. Add `BreakdownMixin` and use in OCP-on-cloud handlers → T7.13 passes
-6. Add `_get_breakdown_data_for_tags()` → T7.14 passes
+2. Add `breakdown_views` to provider map, `_get_breakdown_table()` to query handler → T7.13b, T7.13f pass
+3. Add `_get_breakdown_data()`, `_build_usage_breakdown()`, `_build_overhead_breakdown()`, `_apply_breakdown_limit()` to query handler → T7.4–T7.7, T7.9 pass
+4. Add `_attach_breakdown_to_data_rows()` with `breakdown_limit` passthrough → T7.8, T7.8b pass
+5. Add CSV breakdown path in `execute_query()` → T7.11 passes
+6. Add `BreakdownMixin` and use in OCP-on-cloud handlers → T7.13 passes
+7. Add `_get_breakdown_data_for_tags()` → T7.14 passes
 
 ### REFACTOR phase
 
@@ -1989,7 +2049,7 @@ PR 4 tests (T4.1–T4.7)           → tiered rate refactoring
 PR 5 tests (T5.1–T5.5)           → distribution per-rate-name
 PR 6 tests (T6.1–T6.9)           → breakdown summary tables
                                   ↓
-PR 7 tests (T7.1–T7.14, T7.13b-e) → API layer
+PR 7 tests (T7.1–T7.14, T7.8b, T7.13b-f) → API layer
 PR 8 tests (T8.1–T8.3)           → Trino + self-hosted SQL
                                   ↓
 E2E tests (T-E2E.1–T-E2E.4)      → full pipeline verification
@@ -2023,7 +2083,7 @@ E2E tests (T-E2E.1–T-E2E.4)      → full pipeline verification
 | PR 4 | 7 | Per-rate execution, multiple rates, delete-once, updater integration |
 | PR 5 | 5 | Distribution rate-name tracking, conservation, negation |
 | PR 6 | 9 | Model existence, population, cleanup, group-by, VM names, tag cost type |
-| PR 7 | 19 | Serializer params, JSON breakdown, CSV, OCP-on-cloud, tag/node/project/VM perspectives, provider map |
+| PR 7 | 21 | Serializer params, JSON breakdown, CSV, OCP-on-cloud, tag/node/project/VM perspectives, provider map, breakdown_views, per-row limit |
 | PR 8 | 3 | SQL file content verification |
 | E2E | 4 | Full pipeline, backward compat |
-| **Total** | **77** | |
+| **Total** | **79** | |
