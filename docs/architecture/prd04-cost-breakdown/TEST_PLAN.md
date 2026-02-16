@@ -962,6 +962,48 @@ class PopulateUsageCostsByNameTest(MasuTestCase):
 
 **Fails because:** SQL template not yet modified.
 
+#### T4.6b `test_cluster_cost_per_hour_distributed_to_cpu_and_memory`
+
+```python
+    def test_cluster_cost_per_hour_distributed_to_cpu_and_memory(self):
+        """cluster_cost_per_hour in per-rate mode distributes across CPU and memory columns."""
+        rates_by_name = [
+            {"metric": "cluster_cost_per_hour", "value": Decimal("10.00"), "name": "Cluster hourly"},
+        ]
+        with OCPReportDBAccessor(self.schema) as acc:
+            acc.populate_usage_costs_by_name(
+                "Infrastructure", rates_by_name, "cpu",
+                self.start_date, self.end_date, self.provider_uuid,
+                self.report_period_id,
+            )
+        with schema_context(self.schema):
+            rows = OCPUsageLineItemDailySummary.objects.filter(
+                cost_model_rate_name="Cluster hourly",
+                cost_model_rate_type="Infrastructure",
+                monthly_cost_type__isnull=True,
+                usage_start__gte=self.start_date,
+            )
+            self.assertTrue(rows.exists(), "cluster_cost_per_hour should produce rows")
+            for row in rows:
+                # cluster_cost_per_hour distributes to both cpu and memory columns
+                # based on the distribution setting. At least one should be non-zero.
+                has_cost = (
+                    (row.cost_model_cpu_cost or 0) != 0
+                    or (row.cost_model_memory_cost or 0) != 0
+                )
+                self.assertTrue(has_cost,
+                    f"cluster_cost_per_hour row should have cpu or memory cost, "
+                    f"got cpu={row.cost_model_cpu_cost}, mem={row.cost_model_memory_cost}")
+            # Verify volume cost is zero (cluster_cost_per_hour doesn't apply to storage)
+            volume_sum = sum(
+                (r.cost_model_volume_cost or 0) for r in rows
+            )
+            self.assertEqual(volume_sum, 0,
+                "cluster_cost_per_hour should not produce volume cost")
+```
+
+**Fails because:** `populate_usage_costs_by_name` doesn't exist, and when it does, must correctly handle the `cluster_cost_per_hour` metric which splits cost across CPU and memory columns via `cte_node_cost` in the SQL.
+
 #### T4.7 `test_updater_calls_populate_usage_costs_by_name`
 
 ```python
@@ -992,7 +1034,7 @@ class PopulateUsageCostsByNameTest(MasuTestCase):
 ### GREEN phase
 
 1. Add `cost_model_rate_name` to `usage_costs.sql` INSERT + SELECT, remove leading DELETE → T4.6 passes
-2. Implement `populate_usage_costs_by_name()` with per-rate loop → T4.1–T4.5 pass
+2. Implement `populate_usage_costs_by_name()` with per-rate loop → T4.1–T4.5, T4.6b pass
 3. Update `_update_usage_costs()` in updater to call new method → T4.7 passes
 
 ### REFACTOR phase
@@ -2044,7 +2086,7 @@ PR 1 tests (T1.1–T1.11)          → implements rate name field
 PR 2 tests (T2.1–T2.3)           → implements line item column
                                   ↕ (parallel)
 PR 3 tests (T3.1–T3.14, T3.9b-c) → rate name threading
-PR 4 tests (T4.1–T4.7)           → tiered rate refactoring
+PR 4 tests (T4.1–T4.7, T4.6b)    → tiered rate refactoring
                                   ↕ (parallel with PR 6)
 PR 5 tests (T5.1–T5.5)           → distribution per-rate-name
 PR 6 tests (T6.1–T6.9)           → breakdown summary tables
@@ -2080,10 +2122,10 @@ E2E tests (T-E2E.1–T-E2E.4)      → full pipeline verification
 | PR 1 | 11 | Serializer validation, migration logic |
 | PR 2 | 3 | Model field, column existence |
 | PR 3 | 16 | Accessor properties, updater threading (incl. monthly tag + GPU), SQL params, DB writes |
-| PR 4 | 7 | Per-rate execution, multiple rates, delete-once, updater integration |
+| PR 4 | 8 | Per-rate execution, multiple rates, delete-once, cluster_cost_per_hour, updater integration |
 | PR 5 | 5 | Distribution rate-name tracking, conservation, negation |
 | PR 6 | 9 | Model existence, population, cleanup, group-by, VM names, tag cost type |
 | PR 7 | 21 | Serializer params, JSON breakdown, CSV, OCP-on-cloud, tag/node/project/VM perspectives, provider map, breakdown_views, per-row limit |
 | PR 8 | 3 | SQL file content verification |
 | E2E | 4 | Full pipeline, backward compat |
-| **Total** | **79** | |
+| **Total** | **80** | |
