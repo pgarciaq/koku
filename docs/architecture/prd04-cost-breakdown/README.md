@@ -250,11 +250,13 @@ This breakdown must be available for all OCP report perspectives:
 
 ### Environment Support
 
-| Environment | Raw cost breakdown | Usage cost breakdown | Overhead breakdown | Markup breakdown |
+This table shows the target state across both phases. Phase 1 delivers usage cost and overhead breakdown only. Raw cost and markup breakdown are Phase 2.
+
+| Environment | Raw cost breakdown (Phase 2) | Usage cost breakdown (Phase 1) | Overhead breakdown (Phase 1) | Markup breakdown (Phase 2) |
 |-------------|-------------------|---------------------|-------------------|-----------------|
-| OCP on-prem (PostgreSQL-only) | N/A (no cloud) | By rate name | By rate name proportions | By rate name proportions |
+| OCP on-prem (PostgreSQL-only) | N/A (no cloud) | By rate name | By rate name proportions | N/A (no cloud raw cost, so no markup) |
 | OCP on-cloud (Trino + PostgreSQL) | By product_code/service_name | By rate name | By rate name + service proportions | By service proportions |
-| OCP Virtualization on-prem | N/A (no cloud) | By rate name | By rate name proportions | By rate name proportions |
+| OCP Virtualization on-prem | N/A (no cloud) | By rate name | By rate name proportions | N/A (no cloud raw cost, so no markup) |
 | OCP Virtualization on-cloud | By product_code/service_name | By rate name | By rate name + service proportions | By service proportions |
 
 ---
@@ -449,7 +451,7 @@ The `POST/PUT /api/cost-management/v1/cost-models/` `rates` array gains a new `n
 
 ### Phase 1: Custom Rate Breakdown (COST-2105)
 
-**Scope:** Break down "usage cost" into individual price list rate names. Break down overhead and markup costs proportionally by rate name. Works on all environments (on-prem and cloud).
+**Scope:** Break down "usage cost" into individual price list rate names. Break down overhead costs by pre-computed per-rate-name attribution from the distribution SQL. Raw cost and markup remain as single aggregates (deferred to Phase 2). Works on all environments (on-prem and cloud).
 
 **Backend changes:**
 
@@ -462,10 +464,10 @@ The `POST/PUT /api/cost-management/v1/cost-models/` `rates` array gains a new `n
    - **Monthly rates** (`monthly_cost_cluster_and_node.sql`, `monthly_cost_persistentvolumeclaim.sql`, `monthly_cost_virtual_machine.sql`): Already executed per cost type -- add `{{rate_name}}` parameter. Straightforward.
    - **VM rates** (`hourly_cost_virtual_machine.sql`, `hourly_vm_core.sql`, `monthly_vm_core.sql`): Already per-rate execution -- add `{{rate_name}}` parameter.
    - **Tiered usage rates** (`usage_costs.sql`): Currently applies ALL tiered rates in a single INSERT (cpu + memory + volume together). Must be refactored to execute per-rate so each rate gets its own `cost_model_rate_name`. See [Tiered Rate Attribution](#tiered-rate-attribution) below.
-6. **Distribution SQL**: No changes needed. Distribution rows carry `cost_model_rate_type` only (e.g., `platform_distributed`). The breakdown of overhead by constituent is computed at query time from the receiving project's cost composition. See [Overhead Distribution Breakdown](#overhead-distribution-breakdown) below.
+6. **Distribution SQL**: Modified to distribute per `cost_model_rate_name` (split CTE pattern). Distributed rows carry both `cost_model_rate_type` and `cost_model_rate_name`, so overhead breakdown is pre-computed at distribution time, not approximated at query time. See [Overhead Distribution Breakdown](#overhead-distribution-breakdown) below.
 7. **New breakdown summary tables** (zero regression risk): Create **parallel** breakdown-specific summary tables (e.g., `reporting_ocp_cost_breakdown_by_project_p`) that GROUP BY `cost_model_rate_name`. Existing summary tables remain untouched. The API queries existing tables for aggregate response and new tables for the `breakdown` array.
 8. **Provider map**: Add new annotations for the breakdown aggregation. Extend `PACK_DEFINITIONS` with breakdown keys.
-9. **Query handler**: Extend `_format_query_response()` to include the `breakdown` field in each cost category. Compute overhead proportional breakdown at query time.
+9. **Query handler**: Extend `_format_query_response()` to include the `breakdown` field in each cost category. Read pre-computed overhead breakdown from the breakdown summary tables (no query-time proportional computation).
 10. **Migration**: Django migration 0344+ adding the `cost_model_rate_name` column. Separate migration for new breakdown summary tables. Data migration for existing cost model rate names.
 
 **Frontend changes:**
@@ -560,16 +562,11 @@ The rate `description` field exists in the JSON but is **never read** by the acc
 | Network | `Network unattributed` | `unattributed_network` | CPU/memory usage share |
 | GPU | `GPU unallocated` | `gpu_distributed` | Pod uptime share (from `openshift_gpu_usage_line_items_daily`) |
 
-**Decision: No changes to distribution SQL.** The distribution SQL does not need modification. Distributed cost rows will not carry a `cost_model_rate_name` (it would be meaningless -- they represent redistributed overhead, not a specific rate).
+**Decision: Distribute per `cost_model_rate_name` in SQL (split CTE pattern).** The distribution SQL is modified to iterate over each unique `cost_model_rate_name` in the source namespace, distributing each rate's cost share separately. Distributed rows now carry both `cost_model_rate_type` (e.g., `'platform_distributed'`) AND `cost_model_rate_name` (e.g., `'JBoss subscription'`). This produces accurate per-rate-name overhead attribution pre-computed at distribution time.
 
-**Breakdown of overhead at query time:** The query handler computes the proportional breakdown of each overhead category using the receiving entity's (project/cluster/node) cost composition from the new breakdown summary tables:
+**Why not query-time proportional approximation?** Platform namespaces may have a completely different cost composition than user namespaces. A query-time proportional model would incorrectly attribute overhead using the receiving project's cost mix rather than the source platform's actual cost composition. Pre-computing at distribution time uses the correct source data.
 
-1. Query the entity's total costs by `cost_model_rate_name` from the breakdown table (e.g., "JBoss subscription: $40, Quota charge: $80, AmazonEC2: $183, ...")
-2. Compute each constituent's share as a percentage of the entity's total non-overhead cost
-3. Apply those percentages to each overhead category's total (e.g., platform_distributed: $59 * 6% = $3.54 for JBoss subscription)
-4. Return the result in the `breakdown` array
-
-This keeps the distribution SQL simple and avoids storing redundant data. Performance is acceptable because the breakdown data is already queried for the `usage` category.
+The query handler simply reads the pre-computed breakdown from the breakdown summary tables — no proportional computation needed at query time.
 
 ### Markup Breakdown
 

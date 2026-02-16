@@ -2071,9 +2071,9 @@ class CostBreakdownE2ETest(IamTestCase):
 
 ## PRD vs DD: Explicitly Out of Scope for Phase 1
 
-The PRD acceptance criteria (line 552) lists "Markup breakdown reflects proportional attribution by the entity's infrastructure raw cost composition" under Phase 1. However, the PRD's own implementation notes (line 472) state: "markup breakdown is deferred to Phase 2" because markup applies to cloud raw cost, which doesn't have per-service granularity until Phase 2. The DD follows this (Section 13.3: "markup breakdown deferred"). For pure on-prem OCP, markup is $0.
+The PRD acceptance criteria has been updated to explicitly state that `raw` and `markup` remain unchanged in Phase 1 (no `breakdown` array — deferred to Phase 2). Markup applies to cloud raw cost, which doesn't have per-service granularity until Phase 2. The DD follows this (Section 13.3: "markup breakdown deferred"). For pure on-prem OCP, markup is $0.
 
-**No markup breakdown tests are included in this plan.** The PRD acceptance criteria should be updated to move this item to Phase 2.
+**No markup breakdown tests are included in this plan.** This is correct and consistent with the PRD and DD.
 
 ---
 
