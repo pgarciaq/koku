@@ -41,12 +41,13 @@ This document describes the technical design for the "Cost Breakdown for Custom 
 |----------|--------|-----------|
 | Rate attribution granularity | New `cost_model_rate_name` column on `OCPUsageLineItemDailySummary` | Follows existing `cost_model_rate_type` multiplicative-row pattern; enables standard GROUP BY |
 | Summary table strategy | New parallel breakdown tables | Zero regression risk; existing tables, dashboards, CSVs, and forecasting untouched |
-| Overhead breakdown | Per-rate distribution in SQL (not query-time approximation) | Accurate attribution required; query-time proportional approximation rejected because Platform namespaces may have a completely different cost composition than user namespaces |
+| Overhead breakdown | Per-rate distribution in SQL (split CTE: distribution + negation) | Accurate attribution required; naive single-CTE fails because cost model rows lack usage hours |
 | Tiered rate refactoring | Per-rate execution of `usage_costs.sql` | Required to attribute each rate to its own `cost_model_rate_name` |
 | Multiple rates per metric | Supported via list-based rate structures | Real use case: users may define separate named rates for the same metric |
 | Accessor refactoring | New parallel properties (no breaking change) | Existing `infrastructure_rates` etc. kept as-is; new `infrastructure_rates_by_name` added |
 | Markup breakdown | Deferred to Phase 2 | Markup applies to infrastructure raw cost (cloud), which needs per-service granularity |
 | GPU rate name | Covered in Phase 1 | GPU cost goes through `populate_tag_based_costs()` which already threads `metric_to_tag_params_map` |
+| Rate `name` field | Mandatory from day one | Data migration auto-generates names for existing rates; API rejects requests without `name` |
 
 ---
 
@@ -175,7 +176,7 @@ Add `name` field to `RateSerializer`:
 class RateSerializer(serializers.Serializer):
     """Serializer for the rate objects within a cost model."""
 
-    name = serializers.CharField(max_length=50, required=False, allow_blank=True, default="")
+    name = serializers.CharField(max_length=50, required=True)
     metric = MetricSerializer(required=True)
     description = serializers.CharField(max_length=500, required=False, allow_blank=True, default="")
     cost_type = serializers.ChoiceField(choices=metric_constants.COST_TYPE_CHOICES, required=True)
@@ -183,19 +184,18 @@ class RateSerializer(serializers.Serializer):
     tag_rates = TagRateSerializer(required=False)
 ```
 
-**Note:** `name` is initially `required=False` with auto-generation fallback. This decouples the backend and frontend deployment — existing API clients (including the UI) won't break. Once the frontend is updated to send `name`, we flip to `required=True` in a follow-up.
+**`name` is mandatory from day one.** The data migration (Section 5.2) populates names for all existing rates before this code ships. The frontend must be updated to send `name` in the same release. There is no auto-generation fallback in the serializer — if `name` is missing, the API rejects the request.
 
-**Auto-generation in `CostModelSerializer.validate()`:**
+**Uniqueness validation in `CostModelSerializer.validate()`:**
 
 ```python
 def validate_rates(self, rates):
-    """Validate and auto-generate rate names."""
+    """Validate rate names are unique within the cost model."""
     used_names = set()
     for rate in rates:
         name = rate.get("name", "").strip()
         if not name:
-            name = _generate_name(rate, used_names)
-            rate["name"] = name
+            raise serializers.ValidationError("Rate name is required.")
         if name in used_names:
             raise serializers.ValidationError(
                 f"Rate names must be unique within a cost model. Duplicate: '{name}'"
@@ -204,13 +204,13 @@ def validate_rates(self, rates):
     return rates
 ```
 
-The `_generate_name()` function uses the same logic as the data migration (see 5.2). The uniqueness validation happens at the serializer level since rates are stored as a JSONField on the `CostModel` model — there is no separate `Rate` model with a unique constraint.
+The uniqueness validation happens at the serializer level since rates are stored as a JSONField on the `CostModel` model — there is no separate `Rate` model with a unique constraint.
 
 ### 5.2 Data Migration for Existing Rates
 
 **File:** `koku/cost_models/migrations/NNNN_rate_name_migration.py`
 
-This is a `RunPython` data migration that iterates over all `CostModel` objects and populates `name` for each rate in the `rates` JSON array:
+This is a `RunPython` data migration that iterates over all `CostModel` objects and populates `name` for each rate in the `rates` JSON array. **Auto-generated names are only used here** — once the migration runs, all rates have names, and the API enforces `name` as mandatory from then on. Users can rename auto-generated names via the API/UI at any time.
 
 ```python
 def populate_rate_names(apps, schema_editor):
@@ -891,27 +891,26 @@ After PRs 3-4 merge, all cost-model-attributed rows in `OCPUsageLineItemDailySum
 
 ### 9.3 Modified `distribute_platform_cost.sql`
 
-**Current `platform_cost` CTE:**
+#### 9.3.1 Why the Naive Approach Fails
 
-```sql
-platform_cost AS (
-    SELECT SUM(
-            COALESCE(infrastructure_raw_cost, 0) +
-            COALESCE(infrastructure_markup_cost, 0) +
-            COALESCE(cost_model_cpu_cost, 0) +
-            COALESCE(cost_model_memory_cost, 0) +
-            COALESCE(cost_model_volume_cost, 0)
-        ) as platform_cost,
-        filtered.usage_start,
-        filtered.source_uuid,
-        filtered.cluster_id
-    FROM cte_narrow_dataset as filtered
-    WHERE category_name = 'Platform'
-    GROUP BY filtered.usage_start, filtered.cluster_id, filtered.source_uuid
-)
-```
+A naive approach — adding `cost_model_rate_name` to the JOIN between `platform_cost` and `cte_narrow_dataset` — **does not work**. The fundamental issue:
 
-**New `platform_cost` CTE (per rate name):**
+- **Raw data rows** have `cost_model_rate_name = NULL` and `pod_effective_usage_cpu_core_hours > 0`
+- **Cost model rows** (from `usage_costs.sql`) have `cost_model_rate_name = 'CPU rate'` etc. but `pod_effective_usage_cpu_core_hours = NULL` (usage hours are NOT in the INSERT column list of `usage_costs.sql`)
+
+A JOIN on `cost_model_rate_name` would match user-namespace cost model rows (no usage hours) to platform cost model rows — producing `distributed_cost = 0` for every rate-named entry. Only NULL-named (cloud) cost would be distributed. This is wrong: "JBoss subscription" platform cost must be distributed to ALL user namespaces proportionally.
+
+Conversely, removing the JOIN condition entirely breaks **Platform negation** — the `WHEN category_name = 'Platform'` case would over-negate by M× (once per platform rate name).
+
+#### 9.3.2 Correct Approach: Split Distribution and Negation
+
+The solution is to split into two CTEs with a UNION ALL:
+
+1. **`cte_user_distribution`** — distributes each rate name's source cost to user namespaces proportionally by usage. Does NOT join on `cost_model_rate_name`. Usage comes from raw data rows (cost model rows contribute NULL/0).
+
+2. **`cte_source_negation`** — negates each rate name's cost in the source namespace (Platform). Groups by `filtered.cost_model_rate_name` to negate per-rate.
+
+**New `platform_cost` CTE (per rate name) — unchanged from before:**
 
 ```sql
 platform_cost AS (
@@ -925,7 +924,7 @@ platform_cost AS (
         filtered.usage_start,
         filtered.source_uuid,
         filtered.cluster_id,
-        filtered.cost_model_rate_name   -- NEW
+        filtered.cost_model_rate_name   -- NEW: group by rate name
     FROM cte_narrow_dataset as filtered
     WHERE category_name = 'Platform'
     GROUP BY filtered.usage_start, filtered.cluster_id, filtered.source_uuid,
@@ -933,40 +932,102 @@ platform_cost AS (
 )
 ```
 
-**Modified `cte_line_items`:**
+**`user_defined_project_sum` — unchanged.** Usage proportions do not depend on rate name.
 
-The join changes from `(usage_start, cluster_id)` to `(usage_start, cluster_id, cost_model_rate_name)`. The distributed_cost computation is per rate name:
+**New `cte_user_distribution` (replaces user-namespace portion of `cte_line_items`):**
 
 ```sql
-cte_line_items as (
+cte_user_distribution as (
     SELECT
-        -- ... existing columns ...
-        CASE WHEN {{distribution}} = 'cpu' AND (...) THEN
-            (sum(pod_effective_usage_cpu_core_hours) / max(udps.usage_cpu_sum))
-            * max(pc.platform_cost)::decimal
-        -- ... memory case ...
+        max(report_period_id) as report_period_id,
+        filtered.cluster_id,
+        max(cluster_alias) as cluster_alias,
+        filtered.data_source,
+        filtered.usage_start,
+        max(usage_end) as usage_end,
+        filtered.namespace,
+        filtered.node,
+        max(resource_id) as resource_id,
+        max(node_capacity_cpu_cores) as node_capacity_cpu_cores,
+        max(node_capacity_cpu_core_hours) as node_capacity_cpu_core_hours,
+        max(node_capacity_memory_gigabytes) as node_capacity_memory_gigabytes,
+        max(node_capacity_memory_gigabyte_hours) as node_capacity_memory_gigabyte_hours,
+        max(cluster_capacity_cpu_core_hours) as cluster_capacity_cpu_core_hours,
+        max(cluster_capacity_memory_gigabyte_hours) as cluster_capacity_memory_gigabyte_hours,
+        CASE WHEN {{distribution}} = 'cpu' THEN
+            CASE WHEN max(udps.usage_cpu_sum) <= 0 THEN 0
+            ELSE
+                (sum(pod_effective_usage_cpu_core_hours) / max(udps.usage_cpu_sum))
+                * max(pc.platform_cost)::decimal
+            END
+        WHEN {{distribution}} = 'memory' THEN
+            CASE WHEN max(udps.usage_memory_sum) <= 0 THEN 0
+            ELSE
+                (sum(pod_effective_usage_memory_gigabyte_hours) / max(udps.usage_memory_sum))
+                * max(pc.platform_cost)::decimal
+            END
         END AS distributed_cost,
-        pc.cost_model_rate_name,   -- NEW: carry through from platform_cost
+        pc.cost_model_rate_name,   -- from platform_cost, NOT from filtered
         max(cost_category_id) as cost_category_id
     FROM cte_narrow_dataset as filtered
     JOIN platform_cost as pc
         ON pc.usage_start = filtered.usage_start
         AND pc.cluster_id = filtered.cluster_id
-        AND (pc.cost_model_rate_name = filtered.cost_model_rate_name
-             OR (pc.cost_model_rate_name IS NULL AND filtered.cost_model_rate_name IS NULL))
+        -- NO cost_model_rate_name condition: each user row joins to ALL rate names
     JOIN user_defined_project_sum as udps
         ON udps.usage_start = filtered.usage_start
         AND udps.cluster_id = filtered.cluster_id
     WHERE filtered.namespace IS NOT NULL
+        AND (cost_category_id IS NULL OR max(filtered.category_name) != 'Platform')
     GROUP BY filtered.usage_start, filtered.node, filtered.namespace,
              filtered.cluster_id, cost_category_id, filtered.data_source,
-             pc.cost_model_rate_name   -- NEW
+             pc.cost_model_rate_name   -- produces M rows per user entity
 )
 ```
 
-**Modified INSERT:**
+**Why this works:** `cte_narrow_dataset` includes both raw data rows and cost model rows. The GROUP BY on `pc.cost_model_rate_name` creates M groups (one per platform rate name). Within each group, the same filtered rows appear. `sum(pod_effective_usage_cpu_core_hours)` only picks up values from raw data rows (cost model rows have NULL for usage hours, contributing 0). `max(pc.platform_cost)` picks up this rate name's platform cost. Result: each user entity gets `(usage / total) × rate_name_platform_cost` — correct proportional distribution per rate name.
 
-The INSERT adds `cost_model_rate_name` to the column list:
+**New `cte_source_negation` (replaces Platform-namespace portion of `cte_line_items`):**
+
+```sql
+cte_source_negation as (
+    SELECT
+        max(report_period_id) as report_period_id,
+        filtered.cluster_id,
+        max(cluster_alias) as cluster_alias,
+        filtered.data_source,
+        filtered.usage_start,
+        max(usage_end) as usage_end,
+        filtered.namespace,
+        filtered.node,
+        max(resource_id) as resource_id,
+        max(node_capacity_cpu_cores) as node_capacity_cpu_cores,
+        max(node_capacity_cpu_core_hours) as node_capacity_cpu_core_hours,
+        max(node_capacity_memory_gigabytes) as node_capacity_memory_gigabytes,
+        max(node_capacity_memory_gigabyte_hours) as node_capacity_memory_gigabyte_hours,
+        max(cluster_capacity_cpu_core_hours) as cluster_capacity_cpu_core_hours,
+        max(cluster_capacity_memory_gigabyte_hours) as cluster_capacity_memory_gigabyte_hours,
+        0 - SUM(
+            COALESCE(infrastructure_raw_cost, 0) +
+            COALESCE(infrastructure_markup_cost, 0) +
+            COALESCE(cost_model_cpu_cost, 0) +
+            COALESCE(cost_model_memory_cost, 0) +
+            COALESCE(cost_model_volume_cost, 0)
+        ) AS distributed_cost,
+        filtered.cost_model_rate_name,   -- from filtered rows, per-rate negation
+        max(cost_category_id) as cost_category_id
+    FROM cte_narrow_dataset as filtered
+    WHERE filtered.namespace IS NOT NULL
+        AND category_name = 'Platform'
+    GROUP BY filtered.usage_start, filtered.node, filtered.namespace,
+             filtered.cluster_id, cost_category_id, filtered.data_source,
+             filtered.cost_model_rate_name   -- one negative row per rate name
+)
+```
+
+**Why this works:** Groups Platform rows by `filtered.cost_model_rate_name`. Raw data rows (rate_name NULL) produce a negative row for cloud cost. Cost model rows (rate_name 'CPU rate', 'Memory rate') produce negative rows for each rate's cost. The sum of all negation rows = total platform cost, matching the sum of all distribution rows.
+
+**Modified INSERT (UNION ALL):**
 
 ```sql
 INSERT INTO {{schema | sqlsafe}}.reporting_ocpusagelineitem_daily_summary (
@@ -979,21 +1040,45 @@ INSERT INTO {{schema | sqlsafe}}.reporting_ocpusagelineitem_daily_summary (
 SELECT
     -- ...
     {{cost_model_rate_type}} as cost_model_rate_type,
-    ctl.cost_model_rate_name,   -- NEW: from CTE
+    ctl.cost_model_rate_name,
     ctl.distributed_cost,
     ctl.cost_category_id
-FROM cte_line_items as ctl
+FROM cte_user_distribution as ctl
+WHERE ctl.distributed_cost != 0
+
+UNION ALL
+
+SELECT
+    -- ... same columns ...
+    {{cost_model_rate_type}} as cost_model_rate_type,
+    ctl.cost_model_rate_name,
+    ctl.distributed_cost,
+    ctl.cost_category_id
+FROM cte_source_negation as ctl
 WHERE ctl.distributed_cost != 0;
 ```
 
-**Result:** Each distributed row now carries the `cost_model_rate_name` of the source cost it originated from. A project receiving $59 of platform distributed cost might get:
+**Result:** Each distributed row carries the `cost_model_rate_name` of the source cost it originated from. A project receiving $59 of platform distributed cost might get:
 - $21 with `cost_model_rate_name = NULL` (from infrastructure_raw_cost, i.e., AmazonEC2 — Phase 2)
 - $7 with `cost_model_rate_name = 'JBoss subscription'`
 - $7 with `cost_model_rate_name = NULL` (from AmazonRDS raw cost — Phase 2)
 - $3 with `cost_model_rate_name = 'Quota charge'`
 - $21 with `cost_model_rate_name = NULL` (from Red Hat OpenShift Service on AWS raw cost — Phase 2)
 
-In Phase 1, cloud-sourced costs have `cost_model_rate_name = NULL`. The breakdown groups those as "unattributed cloud cost" or omits them. In Phase 2, `product_code`/`service_name` fills the gap.
+In Phase 1, cloud-sourced costs have `cost_model_rate_name = NULL`. The API aggregates these as `{"name": "Cloud cost", "source": "cloud"}`. In Phase 2, `product_code`/`service_name` fills the gap.
+
+#### 9.3.3 Validation
+
+The sum of all `cte_user_distribution` rows + all `cte_source_negation` rows should equal zero (costs are redistributed, not created or destroyed). This can be verified with:
+
+```sql
+SELECT SUM(distributed_cost)
+FROM {{schema}}.reporting_ocpusagelineitem_daily_summary
+WHERE cost_model_rate_type = 'platform_distributed'
+  AND usage_start BETWEEN {{start_date}} AND {{end_date}}
+  AND source_uuid = {{source_uuid}};
+-- Expected: 0
+```
 
 ### 9.4 `cte_narrow_dataset` Change
 
@@ -1016,15 +1101,23 @@ The `user_defined_project_sum` CTE computes CPU/memory usage totals for distribu
 
 ### 9.6 All Five Distribution Types
 
-The same pattern applies to all five distribution SQL files:
+The same split-CTE pattern (`cte_user_distribution` + `cte_source_negation` + UNION ALL) applies to all five distribution SQL files:
 
-| File | Source CTE | Change |
-|------|-----------|--------|
-| `distribute_platform_cost.sql` | `platform_cost` | Add `cost_model_rate_name` GROUP BY + JOIN + INSERT |
-| `distribute_worker_cost.sql` | `worker_cost` | Same pattern |
-| `distribute_unattributed_storage_cost.sql` | `unattributed_storage_cost` | Same pattern |
-| `distribute_unattributed_network_cost.sql` | `unattributed_network_cost` | Same pattern |
-| `distribute_unallocated_gpu_cost.sql` (Trino + self-hosted) | `gpu_cost` | Same pattern |
+| File | Source CTE | Source Namespace | Change |
+|------|-----------|-----------------|--------|
+| `distribute_platform_cost.sql` | `platform_cost` | `category_name = 'Platform'` | Split into distribution + negation CTEs |
+| `distribute_worker_cost.sql` | `worker_cost` | `namespace = 'Worker unallocated'` | Same split pattern |
+| `distribute_unattributed_storage_cost.sql` | `unattributed_storage_cost` | `namespace = 'Storage unattributed'` | Same split pattern |
+| `distribute_unattributed_network_cost.sql` | `unattributed_network_cost` | `namespace = 'Network unattributed'` | Same split pattern |
+| `distribute_unallocated_gpu_cost.sql` (Trino + self-hosted) | `gpu_cost` | GPU unallocated rows | Same split pattern |
+
+Each file follows the same structure:
+1. **Source cost CTE**: adds `cost_model_rate_name` to GROUP BY
+2. **`cte_user_distribution`**: joins source cost to user rows WITHOUT `cost_model_rate_name` condition; GROUP BY includes `source_cost.cost_model_rate_name`
+3. **`cte_source_negation`**: groups source-namespace rows by `filtered.cost_model_rate_name` for per-rate negation
+4. **INSERT**: UNION ALL of distribution + negation, with `cost_model_rate_name` in column list
+
+**Note on `cte_narrow_dataset` after PR 4:** After per-rate execution of `usage_costs.sql`, the line item table has more rows (one per rate instead of one per rate_type). `cte_narrow_dataset` picks up all of them (it has no filter on `cost_model_rate_type`). This does NOT affect correctness — cost model rows contribute NULL/0 to usage hour sums, and the GROUP BY absorbs the extra rows. However, it does increase the row count flowing through the CTEs by a factor proportional to the number of rates (typically 3-5). This is acceptable for a batch job.
 
 ### 9.7 Row Count Impact
 
@@ -1786,7 +1879,9 @@ Add an optional `breakdown_limit` parameter to the report serializers:
 breakdown_limit = serializers.IntegerField(required=False, min_value=1, max_value=100)
 ```
 
-When set, the `breakdown` array on each cost category is limited to the top N entries by value, with the remainder aggregated as `{"name": "Other", "source": "other", "value": X, "units": "USD"}`. Default: no limit (full breakdown).
+**JSON behavior:** When set, the `breakdown` array on each cost category is limited to the top N entries by value, with the remainder aggregated as `{"name": "Other", "source": "other", "value": X, "units": "USD"}`. Default: no limit (full breakdown).
+
+**CSV behavior:** For CSV, `breakdown_limit` acts as a boolean trigger: if present (any value), CSV includes `cost_model_rate_name` as a flat column by switching to the breakdown summary table. Top-N limiting and "Other" aggregation do NOT apply to CSV — CSV always returns the full set of rate names. This is consistent with CSV's role as raw data export for spreadsheet analysis.
 
 ### 11.6 Serializer Changes
 
@@ -1851,9 +1946,9 @@ All Trino cost model SQL files need the same `cost_model_rate_name` column addit
 | `monthly_vm_core_tag_based.sql` | Add `cost_model_rate_name` to INSERT + SELECT |
 | `monthly_project_tag_based.sql` | Add `cost_model_rate_name` to INSERT + SELECT |
 | `monthly_cost_gpu.sql` | Add `cost_model_rate_name` to INSERT + SELECT |
-| `distribute_cost/distribute_unallocated_gpu_cost.sql` | **No changes** (distribution SQL) |
+| `distribute_cost/distribute_unallocated_gpu_cost.sql` | Per-rate-name distribution (split CTE pattern) — **already handled in PR 5** |
 
-Trino distribution SQL files (`distribute_cost/`) — **no changes needed** (same rationale as PostgreSQL).
+Note: The GPU distribution SQL files (`distribute_cost/`) are listed here for completeness, but the actual changes are part of **PR 5** (Section 9), not PR 8. PR 8 only covers cost *application* SQL (rates, not distribution).
 
 #### 12.1.1 Trino Parquet Schema
 
@@ -1879,7 +1974,7 @@ The self-hosted directory contains a subset of cost model SQL files for the on-p
 | `monthly_vm_core_tag_based.sql` | Add `cost_model_rate_name` to INSERT + SELECT |
 | `monthly_project_tag_based.sql` | Add `cost_model_rate_name` to INSERT + SELECT |
 | `monthly_cost_gpu.sql` | Add `cost_model_rate_name` to INSERT + SELECT |
-| `distribute_cost/distribute_unallocated_gpu_cost.sql` | **No changes** (distribution SQL) |
+| `distribute_cost/distribute_unallocated_gpu_cost.sql` | Per-rate-name distribution (split CTE pattern) — **already handled in PR 5** |
 
 ### 12.3 Verification
 
@@ -2135,5 +2230,7 @@ All questions have been resolved. This section serves as a decision record.
 | 11 | Backfill mechanism | Use existing `update_all_summary_tables` Celery task. No new task needed. |
 | 12 | `monthly_cost_type = 'Tag'` rows in breakdown | Included. Breakdown SQL does not filter on `monthly_cost_type`, consistent with existing UI summary SQL. |
 | 13 | NULL-named distribution entries (Phase 1) | Aggregate all NULL-named entries (cloud cost) as a single `{"name": "Cloud cost", "source": "cloud", "value": X}` placeholder. Phase 2 replaces with per-service entries. |
-| 14 | `name` field mandatory vs optional | Initially optional with auto-generation fallback (same logic as data migration). Flip to required after frontend is updated. Decouples backend/frontend deployment. |
+| 14 | `name` field mandatory vs optional | Mandatory from day one. Data migration auto-generates names for existing rates before code ships. Frontend must be updated in the same release. |
 | 15 | Cross-cost-model rate name collisions | Not possible — only one cost model can be applied per cluster. No disambiguation logic needed. |
+| 16 | Distribution SQL JOIN on `cost_model_rate_name` | Split into two CTEs: `cte_user_distribution` (no rate_name JOIN, correct usage proportions) + `cte_source_negation` (GROUP BY `filtered.cost_model_rate_name`, correct per-rate negation). UNION ALL for INSERT. Naive single-CTE approach fails because cost model rows lack usage hours. |
+| 17 | CSV breakdown semantics | `breakdown_limit` acts as boolean trigger for CSV — include `cost_model_rate_name` column, no top-N limiting. CSV always returns full data for spreadsheet analysis. |
