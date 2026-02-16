@@ -175,7 +175,7 @@ Add `name` field to `RateSerializer`:
 class RateSerializer(serializers.Serializer):
     """Serializer for the rate objects within a cost model."""
 
-    name = serializers.CharField(max_length=50, required=True)
+    name = serializers.CharField(max_length=50, required=False, allow_blank=True, default="")
     metric = MetricSerializer(required=True)
     description = serializers.CharField(max_length=500, required=False, allow_blank=True, default="")
     cost_type = serializers.ChoiceField(choices=metric_constants.COST_TYPE_CHOICES, required=True)
@@ -183,21 +183,28 @@ class RateSerializer(serializers.Serializer):
     tag_rates = TagRateSerializer(required=False)
 ```
 
-**Validation logic** in `CostModelSerializer.validate()`:
+**Note:** `name` is initially `required=False` with auto-generation fallback. This decouples the backend and frontend deployment — existing API clients (including the UI) won't break. Once the frontend is updated to send `name`, we flip to `required=True` in a follow-up.
+
+**Auto-generation in `CostModelSerializer.validate()`:**
 
 ```python
 def validate_rates(self, rates):
-    """Validate rate names are unique within the cost model."""
-    names = [r.get("name") for r in rates if r.get("name")]
-    if len(names) != len(set(names)):
-        duplicate = next(n for n in names if names.count(n) > 1)
-        raise serializers.ValidationError(
-            f"Rate names must be unique within a cost model. Duplicate: '{duplicate}'"
-        )
+    """Validate and auto-generate rate names."""
+    used_names = set()
+    for rate in rates:
+        name = rate.get("name", "").strip()
+        if not name:
+            name = _generate_name(rate, used_names)
+            rate["name"] = name
+        if name in used_names:
+            raise serializers.ValidationError(
+                f"Rate names must be unique within a cost model. Duplicate: '{name}'"
+            )
+        used_names.add(name)
     return rates
 ```
 
-The uniqueness validation happens at the serializer level since rates are stored as a JSONField on the `CostModel` model — there is no separate `Rate` model with a unique constraint.
+The `_generate_name()` function uses the same logic as the data migration (see 5.2). The uniqueness validation happens at the serializer level since rates are stored as a JSONField on the `CostModel` model — there is no separate `Rate` model with a unique constraint.
 
 ### 5.2 Data Migration for Existing Rates
 
@@ -1486,6 +1493,36 @@ def _get_breakdown_data(self, date_filter, group_filter=None):
     ).order_by("-total_cost")
 
     return breakdown
+
+
+def _get_breakdown_data_for_tags(self, date_filter, tag_group_by, group_filter=None):
+    """Query the line item table directly for tag group-by breakdown.
+
+    Tag group-by queries already run against OCPUsageLineItemDailySummary
+    (not a summary table), so the breakdown data is available with minimal
+    additional overhead — same table, same filters, one more GROUP BY column.
+    """
+    from koku.reporting.provider.ocp.models import OCPUsageLineItemDailySummary
+
+    queryset = OCPUsageLineItemDailySummary.objects.filter(date_filter)
+    if group_filter:
+        queryset = queryset.filter(group_filter)
+
+    group_fields = list(tag_group_by) + ["cost_model_rate_type", "cost_model_rate_name"]
+    breakdown = queryset.values(*group_fields).annotate(
+        total_cost=Sum(
+            Coalesce(F("cost_model_cpu_cost"), Value(0)) +
+            Coalesce(F("cost_model_memory_cost"), Value(0)) +
+            Coalesce(F("cost_model_volume_cost"), Value(0)) +
+            Coalesce(F("cost_model_gpu_cost"), Value(0))
+        ),
+        total_raw_cost=Sum(Coalesce(F("infrastructure_raw_cost"), Value(0))),
+        total_markup_cost=Sum(Coalesce(F("infrastructure_markup_cost"), Value(0))),
+        total_distributed=Sum(Coalesce(F("distributed_cost"), Value(0))),
+        currency=Max("raw_currency"),
+    ).order_by("-total_cost")
+
+    return breakdown
 ```
 
 #### 11.2.2 Overhead Breakdown (From Pre-Computed Distribution Data)
@@ -1503,17 +1540,32 @@ The query handler simply reads these as breakdown entries:
 def _build_overhead_breakdown(self, breakdown_qs, overhead_rate_type):
     """Build breakdown for an overhead type from pre-computed distribution data."""
     breakdown = []
+    cloud_cost_total = Decimal("0")
+    currency = "USD"
     for entry in breakdown_qs.filter(cost_model_rate_type=overhead_rate_type):
         name = entry["cost_model_rate_name"]
+        currency = entry.get("currency", "USD")
         if name:
             breakdown.append({
                 "name": name,
                 "source": "rate",
                 "value": entry["total_distributed"],
-                "units": entry.get("currency", "USD"),
+                "units": currency,
             })
-        # In Phase 1, NULL-named entries (cloud cost) are aggregated as a single "Cloud cost" entry
-        # In Phase 2, they will have service names from product_code/service_name
+        else:
+            # NULL-named entries are cloud-sourced cost (no rate attribution)
+            cloud_cost_total += entry["total_distributed"] or Decimal("0")
+
+    # Phase 1: aggregate all NULL-named (cloud) cost as a single placeholder
+    # Phase 2: replace with per-service entries from product_code/service_name
+    if cloud_cost_total:
+        breakdown.append({
+            "name": "Cloud cost",
+            "source": "cloud",
+            "value": cloud_cost_total,
+            "units": currency,
+        })
+
     return breakdown
 ```
 
@@ -1533,10 +1585,13 @@ def _format_query_response(self):
         # Get breakdown for the entire query (all dates, all entities)
         breakdown_qs = self._get_breakdown_data(self.query_filter)
 
+        # Determine breakdown_limit from query parameters (None = no limit)
+        breakdown_limit = self.parameters.get("breakdown_limit")
+
         # Usage breakdown: rate-attributed costs
         usage_breakdown = self._build_usage_breakdown(breakdown_qs)
         if usage_breakdown and "usage" in cost:
-            cost["usage"]["breakdown"] = usage_breakdown
+            cost["usage"]["breakdown"] = self._apply_breakdown_limit(usage_breakdown, breakdown_limit)
 
         # Overhead breakdown (from pre-computed distribution data)
         overhead_types = [
@@ -1550,7 +1605,7 @@ def _format_query_response(self):
             if cost_key in cost:
                 oh_breakdown = self._build_overhead_breakdown(breakdown_qs, rate_type)
                 if oh_breakdown:
-                    cost[cost_key]["breakdown"] = oh_breakdown
+                    cost[cost_key]["breakdown"] = self._apply_breakdown_limit(oh_breakdown, breakdown_limit)
 
     # Also attach breakdown to each data row (per date, per group-by value)
     self._attach_breakdown_to_data_rows(output.get("data", []))
@@ -1571,6 +1626,33 @@ def _build_usage_breakdown(self, breakdown_qs):
                     "units": entry.get("currency", "USD"),
                 })
     return breakdown
+
+
+def _apply_breakdown_limit(self, breakdown, limit):
+    """Apply top-N limiting with 'Other' aggregation.
+
+    If limit is None, return the full breakdown (default behavior).
+    Otherwise, return the top N entries and aggregate the rest as 'Other'.
+    """
+    if limit is None or len(breakdown) <= limit:
+        return breakdown
+
+    # Sort by value descending (should already be sorted, but ensure)
+    breakdown.sort(key=lambda x: x.get("value", 0) or 0, reverse=True)
+
+    top_entries = breakdown[:limit]
+    rest = breakdown[limit:]
+    other_total = sum((e.get("value", 0) or 0) for e in rest)
+    units = breakdown[0].get("units", "USD") if breakdown else "USD"
+
+    if other_total:
+        top_entries.append({
+            "name": "Other",
+            "source": "other",
+            "value": other_total,
+            "units": units,
+        })
+    return top_entries
 ```
 
 #### 11.2.4 Per-Data-Row Breakdown
@@ -1692,9 +1774,23 @@ class BreakdownMixin:
         return breakdown_table.objects.filter(source_uuid_filter, date_filter)
 ```
 
-### 11.4 Serializer Changes
+### 11.4 Tag Group-By Breakdown
 
-No serializer changes needed for the report API — the `breakdown` array is an additive extension to the response, not a new query parameter. Existing serializers for `group_by`, `filter`, and `order_by` remain unchanged.
+Tag group-by queries (e.g., `group_by[tag:app]=*`) already run against `OCPUsageLineItemDailySummary` because the cost summary tables lack tag data. Since the line item table has `cost_model_rate_name` (after PR 2), the breakdown for tag group-by is a secondary query on the same table with `cost_model_rate_name` added to the GROUP BY alongside the tag value. No additional tables needed. Performance overhead is minimal — same filters, same partitions, one more grouping dimension.
+
+### 11.5 `breakdown_limit` Query Parameter
+
+Add an optional `breakdown_limit` parameter to the report serializers:
+
+```python
+breakdown_limit = serializers.IntegerField(required=False, min_value=1, max_value=100)
+```
+
+When set, the `breakdown` array on each cost category is limited to the top N entries by value, with the remainder aggregated as `{"name": "Other", "source": "other", "value": X, "units": "USD"}`. Default: no limit (full breakdown).
+
+### 11.6 Serializer Changes
+
+No other serializer changes needed for the report API — the `breakdown` array is an additive extension to the response. Existing serializers for `group_by`, `filter`, and `order_by` remain unchanged.
 
 ### 11.5 Files Changed
 
@@ -1977,19 +2073,24 @@ Each PR can be reverted independently:
 
 ---
 
-## 17. Open Questions and Decisions
+## 17. Decisions Log
 
-| # | Question | Status | Decision |
-|---|----------|--------|----------|
-| 1 | Top-N limiting for breakdown entries | Open | Recommend top 10 by value, rest as "Other". Implement in query handler. |
-| 2 | Multiple tiered rates for same metric | **Decided** | Fully supported. List-based rate structures + per-rate SQL execution. Each rate gets its own rows and breakdown entry. |
-| 3 | Infrastructure vs Supplementary in breakdown | **Decided** | Merge under rate name. Rate name is the user-facing concept. |
-| 4 | CSV export of breakdown data | Deferred | Follow-up after Phase 1 GA. |
-| 5 | Breakdown for tag group-by view | Open | Tag group-by queries a different code path in query handler. Need to verify breakdown table has sufficient data. |
-| 6 | GPU rate name attribution | **Decided** | Covered in Phase 1. GPU goes through `populate_tag_based_costs()` which reads `name` from `metric_to_tag_params_map`. SQL files updated in PR 8. |
-| 7 | Breakdown summary table cleanup | **Decided** | Same lifecycle as existing UI summary tables. Populated in `populate_ui_summary_tables()`. |
-| 8 | Overhead breakdown accuracy | **Decided** | Per-rate-name distribution in SQL (PR 5). No query-time approximation. |
-| 9 | CostModelDBAccessor breaking change | **Decided** | No breaking change. New parallel properties (`infrastructure_rates_by_name`, `tag_rate_names`). Existing properties unchanged. |
-| 10 | OCP-on-cloud breakdown sourcing | **Decided** | OCP-on-cloud handlers use `BreakdownMixin` to query OCP breakdown tables for cost-model-attributed breakdown. Cloud cost breakdown deferred to Phase 2. |
-| 11 | Backfill mechanism | **Decided** | Use existing `update_all_summary_tables` Celery task. No new task needed. |
-| 12 | `monthly_cost_type = 'Tag'` rows in breakdown | **Decided** | Included. Breakdown SQL does not filter on `monthly_cost_type`, consistent with existing UI summary SQL. |
+All questions have been resolved. This section serves as a decision record.
+
+| # | Question | Decision |
+|---|----------|----------|
+| 1 | Top-N limiting for breakdown entries | Configurable via `breakdown_limit` query parameter. Default: no limit (full breakdown). Frontend typically shows full breakdown. |
+| 2 | Multiple tiered rates for same metric | Fully supported. List-based rate structures + per-rate SQL execution. Each rate gets its own rows and breakdown entry. |
+| 3 | Infrastructure vs Supplementary in breakdown | Merge under rate name. Rate name is the user-facing concept. |
+| 4 | CSV export of breakdown data | Deferred — follow-up after Phase 1 GA. |
+| 5 | Breakdown for tag group-by view | Supported in Phase 1. Tag group-by queries already run against `OCPUsageLineItemDailySummary` (not a summary table), so breakdown is a secondary query on the same table with `cost_model_rate_name` added to GROUP BY. Minimal performance overhead. |
+| 6 | GPU rate name attribution | Covered in Phase 1. GPU goes through `populate_tag_based_costs()` which reads `name` from `metric_to_tag_params_map`. SQL files updated in PR 8. |
+| 7 | Breakdown summary table cleanup | Same lifecycle as existing UI summary tables. Populated in `populate_ui_summary_tables()`. |
+| 8 | Overhead breakdown accuracy | Per-rate-name distribution in SQL (PR 5). No query-time approximation. Accurate attribution from source. |
+| 9 | CostModelDBAccessor breaking change | No breaking change. New parallel properties (`infrastructure_rates_by_name`, `tag_rate_names`). Existing properties unchanged. |
+| 10 | OCP-on-cloud breakdown sourcing | OCP-on-cloud handlers use `BreakdownMixin` to query OCP breakdown tables for cost-model-attributed breakdown. Cloud cost breakdown deferred to Phase 2. |
+| 11 | Backfill mechanism | Use existing `update_all_summary_tables` Celery task. No new task needed. |
+| 12 | `monthly_cost_type = 'Tag'` rows in breakdown | Included. Breakdown SQL does not filter on `monthly_cost_type`, consistent with existing UI summary SQL. |
+| 13 | NULL-named distribution entries (Phase 1) | Aggregate all NULL-named entries (cloud cost) as a single `{"name": "Cloud cost", "source": "cloud", "value": X}` placeholder. Phase 2 replaces with per-service entries. |
+| 14 | `name` field mandatory vs optional | Initially optional with auto-generation fallback (same logic as data migration). Flip to required after frontend is updated. Decouples backend/frontend deployment. |
+| 15 | Cross-cost-model rate name collisions | Not possible — only one cost model can be applied per cluster. No disambiguation logic needed. |
