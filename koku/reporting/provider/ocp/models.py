@@ -129,6 +129,7 @@ class OCPUsageLineItemDailySummary(models.Model):
             models.Index(fields=["data_source"], name="summary_data_source_idx"),
             models.Index(fields=["monthly_cost_type"], name="monthly_cost_type_idx"),
             models.Index(fields=["cost_model_rate_type"], name="cost_model_rate_type_idx"),
+            models.Index(fields=["cost_model_rate_name"], name="cost_model_rate_name_idx"),
             GinIndex(fields=["all_labels"], name="all_labels_idx"),
             GinIndex(fields=["pod_labels"], name="pod_labels_idx"),
             GinIndex(fields=["volume_labels"], name="volume_labels_idx"),
@@ -199,6 +200,7 @@ class OCPUsageLineItemDailySummary(models.Model):
     cost_model_volume_cost = models.DecimalField(max_digits=33, decimal_places=15, null=True)
     cost_model_gpu_cost = models.DecimalField(max_digits=33, decimal_places=15, null=True)
     cost_model_rate_type = models.TextField(null=True)
+    cost_model_rate_name = models.TextField(null=True)
 
     monthly_cost_type = models.TextField(null=True, choices=MONTHLY_COST_TYPES)
     source_uuid = models.UUIDField(unique=False, null=True)
