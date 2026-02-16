@@ -14,6 +14,7 @@ INSERT INTO postgres.{{schema | sqlsafe}}.reporting_ocpusagelineitem_daily_summa
     source_uuid,
     monthly_cost_type,
     cost_model_rate_type,
+    cost_model_rate_name,
     cost_model_cpu_cost,
     cost_category_id
 )
@@ -74,6 +75,7 @@ SELECT
     lids.source_uuid,
     'Tag' AS monthly_cost_type,
     {{rate_type}} AS cost_model_rate_type,
+    {{rate_name}} AS cost_model_rate_name,
     {%- if value_rates is defined and value_rates %}
     CASE
         {%- for value, rate in value_rates.items() %}

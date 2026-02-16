@@ -13,6 +13,7 @@ INSERT INTO postgres.{{schema | sqlsafe}}.reporting_ocpusagelineitem_daily_summa
     source_uuid,
     monthly_cost_type,
     cost_model_rate_type,
+    cost_model_rate_name,
     cost_model_cpu_cost
 )
 WITH filtered_data as (
@@ -95,6 +96,7 @@ SELECT
     CAST({{source_uuid}} AS uuid),
     'Tag' AS monthly_cost_type,
     {{rate_type}} AS cost_model_rate_type,
+    {{rate_name}} AS cost_model_rate_name,
     CASE
         WHEN nc.node_count < 1
         THEN fd.amortized_cost

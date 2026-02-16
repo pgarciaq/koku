@@ -12,6 +12,7 @@ INSERT INTO {{schema | sqlsafe}}.reporting_ocpusagelineitem_daily_summary (
     all_labels,
     source_uuid,
     cost_model_rate_type,
+    cost_model_rate_name,
     cost_model_gpu_cost,
     monthly_cost_type,
     cost_category_id
@@ -34,6 +35,7 @@ SELECT
     ) as all_labels,
     gpu.source::uuid as source_uuid,
     {{rate_type}} AS cost_model_rate_type,
+    {{rate_name}} AS cost_model_rate_name,
     -- GPU cost calculation: (rate / days_in_month) * (uptime_seconds / 86400)
     -- Formula: daily_rate * uptime_as_fraction_of_day
     {%- if rate is defined %}
@@ -87,6 +89,7 @@ INSERT INTO {{schema | sqlsafe}}.reporting_ocpusagelineitem_daily_summary (
     all_labels,
     source_uuid,
     cost_model_rate_type,
+    cost_model_rate_name,
     cost_model_gpu_cost,
     monthly_cost_type
 )
@@ -136,6 +139,7 @@ SELECT
     ) as all_labels,
     {{source_uuid}}::uuid as source_uuid,
     {{rate_type}} AS cost_model_rate_type,
+    {{rate_name}} AS cost_model_rate_name,
     {%- if rate is defined %}
     (CAST({{rate}} AS decimal(24,9)) / CAST({{amortized_denominator}} * 24 AS decimal(24,9))) * hrs.untilized_uptime,
     {%- elif value_rates is defined %}

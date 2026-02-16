@@ -13,6 +13,7 @@ INSERT INTO {{schema | sqlsafe}}.reporting_ocpusagelineitem_daily_summary (
     all_labels,
     source_uuid,
     cost_model_rate_type,
+    cost_model_rate_name,
     cost_model_cpu_cost,
     monthly_cost_type,
     cost_category_id
@@ -99,6 +100,7 @@ SELECT
     labels.combined_labels as all_labels,
     lids.source_uuid,
     {{rate_type}} AS cost_model_rate_type,
+    {{rate_name}} AS cost_model_rate_name,
     max(vm_usage.vm_cpu_cores) * CAST({{rate}} as DECIMAL(33, 15)) AS cost_model_cpu_cost,
     {{cost_type}} AS monthly_cost_type,
     lids.cost_category_id
