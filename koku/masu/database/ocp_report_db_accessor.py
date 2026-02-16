@@ -846,7 +846,7 @@ class OCPReportDBAccessor(SQLScriptAtomicExecutorMixin, ReportDBAccessorBase):
         self._prepare_and_execute_raw_sql_query(table_name, sql, sql_params, operation="INSERT")
 
     def populate_vm_usage_costs(
-        self, rate_type, vm_usage_rates, start_date, end_date, provider_uuid, report_period_id
+        self, rate_type, vm_usage_rates, start_date, end_date, provider_uuid, report_period_id, vm_rate_names=None
     ):
         if not vm_usage_rates:
             return
@@ -873,7 +873,8 @@ class OCPReportDBAccessor(SQLScriptAtomicExecutorMixin, ReportDBAccessorBase):
                 source_uuid=provider_uuid,
                 report_period_id=report_period_id,
             )
-            context_params = {"rate_type": rate_type, "hourly_rate": hourly_rate}
+            rate_name = (vm_rate_names or {}).get(metric_name)
+            context_params = {"rate_type": rate_type, "hourly_rate": hourly_rate, "rate_name": rate_name}
             if metric_params := metadata.get("metric_params"):
                 context_params.update(metric_params)
             sql_params = param_builder.build_parameters(context_params=context_params)
@@ -968,6 +969,10 @@ class OCPReportDBAccessor(SQLScriptAtomicExecutorMixin, ReportDBAccessorBase):
 
         sql = pkgutil.get_data("masu.database", "sql/openshift/cost_model/usage_costs.sql")
         sql = sql.decode("utf-8")
+        # Strip the DELETE portion from the SQL since we already deleted above.
+        # The SQL file contains DELETE...;INSERT...; and we only want the INSERT.
+        if "INSERT INTO" in sql:
+            sql = sql[sql.index("INSERT INTO") :]
 
         for rate_entry in rates_by_name:
             metric = rate_entry["metric"]

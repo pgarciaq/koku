@@ -278,16 +278,24 @@ class OCPReportQueryHandler(ReportQueryHandler):
         if extra_group_fields:
             group_fields = list(extra_group_fields) + group_fields
 
+        _decimal = DecimalField(max_digits=33, decimal_places=15)
         return breakdown_qs.values(*group_fields).annotate(
             total_cost=Sum(
-                Coalesce(F("cost_model_cpu_cost"), Value(0))
-                + Coalesce(F("cost_model_memory_cost"), Value(0))
-                + Coalesce(F("cost_model_volume_cost"), Value(0))
-                + Coalesce(F("cost_model_gpu_cost"), Value(0))
+                Coalesce(F("cost_model_cpu_cost"), Value(0, output_field=_decimal))
+                + Coalesce(F("cost_model_memory_cost"), Value(0, output_field=_decimal))
+                + Coalesce(F("cost_model_volume_cost"), Value(0, output_field=_decimal))
+                + Coalesce(F("cost_model_gpu_cost"), Value(0, output_field=_decimal)),
+                output_field=_decimal,
             ),
-            total_distributed=Sum(Coalesce(F("distributed_cost"), Value(0))),
-            total_raw_cost=Sum(Coalesce(F("infrastructure_raw_cost"), Value(0))),
-            total_markup_cost=Sum(Coalesce(F("infrastructure_markup_cost"), Value(0))),
+            total_distributed=Sum(
+                Coalesce(F("distributed_cost"), Value(0, output_field=_decimal)), output_field=_decimal
+            ),
+            total_raw_cost=Sum(
+                Coalesce(F("infrastructure_raw_cost"), Value(0, output_field=_decimal)), output_field=_decimal
+            ),
+            total_markup_cost=Sum(
+                Coalesce(F("infrastructure_markup_cost"), Value(0, output_field=_decimal)), output_field=_decimal
+            ),
             currency=Max("raw_currency"),
         )
 
@@ -321,17 +329,22 @@ class OCPReportQueryHandler(ReportQueryHandler):
         annotate_fields = {
             "date": self.date_trunc("usage_start"),
         }
+        _decimal = DecimalField(max_digits=33, decimal_places=15)
         raw_data = (
             breakdown_qs.annotate(**annotate_fields)
             .values(*extra_group, *qs_fields)
             .annotate(
                 total_cost=Sum(
-                    Coalesce(F("cost_model_cpu_cost"), Value(0))
-                    + Coalesce(F("cost_model_memory_cost"), Value(0))
-                    + Coalesce(F("cost_model_volume_cost"), Value(0))
-                    + Coalesce(F("cost_model_gpu_cost"), Value(0))
+                    Coalesce(F("cost_model_cpu_cost"), Value(0, output_field=_decimal))
+                    + Coalesce(F("cost_model_memory_cost"), Value(0, output_field=_decimal))
+                    + Coalesce(F("cost_model_volume_cost"), Value(0, output_field=_decimal))
+                    + Coalesce(F("cost_model_gpu_cost"), Value(0, output_field=_decimal)),
+                    output_field=_decimal,
                 ),
-                total_distributed=Sum(Coalesce(F("distributed_cost"), Value(0))),
+                total_distributed=Sum(
+                    Coalesce(F("distributed_cost"), Value(0, output_field=_decimal)),
+                    output_field=_decimal,
+                ),
                 currency=Max("raw_currency"),
             )
         )
@@ -374,20 +387,29 @@ class OCPReportQueryHandler(ReportQueryHandler):
             date_str = str(date_entry.get("date", ""))
             if api_group_key:
                 plural_key = api_group_key + "s"
-                rows = date_entry.get(plural_key, [])
-                for row in rows:
+                for row in date_entry.get(plural_key, []):
                     group_value = str(row.get(api_group_key, "__all__"))
                     row_entries = breakdown_index.get((date_str, group_value), [])
                     if row_entries:
-                        cost = row.get("cost", {})
-                        if cost:
-                            self._inject_breakdown_into_cost(cost, row_entries, breakdown_limit)
+                        self._inject_into_cost_if_present(row, row_entries, breakdown_limit)
             else:
                 row_entries = breakdown_index.get((date_str, "__all__"), [])
                 if row_entries:
-                    cost = date_entry.get("cost", {})
-                    if cost:
-                        self._inject_breakdown_into_cost(cost, row_entries, breakdown_limit)
+                    self._inject_into_date_entry(date_entry, row_entries, breakdown_limit)
+
+    def _inject_into_date_entry(self, date_entry, row_entries, breakdown_limit):
+        """Inject breakdown into a date entry, handling both nested and flat structures."""
+        # After _transform_data, no-group-by data nests cost under "values" list
+        for val in date_entry.get("values", []):
+            self._inject_into_cost_if_present(val, row_entries, breakdown_limit)
+        if not date_entry.get("values"):
+            self._inject_into_cost_if_present(date_entry, row_entries, breakdown_limit)
+
+    def _inject_into_cost_if_present(self, row, row_entries, breakdown_limit):
+        """Inject breakdown into a row's cost dict if it exists."""
+        cost = row.get("cost", {})
+        if cost:
+            self._inject_breakdown_into_cost(cost, row_entries, breakdown_limit)
 
     def _inject_breakdown_into_cost(self, cost, breakdown_entries, breakdown_limit):
         """Inject breakdown arrays into a cost structure (total or per-row)."""

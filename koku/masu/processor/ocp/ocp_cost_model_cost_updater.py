@@ -455,11 +455,18 @@ class OCPCostModelCostUpdater(OCPCloudUpdaterBase):
             metric_constants.INFRASTRUCTURE_COST_TYPE: self._infra_rates_by_name,
             metric_constants.SUPPLEMENTARY_COST_TYPE: self._supplementary_rates_by_name,
         }
-        # Keep legacy dict for VM rates (not refactored in this PR)
+        # Keep legacy dict for VM rates; build rate_name lookup from rates_by_name
         legacy_rate_map = {
             metric_constants.INFRASTRUCTURE_COST_TYPE: self._infra_rates,
             metric_constants.SUPPLEMENTARY_COST_TYPE: self._supplementary_rates,
         }
+        vm_rate_names_map = {}
+        for rt, by_name_list in rates_by_name_map.items():
+            names = {}
+            for entry in by_name_list:
+                if entry["metric"] in metric_constants.COST_MODEL_VM_USAGE_RATES:
+                    names[entry["metric"]] = entry.get("name")
+            vm_rate_names_map[rt] = names
         with OCPReportDBAccessor(self._schema) as report_accessor:
             report_period = report_accessor.report_periods_for_provider_uuid(self._provider.uuid, start_date)
             if not report_period:
@@ -496,6 +503,7 @@ class OCPCostModelCostUpdater(OCPCloudUpdaterBase):
                     end_date,
                     self._provider.uuid,
                     report_period_id,
+                    vm_rate_names=vm_rate_names_map.get(report_type, {}),
                 )
 
     def _update_markup_cost(self, start_date, end_date):
