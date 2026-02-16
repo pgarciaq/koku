@@ -23,7 +23,7 @@
 12. [PR 8: Trino and Self-Hosted SQL Paths](#12-pr-8-trino-and-self-hosted-sql-paths)
 13. [Cross-Cutting Concerns](#13-cross-cutting-concerns)
 14. [Phase 2 Notes (COST-4415)](#14-phase-2-notes-cost-4415)
-15. [Testing Strategy](#15-testing-strategy)
+15. [Testing Strategy](#15-testing-strategy) *(expanded with practical implementation guidance)*
 16. [Migration and Rollback Plan](#16-migration-and-rollback-plan)
 17. [Open Questions and Decisions](#17-open-questions-and-decisions)
 
@@ -2183,35 +2183,214 @@ The `breakdown` array gains `"source": "service"` entries alongside `"source": "
 
 ## 15. Testing Strategy
 
-### 15.1 Unit Tests
+### 15.1 Test Infrastructure
+
+**Database requirement:** Tests need PostgreSQL 16 on `localhost:15432` (user `postgres`, password `postgres`). Start it before running tests:
+
+```bash
+podman run -d --name koku-test-db -p 15432:5432 -e POSTGRES_PASSWORD=postgres postgres:16
+```
+
+The test DB name is `test_postgres`. Set `KEEPDB=True` in `.env` to preserve the test database between runs (avoids re-running migrations on every test invocation).
+
+**Running tests:**
+
+```bash
+# Via tox (canonical — creates isolated venv):
+tox -e py311 -- masu.test.database.test_cost_breakdown_usage
+
+# Direct (faster — uses current pipenv):
+cd koku && pipenv run python koku/manage.py test masu.test.database.test_cost_breakdown_usage --no-input -v 2
+```
+
+### 15.2 Test Base Classes
+
+| Class | Module | Use When |
+|-------|--------|----------|
+| `MasuTestCase` | `masu.test` | Masu/data-pipeline tests (SQL, DB accessors, cost updater). Provides `self.schema`, `self.ocp_provider_uuid`, `self.ocp_cluster_id`, provider fixtures. |
+| `IamTestCase` | `api.iam.test.iam_test_case` | API-layer tests (query handlers, views, serializers). Provides `self.schema_name`, `self.tenant`, `self.headers`, `self.request_context`. |
+
+Both classes provide `self.dh` (DateHelper) for date ranges.
+
+### 15.3 Mocking Requirements
+
+External services are unavailable in unit tests. **Always mock these at the import location, not the definition location:**
+
+| Service | What to Mock | Return | Why |
+|---------|-------------|--------|-----|
+| Trino | `masu.database.ocp_report_db_accessor.trino_table_exists` | `False` | GPU UI table creation calls Trino |
+| Trino | `masu.database.ocp_report_db_accessor.OCPReportDBAccessor.schema_exists_trino` | `False` | Virtualization UI table checks Trino |
+| Unleash | `masu.database.ocp_report_db_accessor.is_feature_flag_enabled_by_schema` | `False` | Feature flag checks call Unleash |
+| Currency API | `api.report.serializers.get_currency` | `"USD"` | Serializer calls `UserSettings` (tenant model) |
+
+**Pattern for E2E tests using the cost model pipeline:**
+
+```python
+from unittest.mock import patch
+
+class CostBreakdownE2ETest(IamTestCase):
+    def setUp(self):
+        super().setUp()
+        # Start mocks for external services
+        trino_patch = patch(
+            "masu.database.ocp_report_db_accessor.trino_table_exists",
+            return_value=False,
+        )
+        schema_trino_patch = patch(
+            "masu.database.ocp_report_db_accessor.OCPReportDBAccessor.schema_exists_trino",
+            return_value=False,
+        )
+        unleash_patch = patch(
+            "masu.database.ocp_report_db_accessor.is_feature_flag_enabled_by_schema",
+            return_value=False,
+        )
+        trino_patch.start()
+        schema_trino_patch.start()
+        unleash_patch.start()
+        self.addCleanup(trino_patch.stop)
+        self.addCleanup(schema_trino_patch.stop)
+        self.addCleanup(unleash_patch.stop)
+```
+
+### 15.4 Test Data and Fixture Requirements
+
+**Seeded test data:** `KokuTestRunner.setup_databases()` seeds providers, report periods, daily summary rows, and cost models via `ModelBakeryDataLoader`. OCP cluster IDs: `"OCP-on-Prem"`, `"OCP-on-AWS"`, `"OCP-on-Azure"`, `"OCP-on-GCP"`.
+
+**Test isolation — always clean up stale tenant data:**
+
+```python
+with schema_context(self.schema):
+    CostModelMap.objects.filter(provider_uuid=self.ocp_provider_uuid).delete()
+    cost_model = CostModel.objects.create(...)
+    CostModelMap.objects.create(cost_model_id=cost_model.uuid, provider_uuid=...)
+```
+
+**Worker distribution tests need manual fixture data:** The standard test fixtures do NOT include "Worker unallocated" namespace rows. Distribution tests for `worker_distributed` must create synthetic `OCPUsageLineItemDailySummary` rows with `namespace="Worker unallocated"` before invoking the distribution SQL. Example:
+
+```python
+import uuid
+from decimal import Decimal
+
+with schema_context(self.schema):
+    ref_row = OCPUsageLineItemDailySummary.objects.filter(
+        source_uuid=self.ocp_provider_uuid,
+        usage_start__gte=self.dh.this_month_start,
+        data_source="Pod",
+        namespace="koku",
+    ).first()
+
+    OCPUsageLineItemDailySummary.objects.create(
+        uuid=uuid.uuid4(),
+        cluster_id=ref_row.cluster_id,
+        cluster_alias=ref_row.cluster_alias,
+        data_source="Pod",
+        namespace="Worker unallocated",
+        node=ref_row.node,
+        usage_start=self.dh.this_month_start,
+        usage_end=self.dh.this_month_start,
+        source_uuid=self.ocp_provider_uuid,
+        report_period_id=ref_row.report_period_id,
+        cost_model_cpu_cost=Decimal("50.00"),
+        cost_model_memory_cost=Decimal("30.00"),
+        cost_model_rate_name="CPU rate",
+        cost_model_rate_type="Infrastructure",
+        pod_effective_usage_cpu_core_hours=Decimal("100.0"),
+        pod_effective_usage_memory_gigabyte_hours=Decimal("50.0"),
+        node_capacity_cpu_core_hours=ref_row.node_capacity_cpu_core_hours,
+        node_capacity_memory_gigabyte_hours=ref_row.node_capacity_memory_gigabyte_hours,
+        cluster_capacity_cpu_core_hours=ref_row.cluster_capacity_cpu_core_hours,
+        cluster_capacity_memory_gigabyte_hours=ref_row.cluster_capacity_memory_gigabyte_hours,
+    )
+```
+
+The same applies to "Storage unattributed", "Network unattributed", and "GPU unallocated" distribution tests if those namespaces are not in the test fixtures.
+
+### 15.5 Known Behavioral Gotchas
+
+**`cluster_cost_per_hour` produces legitimate zero-cost rows:** The `usage_costs.sql` distributes `cluster_cost_per_hour` proportional to node CPU/memory usage. Rows on nodes with no `pod_effective_usage` (e.g., GPU-only nodes, storage `data_source` rows) get zero `cost_model_cpu_cost` and `cost_model_memory_cost`. This is correct behavior — do NOT weaken assertions to accept these as failures. Instead, assert that **at least some rows** have non-zero costs:
+
+```python
+rows_with_cpu_cost = rows.exclude(cost_model_cpu_cost=0).exclude(cost_model_cpu_cost__isnull=True)
+self.assertTrue(
+    rows_with_cpu_cost.exists(),
+    "cluster_cost_per_hour with cpu distribution should produce non-zero cost_model_cpu_cost "
+    "on at least some rows",
+)
+```
+
+**Python 3.11 `subTest`/`skipTest` caveat:** Calling `self.skipTest()` inside `with self.subTest():` skips the ENTIRE test method, not just the subtest (fixed in Python 3.12+). For Python 3.11 compatibility, split data-dependent subtests into separate test methods rather than using `subTest` loops.
+
+**`DecimalField` mixed-type aggregation:** Django's `Sum`, `Value(0)`, `Coalesce` raise `FieldError: Expression contains mixed types` if `IntegerField` and `DecimalField` are combined. Always set `output_field=DecimalField(max_digits=33, decimal_places=15)`.
+
+**`ForeignKey` to `TenantAPIProvider`:** `OCPUsageReportPeriod.provider` is a FK to `TenantAPIProvider` (tenant-scoped), NOT to `Provider` (public). Filter with `provider_id=uuid`, not `provider=provider_instance`.
+
+### 15.6 Test Database Debugging
+
+When tests fail, inspect the database directly:
+
+```bash
+PGPASSWORD=postgres psql -h localhost -p 15432 -U postgres -d test_postgres
+SET search_path TO org1234567;
+
+-- Check what rate names were written
+SELECT cost_model_rate_type, cost_model_rate_name, count(*)
+FROM reporting_ocpusagelineitem_daily_summary
+WHERE source_uuid = '<provider_uuid>'
+  AND usage_start >= '2026-02-01'
+GROUP BY cost_model_rate_type, cost_model_rate_name;
+
+-- Verify distribution sums to zero per rate_name
+SELECT cost_model_rate_name, SUM(distributed_cost)
+FROM reporting_ocpusagelineitem_daily_summary
+WHERE cost_model_rate_type = 'platform_distributed'
+GROUP BY cost_model_rate_name;
+```
+
+### 15.7 Unit Tests
 
 | Component | Test Focus |
 |-----------|------------|
 | `RateSerializer` | Name validation, max length, uniqueness within cost model |
-| `CostModelDBAccessor` | Rate name extraction from JSON, tag_rate_names property |
+| `CostModelDBAccessor` | Rate name extraction from JSON, `tag_rate_names` property, `infrastructure_rates_by_name` list structure |
 | Data migration | Name generation from description, truncation, deduplication |
-| `populate_usage_costs()` | Per-rate execution, correct rate_name on inserted rows |
-| `populate_monthly_cost_sql()` | Rate name parameter passed to SQL |
-| `populate_tag_usage_costs()` | Rate name per tag iteration |
-| Breakdown summary SQL | Correct GROUP BY including cost_model_rate_name |
-| Query handler | Breakdown query, overhead proportional computation |
+| `populate_usage_costs_by_name()` | Per-rate execution, correct `cost_model_rate_name` on inserted rows, multiple rates per metric |
+| `populate_monthly_cost_sql()` | Rate name parameter passed to SQL, multiple monthly rates for same metric |
+| `populate_tag_usage_costs()` | Rate name per tag iteration via `tag_rate_names` |
+| Distribution SQL | Per-rate-name distribution + negation, sum = 0 per `cost_model_rate_name` |
+| Breakdown summary SQL | Correct GROUP BY including `cost_model_rate_name`, row counts match `rate_type × rate_name × entity` |
+| Query handler | Breakdown query, overhead breakdown from pre-computed distribution, `_apply_breakdown_limit` top-N |
 
-### 15.2 Integration Tests
+### 15.8 Integration Tests
 
 | Scenario | Verification |
 |----------|-------------|
 | Cost model with 3 tiered rates (CPU, memory, volume) | 3 separate rows with distinct `cost_model_rate_name` in line item table |
+| Cost model with 2 CPU rates (same metric, different names) | 2 separate rows per entity, each with correct `cost_model_rate_name` and proportional cost |
 | Cost model with tag-based rates | Tag cost rows carry `cost_model_rate_name` from parent rate |
 | Cost model with monthly rates (node, cluster, PVC, VM) | Monthly cost rows carry `cost_model_rate_name` |
-| Distribution after cost application | Distributed rows carry `cost_model_rate_name` from source (rate name for cost-model cost, NULL for cloud cost). Sum of distribution = 0 per rate_name. |
-| Breakdown summary tables populated correctly | Row counts match expectation (rate_type × rate_name × entity) |
-| API response includes `breakdown` on usage | Array of {name, source, value, units} entries |
-| API response includes `breakdown` on overhead | Proportional computation matches manual calculation |
-| On-prem path (self_hosted_sql) | Same behavior as cloud PostgreSQL path |
+| `cluster_cost_per_hour` distribution | Non-zero `cost_model_cpu_cost` on rows with `pod_effective_usage`; zero on storage/GPU-only rows |
+| Platform distribution after cost application | Distributed rows carry `cost_model_rate_name` from source. Sum of distribution = 0 per `cost_model_rate_name`. |
+| Worker distribution (requires fixture creation) | "Worker unallocated" rows exist; distributed rows carry source rate names |
+| Breakdown summary tables populated correctly | Row counts match expectation (`rate_type × rate_name × entity`). `OCPCostBreakdownByProjectP` has namespace dimension. |
+| API response includes `breakdown` on usage | Array of `{name, source, value, units}` entries, ordered by value descending |
+| API response includes `breakdown` on overhead | Pre-computed from distribution data, not query-time approximation |
+| `breakdown_limit` top-N | Top N entries returned; remainder aggregated as `{"name": "Other", "source": "other", ...}` |
+| On-prem path (`self_hosted_sql`) | Same behavior as cloud PostgreSQL path |
 | Trino path (VM rates) | Rate name written correctly via Trino SQL |
-| Existing API response unchanged | All existing fields/values identical |
+| Existing API response unchanged | All existing fields/values identical when `breakdown` not requested |
+| CSV with breakdown | `cost_model_rate_name` appears as flat column, rows expanded per rate name |
 
-### 15.3 Performance Tests
+### 15.9 Concrete Test Files (Phase 1)
+
+| Test File | PR Coverage | Key Tests |
+|-----------|-------------|-----------|
+| `koku/cost_models/test/test_serializers.py` | PR 1 | Name validation, uniqueness, max length, data migration |
+| `koku/masu/test/database/test_cost_model_db_accessor.py` | PR 3 | `infrastructure_rates_by_name`, `tag_rate_names`, multiple rates per metric |
+| `koku/masu/test/database/test_cost_breakdown_usage.py` | PRs 3-4 | Per-rate usage cost insertion, `cost_model_rate_name` on line items, `cluster_cost_per_hour` distribution |
+| `koku/masu/test/database/test_cost_breakdown_distribution.py` | PR 5 | Platform/worker distribution tracks `cost_model_rate_name`, sum-to-zero validation |
+| `koku/api/report/test/ocp/test_cost_breakdown_e2e.py` | PRs 6-7 | Full pipeline: cost model → cost application → breakdown summary → API response with `breakdown` array |
+
+### 15.10 Performance Tests
 
 | Scenario | Metric | Threshold |
 |----------|--------|-----------|
