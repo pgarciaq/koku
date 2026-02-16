@@ -668,7 +668,9 @@ class OCPReportDBAccessor(SQLScriptAtomicExecutorMixin, ReportDBAccessorBase):
             self._table_map["line_item_daily_summary"], delete_sql, sql_params, operation="DELETE"
         )
 
-    def populate_monthly_cost_sql(self, cost_type, rate_type, rate, start_date, end_date, distribution, provider_uuid):
+    def populate_monthly_cost_sql(
+        self, cost_type, rate_type, rate, start_date, end_date, distribution, provider_uuid, rate_name=None
+    ):
         """
         Populate the monthly cost of a customer.
 
@@ -743,6 +745,7 @@ class OCPReportDBAccessor(SQLScriptAtomicExecutorMixin, ReportDBAccessorBase):
             "cost_type": cost_type,
             "rate_type": rate_type,
             "distribution": distribution,
+            "rate_name": rate_name,
         }
         insert_sql = pkgutil.get_data("masu.database", cost_type_file)
         insert_sql = insert_sql.decode("utf-8")
@@ -756,7 +759,16 @@ class OCPReportDBAccessor(SQLScriptAtomicExecutorMixin, ReportDBAccessorBase):
             self._prepare_and_execute_raw_sql_query(table_name, insert_sql, sql_params, operation="INSERT")
 
     def populate_tag_cost_sql(
-        self, cost_type, rate_type, tag_key, case_dict, start_date, end_date, distribution, provider_uuid
+        self,
+        cost_type,
+        rate_type,
+        tag_key,
+        case_dict,
+        start_date,
+        end_date,
+        distribution,
+        provider_uuid,
+        rate_name=None,
     ):
         """
         Update or insert daily summary line item for node cost.
@@ -808,6 +820,7 @@ class OCPReportDBAccessor(SQLScriptAtomicExecutorMixin, ReportDBAccessorBase):
             "distribution": distribution,
             "tag_key": tag_key,
             "labels": labels,
+            "rate_name": rate_name,
         }
 
         if case_dict.get("unallocated"):
@@ -900,7 +913,13 @@ class OCPReportDBAccessor(SQLScriptAtomicExecutorMixin, ReportDBAccessorBase):
         self._prepare_and_execute_raw_sql_query(table_name, sql, sql_params, operation="INSERT")
 
     def populate_tag_usage_costs(  # noqa: C901
-        self, infrastructure_rates, supplementary_rates, start_date, end_date, cluster_id
+        self,
+        infrastructure_rates,
+        supplementary_rates,
+        start_date,
+        end_date,
+        cluster_id,
+        tag_rate_names=None,
     ):
         """
         Update the reporting_ocpusagelineitem_daily_summary table with
@@ -944,6 +963,7 @@ class OCPReportDBAccessor(SQLScriptAtomicExecutorMixin, ReportDBAccessorBase):
                 for tag_key in tags:
                     tag_vals = tags.get(tag_key, {})
                     value_names = list(tag_vals.keys())
+                    rate_name = (tag_rate_names or {}).get(metric, {}).get(tag_key)
                     for val_name in value_names:
                         rate_value = tag_vals[val_name]
                         key_value_pair = json.dumps({tag_key: val_name})
@@ -959,13 +979,20 @@ class OCPReportDBAccessor(SQLScriptAtomicExecutorMixin, ReportDBAccessorBase):
                             "metric": metric,
                             "k_v_pair": key_value_pair,
                             "labels_field": labels_field,
+                            "rate_name": rate_name,
                         }
                         ctx = self.extract_context_from_sql_params(sql_params)
                         LOG.info(log_json(msg="running populate_tag_usage_costs SQL", context=ctx))
                         self._prepare_and_execute_raw_sql_query(table_name, sql, sql_params)
 
     def populate_tag_usage_default_costs(  # noqa: C901
-        self, infrastructure_rates, supplementary_rates, start_date, end_date, cluster_id
+        self,
+        infrastructure_rates,
+        supplementary_rates,
+        start_date,
+        end_date,
+        cluster_id,
+        tag_rate_names=None,
     ):
         """
         Update the reporting_ocpusagelineitem_daily_summary table
@@ -1021,6 +1048,7 @@ class OCPReportDBAccessor(SQLScriptAtomicExecutorMixin, ReportDBAccessorBase):
                     for value_to_skip in value_names:
                         key_value_pair.append(json.dumps({tag_key: value_to_skip}))
                     json.dumps(key_value_pair)
+                    rate_name = (tag_rate_names or {}).get(metric, {}).get(tag_key)
                     sql = pkgutil.get_data("masu.database", sql_file)
                     sql = sql.decode("utf-8")
                     sql_params = {
@@ -1034,6 +1062,7 @@ class OCPReportDBAccessor(SQLScriptAtomicExecutorMixin, ReportDBAccessorBase):
                         "tag_key": tag_key,
                         "k_v_pair": key_value_pair,
                         "labels_field": labels_field,
+                        "rate_name": rate_name,
                     }
                     ctx = self.extract_context_from_sql_params(sql_params)
                     LOG.info(log_json(msg="running populate_tag_usage_default_costs SQL", context=ctx))
@@ -1452,6 +1481,9 @@ class OCPReportDBAccessor(SQLScriptAtomicExecutorMixin, ReportDBAccessorBase):
                     context_params = tag_params | metric_params
                 else:
                     context_params = tag_params.copy()
+                # Map rate "name" to "rate_name" for SQL template compatibility
+                if "name" in context_params:
+                    context_params["rate_name"] = context_params.pop("name")
                 final_sql_params = param_builder.build_parameters(context_params=context_params)
                 sql = pkgutil.get_data("masu.database", metadata["file_path"]).decode("utf-8")
                 LOG.info(log_json(msg=metadata["log_msg"], context=context_params))

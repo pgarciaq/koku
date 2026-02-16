@@ -35,6 +35,7 @@ INSERT INTO {{schema | sqlsafe}}.reporting_ocpusagelineitem_daily_summary (
     persistentvolumeclaim_usage_gigabyte_months,
     source_uuid,
     cost_model_rate_type,
+    cost_model_rate_name,
     cost_model_cpu_cost,
     cost_model_memory_cost,
     cost_model_volume_cost,
@@ -77,6 +78,7 @@ SELECT uuid_generate_v4(),
     NULL as persistentvolumeclaim_usage_gigabyte_months,
     source_uuid,
     {{rate_type}} as cost_model_rate_type,
+    {{rate_name}} as cost_model_rate_name,
     CASE
         WHEN {{cost_type}} = 'Cluster' AND {{distribution}} = 'cpu'
             THEN sum(pod_effective_usage_cpu_core_hours) / max(cluster_capacity_cpu_core_hours) * {{rate}}::decimal

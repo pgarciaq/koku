@@ -50,6 +50,9 @@ class OCPCostModelCostUpdater(OCPCloudUpdaterBase):
             )
             self._distribution_info = cost_model_accessor.distribution_info
             self.metric_to_tag_params_map = cost_model_accessor.metric_to_tag_params_map
+            self._infra_rates_by_name = cost_model_accessor.infrastructure_rates_by_name
+            self._supplementary_rates_by_name = cost_model_accessor.supplementary_rates_by_name
+            self._tag_rate_names = cost_model_accessor.tag_rate_names
 
     def _build_node_tag_cost_case_statements(  # noqa: C901
         self, rate_dict, start_date, default_rate_dict={}, unallocated=False, node_core="", amortized=True
@@ -251,46 +254,90 @@ class OCPCostModelCostUpdater(OCPCloudUpdaterBase):
         }
 
     def _update_monthly_cost(self, start_date, end_date):
-        """Update the monthly cost for a period of time."""
+        """Update the monthly cost for a period of time.
+
+        Iterates over the list-based rates_by_name properties so that
+        multiple rates targeting the same metric are each applied with
+        their own cost_model_rate_name.
+        """
+        monthly_metrics = set(OCPUsageLineItemDailySummary.MONTHLY_COST_RATE_MAP.values())
+        metric_to_cost_type = {v: k for k, v in OCPUsageLineItemDailySummary.MONTHLY_COST_RATE_MAP.items()}
+
         with OCPReportDBAccessor(self._schema) as report_accessor:
-            # Ex. cost_type == "Node", rate_term == "node_cost_per_month", rate == 1000
+            # First, handle deletion for metrics that have no rate at all.
+            # Collect which (cost_type, metric) combos DO have rates.
+            has_rate = set()
+            for rate_kind, rates_by_name in [
+                (metric_constants.INFRASTRUCTURE_COST_TYPE, self._infra_rates_by_name),
+                (metric_constants.SUPPLEMENTARY_COST_TYPE, self._supplementary_rates_by_name),
+            ]:
+                for entry in rates_by_name:
+                    if entry["metric"] in monthly_metrics:
+                        has_rate.add(entry["metric"])
+
+            # For any monthly metric with NO rate at all, call deletion
             for cost_type, rate_term in OCPUsageLineItemDailySummary.MONTHLY_COST_RATE_MAP.items():
-                rate_type = None
-                rate = None
-                if self._infra_rates.get(rate_term):
-                    rate_type = metric_constants.INFRASTRUCTURE_COST_TYPE
-                    rate = self._infra_rates.get(rate_term)
-                elif self._supplementary_rates.get(rate_term):
-                    rate_type = metric_constants.SUPPLEMENTARY_COST_TYPE
-                    rate = self._supplementary_rates.get(rate_term)
-
-                log_msg = "updating"
-                if rate is None:
-                    log_msg = "removing"
-
-                LOG.info(
-                    log_json(
-                        msg=f"{log_msg} monthly cost",
-                        cost_type=cost_type,
-                        schema=self._schema,
-                        provider_type=self._provider.type,
-                        provider_uuid=self._provider_uuid,
-                        provider_name=self._provider.name,
-                        start_date=start_date,
-                        end_date=end_date,
+                if rate_term not in has_rate:
+                    LOG.info(
+                        log_json(
+                            msg="removing monthly cost",
+                            cost_type=cost_type,
+                            schema=self._schema,
+                            provider_type=self._provider.type,
+                            provider_uuid=self._provider_uuid,
+                            provider_name=self._provider.name,
+                            start_date=start_date,
+                            end_date=end_date,
+                        )
                     )
-                )
+                    report_accessor.populate_monthly_cost_sql(
+                        cost_type,
+                        None,
+                        None,
+                        start_date,
+                        end_date,
+                        self._distribution,
+                        self._provider_uuid,
+                    )
 
-                amortized_rate = get_amortized_monthly_cost_model_rate(rate, start_date)
-                report_accessor.populate_monthly_cost_sql(
-                    cost_type,
-                    rate_type,
-                    amortized_rate,
-                    start_date,
-                    end_date,
-                    self._distribution,
-                    self._provider_uuid,
-                )
+            # Now apply each named rate
+            for rate_kind, rates_by_name in [
+                (metric_constants.INFRASTRUCTURE_COST_TYPE, self._infra_rates_by_name),
+                (metric_constants.SUPPLEMENTARY_COST_TYPE, self._supplementary_rates_by_name),
+            ]:
+                for entry in rates_by_name:
+                    metric = entry["metric"]
+                    if metric not in monthly_metrics:
+                        continue
+                    rate = entry["value"]
+                    name = entry["name"]
+                    cost_type = metric_to_cost_type[metric]
+
+                    LOG.info(
+                        log_json(
+                            msg="updating monthly cost",
+                            cost_type=cost_type,
+                            rate_name=name,
+                            schema=self._schema,
+                            provider_type=self._provider.type,
+                            provider_uuid=self._provider_uuid,
+                            provider_name=self._provider.name,
+                            start_date=start_date,
+                            end_date=end_date,
+                        )
+                    )
+
+                    amortized_rate = get_amortized_monthly_cost_model_rate(rate, start_date)
+                    report_accessor.populate_monthly_cost_sql(
+                        cost_type,
+                        rate_kind,
+                        amortized_rate,
+                        start_date,
+                        end_date,
+                        self._distribution,
+                        self._provider_uuid,
+                        rate_name=name,
+                    )
 
     def _update_monthly_tag_based_cost(self, start_date, end_date):  # noqa: C901
         """Update the monthly cost for a period of time based on tag rates."""
@@ -339,6 +386,7 @@ class OCPCostModelCostUpdater(OCPCloudUpdaterBase):
                     )
 
                     for tag_key, case_statements in per_tag_key_case_statements.items():
+                        rate_name = self._tag_rate_names.get(monthly_cost_metric, {}).get(tag_key)
                         report_accessor.populate_tag_cost_sql(
                             openshift_resource_type,
                             cost_model_cost_type,
@@ -348,6 +396,7 @@ class OCPCostModelCostUpdater(OCPCloudUpdaterBase):
                             end_date,
                             self._distribution,
                             self._provider_uuid,
+                            rate_name=rate_name,
                         )
 
     def _update_node_hour_tag_based_cost(self, start_date, end_date):
@@ -382,6 +431,7 @@ class OCPCostModelCostUpdater(OCPCloudUpdaterBase):
                     rates, default_rates, start_date
                 )
                 for tag_key, case_statements in per_tag_key_case_statements.items():
+                    rate_name = self._tag_rate_names.get(cost_metric, {}).get(tag_key)
                     report_accessor.populate_tag_cost_sql(
                         "Node_Core_Hour",
                         cost_model_cost_type,
@@ -391,6 +441,7 @@ class OCPCostModelCostUpdater(OCPCloudUpdaterBase):
                         end_date,
                         self._distribution,
                         self._provider_uuid,
+                        rate_name=rate_name,
                     )
 
     def _update_usage_costs(self, start_date, end_date):
@@ -487,7 +538,12 @@ class OCPCostModelCostUpdater(OCPCloudUpdaterBase):
         """Update infrastructure and supplementary tag based usage costs."""
         with OCPReportDBAccessor(self._schema) as report_accessor:
             report_accessor.populate_tag_usage_costs(
-                self._tag_infra_rates, self._tag_supplementary_rates, start_date, end_date, self._cluster_id
+                self._tag_infra_rates,
+                self._tag_supplementary_rates,
+                start_date,
+                end_date,
+                self._cluster_id,
+                tag_rate_names=self._tag_rate_names,
             )
 
     def _update_tag_usage_default_costs(self, start_date, end_date):
@@ -499,6 +555,7 @@ class OCPCostModelCostUpdater(OCPCloudUpdaterBase):
                 start_date,
                 end_date,
                 self._cluster_id,
+                tag_rate_names=self._tag_rate_names,
             )
 
     def _delete_tag_usage_costs(self, start_date, end_date, source_uuid):

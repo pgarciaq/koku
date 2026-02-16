@@ -99,6 +99,55 @@ class CostModelDBAccessor:
         }
 
     @property
+    def infrastructure_rates_by_name(self):
+        """Return infrastructure rates with names, supporting multiple rates per metric.
+
+        Returns a list of dicts, each with 'metric', 'value', and 'name' keys.
+        This preserves duplicate-metric rates that the dict-based properties lose.
+        """
+        return self._rates_by_name(metric_constants.INFRASTRUCTURE_COST_TYPE)
+
+    @property
+    def supplementary_rates_by_name(self):
+        """Return supplementary rates with names, supporting multiple rates per metric."""
+        return self._rates_by_name(metric_constants.SUPPLEMENTARY_COST_TYPE)
+
+    def _rates_by_name(self, cost_type):
+        """Build a list of rate entries for the given cost type from the raw rates JSON."""
+        if not self.cost_model:
+            return []
+        rates = []
+        for rate in self.cost_model.rates or []:
+            if rate.get("cost_type") != cost_type:
+                continue
+            metric = rate.get("metric", {}).get("name")
+            tiered_rates = rate.get("tiered_rates", [])
+            if tiered_rates:
+                rates.append(
+                    {
+                        "metric": metric,
+                        "value": tiered_rates[0].get("value", 0),
+                        "name": rate.get("name"),
+                    }
+                )
+        return rates
+
+    @property
+    def tag_rate_names(self):
+        """Return {metric: {tag_key: rate_name}} for tag-based rates."""
+        if not self.cost_model:
+            return {}
+        names = defaultdict(dict)
+        for rate in self.cost_model.rates or []:
+            tag_rates = rate.get("tag_rates", {})
+            if not tag_rates:
+                continue
+            metric = rate.get("metric", {}).get("name")
+            tag_key = tag_rates.get("tag_key")
+            names[metric][tag_key] = rate.get("name")
+        return dict(names)
+
+    @property
     def markup(self):
         if self.cost_model:
             return self.cost_model.markup
@@ -130,6 +179,7 @@ class CostModelDBAccessor:
             metric_name = rate.get("metric", {}).get("name")
             tag_rate_param["rate_type"] = rate["cost_type"]
             tag_rate_param["tag_key"] = tag_rate.get("tag_key")
+            tag_rate_param["name"] = rate.get("name")
             kv_pairs_rates = {}
             for tag_value in tag_rate.get("tag_values"):
                 if tag_value.get("default"):

@@ -17,6 +17,7 @@ INSERT INTO {{schema | sqlsafe}}.reporting_ocpusagelineitem_daily_summary (
     cost_model_memory_cost,
     cost_model_volume_cost,
     cost_model_rate_type,
+    cost_model_rate_name,
     {{labels_field | sqlsafe}},
     all_labels,
     monthly_cost_type,
@@ -52,6 +53,7 @@ SELECT uuid_generate_v4() as uuid,
         ELSE 0.0
     END as cost_model_volume_cost,
     'Infrastructure' as cost_model_rate_type,
+    {{rate_name}} as cost_model_rate_name,
     {{labels_field | sqlsafe}},
     {{labels_field | sqlsafe}} as all_labels,
     'Tag' as monthly_cost_type, -- We are borrowing the monthly field here, although this is a daily usage cost

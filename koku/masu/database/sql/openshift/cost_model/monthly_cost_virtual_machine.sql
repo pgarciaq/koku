@@ -13,6 +13,7 @@ INSERT INTO {{schema | sqlsafe}}.reporting_ocpusagelineitem_daily_summary (
     all_labels,
     source_uuid,
     cost_model_rate_type,
+    cost_model_rate_name,
     cost_model_cpu_cost,
     cost_model_memory_cost,
     cost_model_volume_cost,
@@ -33,6 +34,7 @@ SELECT uuid_generate_v4(),
     all_labels,
     source_uuid,
     {{rate_type}} AS cost_model_rate_type,
+    {{rate_name}} as cost_model_rate_name,
     {%- if rate is defined %}
     {{rate}}::decimal AS cost_model_cpu_cost,
     {%- elif value_rates is defined %}
