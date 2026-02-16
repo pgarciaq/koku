@@ -33,7 +33,7 @@
 
 This document describes the technical design for the "Cost Breakdown for Custom Costs" feature. The goal is to break down aggregate cost categories (usage cost, overhead costs, markup) into their individual constituent rate names from the user's price list, so that the Sankey diagram and API responses show per-rate granularity instead of opaque aggregates.
 
-**Phase 1** covers breaking down usage costs by price list rate names, plus proportional breakdown of overhead and markup by rate name. **Phase 2** adds cloud service breakdown (AmazonEC2, AmazonRDS, etc.) for raw cost and extends overhead/markup breakdown to include service-level constituents.
+**Phase 1** covers breaking down usage costs by price list rate names, plus pre-computed per-rate-name breakdown of overhead types. Raw cost and markup remain as single aggregates in Phase 1. **Phase 2** adds cloud service breakdown (AmazonEC2, AmazonRDS, etc.) for raw cost and extends overhead/markup breakdown to include service-level constituents.
 
 ### Key Design Decisions
 

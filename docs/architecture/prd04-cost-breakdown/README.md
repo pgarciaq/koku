@@ -45,29 +45,58 @@ That was confusing so with COST-5852 we evolved that into the current Sankey dia
 
 ### Desired State
 
-The Sankey breaks down each cost category into its constituent services and rates:
+The Sankey adds a new layer of detail on the left side, breaking down each cost category into its constituent rate names (Phase 1) and cloud services (Phase 2). The flow direction matches the existing chart: parts compose into aggregates left-to-right.
+
+**Phase 1 (rate names):** Usage cost and each overhead type get a breakdown layer:
 
 ```
-Total cost --> Project ---------> JBoss subscription (rate name)
-           |                |---> Guest OS subscription (rate name)
-           |                |---> Quota charge (rate name)
-           |                |---> AmazonEC2 (cloud service)
-           |                |---> Red Hat OpenShift Service on AWS (cloud service)
-           |                |---> AmazonRDS (cloud service)
-           |                |---> AWSDataTransfer (cloud service)
-           |                \---> Markup
-           |
-           \-> Overhead cost --> Platform distributed ----> AmazonEC2
-                            |                          |--> JBoss subscription
-                            |                          |--> AmazonRDS
-                            |                          \--> Quota charge
-                            |
-                            |--> Storage unattributed ---> AmazonEC2
-                            |--> Network unattributed ---> AWSDataTransfer
-                            \--> Worker unallocated -----> AmazonEC2
-                                                      |--> Quota charge
-                                                      |--> JBoss subscription
-                                                      \--> Red Hat OpenShift Service on AWS
+JBoss subscription --------\
+Guest OS subscription ------+--> Usage cost -------\
+Quota charge --------------/                       |
+                                                   |
+                              Raw cost ------------+--> Project (workload) ---\
+                              Markup --------------/                          |
+                                                                             +--> Total cost
+JBoss subscription -----\                                                    |
+Quota charge -----------+--> Platform distributed --\                        |
+Cloud cost ------------/                            |                        |
+                                                    +--> Overhead cost ------/
+JBoss subscription -----\                           |
+Quota charge -----------+--> Worker unallocated ---/
+Cloud cost ------------/                           |
+                              Storage unattributed-/
+                              Network unattributed/
+```
+
+**Phase 2 (adds cloud services):** Raw cost also gets a breakdown layer (AmazonEC2, AmazonRDS, etc.), markup gets proportional breakdown by service, and overhead types gain cloud service detail alongside rate names.
+
+```
+JBoss subscription --------\
+Guest OS subscription ------+--> Usage cost -------\
+Quota charge --------------/                       |
+                                                   |
+AmazonEC2 -----------------\                       |
+Red Hat OpenShift Service --+--> Raw cost ---------+--> Project (workload) ---\
+AmazonRDS -----------------/                       |                          |
+AWSDataTransfer -----------/                       |                          |
+                                                   |                          |
+AmazonEC2 -----------------\                       |                          |
+Red Hat OpenShift Service --+--> Markup -----------/                          |
+AmazonRDS -----------------/                                                  |
+AWSDataTransfer -----------/                                                  |
+                                                                             +--> Total cost
+AmazonEC2 --------\                                                          |
+JBoss subscription +--> Platform distributed --\                             |
+AmazonRDS --------/                            |                             |
+Quota charge ----/                             |                             |
+Red Hat OpenShift Service -/                   +--> Overhead cost -----------/
+                                               |
+AmazonEC2 --------\                            |
+Quota charge ------+--> Worker unallocated ---/
+JBoss subscription /                          |
+Red Hat OpenShift Service -/                  |
+                           Storage unattrib.--/
+                           Network unattrib.-/
 ```
 
 ### Jira Breakdown
@@ -101,55 +130,109 @@ For a cost model like this:
 
 ### Expected Sankey Output
 
-I would expect to see the following breakdown in the Sankey diagram:
+I would expect to see new rate name nodes on the left side of the Sankey, flowing into the existing cost category nodes. The flow direction is left-to-right (parts compose into aggregates), consistent with the existing chart:
 
 - JBoss subscription
 - Guest OS subscription
 - Quota charge
-- AmazonEC2
-- Red Hat OpenShift Service on AWS
-- AmazonRDS
-- AWSDataTransfer
+- AmazonEC2 (Phase 2)
+- Red Hat OpenShift Service on AWS (Phase 2)
+- AmazonRDS (Phase 2)
+- AWSDataTransfer (Phase 2)
 - (more if there's more that would apply)
 
 ![Target Sankey diagram showing per-rate and per-service breakdown](images/target-sankey-diagram.png)
 
-**SankeyMATIC input for the example above:**
+**SankeyMATIC input for Phase 1 (rate names only):**
+
+The existing nodes (Raw cost, Markup, Usage cost, overhead types, Project/workload, Overhead, Total cost) remain unchanged. Rate names are added as a new leftmost layer flowing into Usage cost and each overhead type:
 
 ```
-Total cost[772] Project
-Total cost[197] Overhead cost
+// Rate names -> Usage cost (new layer)
+JBoss subscription[40] Usage cost
+Guest OS subscription[100] Usage cost
+Quota charge[80] Usage cost
 
-Project[40] JBoss subscription
-Project[100] Guest OS subscription (RHEL)
-Project[80] Quota charge
-Project[183] AmazonEC2
-Project[176] Red Hat OpenShift Service on AWS
-Project[73] AmazonRDS
-Project[12] AWSDataTransfer
-Project[108] Markup
+// Existing nodes (unchanged)
+Raw cost[183] Project
+Markup[108] Project
+Usage cost[220] Project
 
-Overhead cost[59] Platform distributed
-Overhead cost[11] Storage unattributed
-Overhead cost[8] Network unattributed
-Overhead cost[79] Worker unallocated
+// Rate names -> overhead types (new layer)
+JBoss subscription[7] Platform distributed
+Quota charge[3] Platform distributed
+Cloud cost[49] Platform distributed
+JBoss subscription[9] Worker unallocated
+Quota charge[10] Worker unallocated
+Cloud cost[60] Worker unallocated
+Cloud cost[11] Storage unattributed
+Cloud cost[8] Network unattributed
 
-Platform distributed[21] AmazonEC2
-Platform distributed[7] JBoss subscription
-Platform distributed[7] AmazonRDS
-Platform distributed[3] Quota charge
-Platform distributed[21] Red Hat OpenShift Service on AWS
+// Existing overhead -> Overhead cost (unchanged)
+Platform distributed[59] Overhead cost
+Worker unallocated[79] Overhead cost
+Storage unattributed[11] Overhead cost
+Network unattributed[8] Overhead cost
 
-Storage unattributed[11] AmazonEC2
-Network unattributed[8] AWSDataTransfer
-
-Worker unallocated[30] AmazonEC2
-Worker unallocated[10] Quota charge
-Worker unallocated[9] JBoss subscription
-Worker unallocated[30] Red Hat OpenShift Service on AWS
+// Existing aggregate -> total (unchanged)
+Project[511] Total cost
+Overhead cost[157] Total cost
 ```
 
-That was an example of per-project breakdown into cloud and custom rates constituents. We need the same for cluster, node, tag and OpenShift Virtualization VMs.
+**SankeyMATIC input for Phase 2 (adds cloud services):**
+
+Phase 2 additionally breaks down Raw cost and Markup into cloud service constituents:
+
+```
+// Rate names -> Usage cost
+JBoss subscription[40] Usage cost
+Guest OS subscription[100] Usage cost
+Quota charge[80] Usage cost
+
+// Cloud services -> Raw cost (Phase 2)
+AmazonEC2[183] Raw cost
+Red Hat OpenShift Service on AWS[176] Raw cost
+AmazonRDS[73] Raw cost
+AWSDataTransfer[12] Raw cost
+
+// Cloud services -> Markup (Phase 2)
+AmazonEC2[44.50] Markup
+Red Hat OpenShift Service on AWS[42.80] Markup
+AmazonRDS[17.74] Markup
+AWSDataTransfer[2.96] Markup
+
+// Existing cost categories -> workload
+Raw cost[444] Project
+Markup[108] Project
+Usage cost[220] Project
+
+// Rate names + cloud services -> overhead types
+AmazonEC2[21] Platform distributed
+Red Hat OpenShift Service on AWS[21] Platform distributed
+JBoss subscription[7] Platform distributed
+AmazonRDS[7] Platform distributed
+Quota charge[3] Platform distributed
+
+AmazonEC2[30] Worker unallocated
+Red Hat OpenShift Service on AWS[30] Worker unallocated
+Quota charge[10] Worker unallocated
+JBoss subscription[9] Worker unallocated
+
+AmazonEC2[11] Storage unattributed
+AWSDataTransfer[8] Network unattributed
+
+// Existing overhead -> Overhead cost
+Platform distributed[59] Overhead cost
+Worker unallocated[79] Overhead cost
+Storage unattributed[11] Overhead cost
+Network unattributed[8] Overhead cost
+
+// Existing aggregate -> total
+Project[772] Total cost
+Overhead cost[157] Total cost
+```
+
+That was an example of per-project breakdown into custom rates (Phase 1) and cloud service (Phase 2) constituents. We need the same for cluster, node, tag and OpenShift Virtualization VMs.
 
 ### Breakdown Perspectives
 
@@ -231,7 +314,64 @@ Extend the existing report API response by adding an optional `breakdown` array 
 }
 ```
 
-**Extended response (new `breakdown` field on each category):**
+**Phase 1 extended response (breakdown on `usage` and overhead types only):**
+
+In Phase 1, `raw` and `markup` remain unchanged (no breakdown). Only `usage` and overhead types (`platform_distributed`, `worker_unallocated_distributed`, etc.) gain `breakdown` arrays:
+
+```json
+{
+  "cost": {
+    "raw": {"value": 183.00, "units": "USD"},
+    "usage": {
+      "value": 220.00,
+      "units": "USD",
+      "breakdown": [
+        {"name": "Guest OS subscription", "source": "rate", "value": 100.00, "units": "USD"},
+        {"name": "Quota charge", "source": "rate", "value": 80.00, "units": "USD"},
+        {"name": "JBoss subscription", "source": "rate", "value": 40.00, "units": "USD"}
+      ]
+    },
+    "markup": {"value": 108.00, "units": "USD"},
+    "platform_distributed": {
+      "value": 59.00,
+      "units": "USD",
+      "breakdown": [
+        {"name": "Cloud cost", "source": "cloud", "value": 49.00, "units": "USD"},
+        {"name": "JBoss subscription", "source": "rate", "value": 7.00, "units": "USD"},
+        {"name": "Quota charge", "source": "rate", "value": 3.00, "units": "USD"}
+      ]
+    },
+    "worker_unallocated_distributed": {
+      "value": 79.00,
+      "units": "USD",
+      "breakdown": [
+        {"name": "Cloud cost", "source": "cloud", "value": 60.00, "units": "USD"},
+        {"name": "Quota charge", "source": "rate", "value": 10.00, "units": "USD"},
+        {"name": "JBoss subscription", "source": "rate", "value": 9.00, "units": "USD"}
+      ]
+    },
+    "storage_unattributed_distributed": {
+      "value": 11.00,
+      "units": "USD",
+      "breakdown": [
+        {"name": "Cloud cost", "source": "cloud", "value": 11.00, "units": "USD"}
+      ]
+    },
+    "network_unattributed_distributed": {
+      "value": 8.00,
+      "units": "USD",
+      "breakdown": [
+        {"name": "Cloud cost", "source": "cloud", "value": 8.00, "units": "USD"}
+      ]
+    },
+    "total": {"value": 969.00, "units": "USD"}
+  }
+}
+```
+
+**Phase 2 extended response (adds breakdown on `raw` and `markup`):**
+
+Phase 2 additionally breaks down `raw` into cloud service constituents and `markup` into proportional service breakdown. Overhead breakdown gains per-service entries replacing the Phase 1 `"Cloud cost"` placeholder:
 
 ```json
 {
@@ -244,15 +384,6 @@ Extend the existing report API response by adding an optional `breakdown` array 
         {"name": "Red Hat OpenShift Service on AWS", "source": "service", "value": 176.00, "units": "USD"},
         {"name": "AmazonRDS", "source": "service", "value": 73.00, "units": "USD"},
         {"name": "AWSDataTransfer", "source": "service", "value": 12.00, "units": "USD"}
-      ]
-    },
-    "usage": {
-      "value": 220.00,
-      "units": "USD",
-      "breakdown": [
-        {"name": "Guest OS subscription", "source": "rate", "value": 100.00, "units": "USD"},
-        {"name": "Quota charge", "source": "rate", "value": 80.00, "units": "USD"},
-        {"name": "JBoss subscription", "source": "rate", "value": 40.00, "units": "USD"}
       ]
     },
     "markup": {
@@ -275,32 +406,7 @@ Extend the existing report API response by adding an optional `breakdown` array 
         {"name": "AmazonRDS", "source": "service", "value": 7.00, "units": "USD"},
         {"name": "Quota charge", "source": "rate", "value": 3.00, "units": "USD"}
       ]
-    },
-    "worker_unallocated_distributed": {
-      "value": 79.00,
-      "units": "USD",
-      "breakdown": [
-        {"name": "AmazonEC2", "source": "service", "value": 30.00, "units": "USD"},
-        {"name": "Red Hat OpenShift Service on AWS", "source": "service", "value": 30.00, "units": "USD"},
-        {"name": "Quota charge", "source": "rate", "value": 10.00, "units": "USD"},
-        {"name": "JBoss subscription", "source": "rate", "value": 9.00, "units": "USD"}
-      ]
-    },
-    "storage_unattributed_distributed": {
-      "value": 11.00,
-      "units": "USD",
-      "breakdown": [
-        {"name": "AmazonEC2", "source": "service", "value": 11.00, "units": "USD"}
-      ]
-    },
-    "network_unattributed_distributed": {
-      "value": 8.00,
-      "units": "USD",
-      "breakdown": [
-        {"name": "AWSDataTransfer", "source": "service", "value": 8.00, "units": "USD"}
-      ]
-    },
-    "total": {"value": 969.00, "units": "USD"}
+    }
   }
 }
 ```
@@ -309,8 +415,8 @@ Extend the existing report API response by adding an optional `breakdown` array 
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `name` | string | Display label: rate name (from price list) or cloud service name (product_code/service_name) |
-| `source` | string | `"rate"` for cost model rate, `"service"` for cloud service |
+| `name` | string | Display label: rate name (from price list), cloud service name (product_code/service_name), `"Cloud cost"` (Phase 1 placeholder), or `"Other"` (top-N aggregation) |
+| `source` | string | `"rate"` for cost model rate, `"service"` for cloud service (Phase 2), `"cloud"` for aggregated cloud cost (Phase 1), `"other"` for top-N remainder |
 | `value` | decimal | Cost amount |
 | `units` | string | Currency code |
 
@@ -543,19 +649,20 @@ For the common case where a user has exactly one rate per resource type (one CPU
 
 **Cost breakdown API:**
 
-- [ ] OCP report endpoints (`/reports/openshift/costs/`, `/reports/openshift/costs/?group_by[project]=*`, etc.) return a `breakdown` array on each cost category (usage, platform_distributed, worker_unallocated_distributed, storage_unattributed_distributed, network_unattributed_distributed, gpu_unallocated_distributed).
-- [ ] Each breakdown entry has `name` (rate name), `source: "rate"`, `value`, and `units`.
+- [ ] OCP report endpoints (`/reports/openshift/costs/`, `/reports/openshift/costs/?group_by[project]=*`, etc.) return a `breakdown` array on `usage` and each overhead type (`platform_distributed`, `worker_unallocated_distributed`, `storage_unattributed_distributed`, `network_unattributed_distributed`, `gpu_unallocated_distributed`).
+- [ ] `raw` and `markup` remain unchanged in Phase 1 (no `breakdown` array — deferred to Phase 2).
+- [ ] Each breakdown entry has `name` (rate name), `source: "rate"`, `value`, and `units`. Overhead entries for cloud-sourced cost use `source: "cloud"` with `name: "Cloud cost"` as a Phase 1 placeholder.
 - [ ] Breakdown is available for: project, cluster, node, tag, and virtual machine perspectives.
 - [ ] Existing response fields are unchanged (backward compatible).
 - [ ] Works on both PostgreSQL-only (on-prem) and Trino+PostgreSQL (cloud) paths.
-- [ ] Overhead breakdown reflects proportional attribution by the receiving entity's cost composition.
-- [ ] Markup breakdown reflects proportional attribution by the entity's infrastructure raw cost composition.
+- [ ] Overhead breakdown reflects pre-computed per-rate-name attribution from the distribution SQL.
 
 **Frontend:**
 
 - [ ] Rate creation/editing form includes the `name` field (required, max 50 chars).
-- [ ] Sankey diagram renders individual rate names as nodes in the flow.
-- [ ] Overhead nodes (platform distributed, worker unallocated, etc.) flow into constituent rate name nodes on the right side.
+- [ ] Sankey diagram renders individual rate names as new nodes on the left side, flowing into the existing cost category nodes (usage, overhead types). The flow direction is parts-to-total (left-to-right), consistent with the current chart.
+- [ ] Overhead types (platform distributed, worker unallocated, etc.) receive flow from constituent rate name nodes on the left side.
+- [ ] The `raw`, `markup`, and `credit` nodes remain unchanged (no breakdown sub-layer in Phase 1).
 
 ### Phase 2 (COST-4415)
 
