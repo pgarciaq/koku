@@ -21,13 +21,16 @@ class OCPCostSerializerBreakdownTest(TestCase):
     """T7.1–T7.3: Tests for breakdown_limit query parameter."""
 
     def test_breakdown_limit_accepted(self):
-        """T7.1: breakdown_limit is accepted as an integer parameter."""
+        """T7.1: breakdown_limit is accepted as an integer parameter and available in validated_data."""
         params = {
             "breakdown_limit": 5,
             "filter": {"resolution": "monthly", "time_scope_value": "-1", "time_scope_units": "month"},
         }
         serializer = OCPCostQueryParamSerializer(data=params)
-        self.assertTrue(serializer.is_valid())
+        self.assertTrue(serializer.is_valid(), serializer.errors)
+        # Must actually appear in validated_data (DRF silently ignores unknown fields)
+        self.assertIn("breakdown_limit", serializer.validated_data)
+        self.assertEqual(serializer.validated_data["breakdown_limit"], 5)
 
     def test_breakdown_limit_rejects_zero(self):
         """T7.2: breakdown_limit < 1 is rejected."""
