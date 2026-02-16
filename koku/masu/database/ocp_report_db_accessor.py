@@ -905,12 +905,91 @@ class OCPReportDBAccessor(SQLScriptAtomicExecutorMixin, ReportDBAccessorBase):
             "report_period_id": report_period_id,
             "rate_type": rate_type,
             "distribution": distribution,
+            "rate_name": None,
         }
         for metric in metric_constants.COST_MODEL_USAGE_RATES:
             sql_params[metric] = rates.get(metric, 0)
 
         LOG.info(log_json(msg=f"populating {rate_type} usage costs", context=ctx))
         self._prepare_and_execute_raw_sql_query(table_name, sql, sql_params, operation="INSERT")
+
+    def populate_usage_costs_by_name(
+        self, rate_type, rates_by_name, distribution, start_date, end_date, provider_uuid, report_period_id
+    ):
+        """Update usage costs with per-rate execution supporting cost_model_rate_name.
+
+        Each rate entry produces its own set of rows tagged with its name.
+        Deletion is performed once upfront, then the SQL is run once per rate.
+
+        Args:
+            rate_type: "Infrastructure" or "Supplementary"
+            rates_by_name: list of {"metric": str, "value": Decimal, "name": str}
+            distribution: "cpu" or "memory"
+            start_date: start date for the range
+            end_date: end date for the range
+            provider_uuid: provider UUID
+            report_period_id: report period ID
+        """
+        table_name = self._table_map["line_item_daily_summary"]
+        ctx = {
+            "schema": self.schema,
+            "provider_uuid": provider_uuid,
+            "start_date": start_date,
+            "end_date": end_date,
+            "report_period": report_period_id,
+        }
+
+        # Always delete existing usage cost rows for this rate_type first (once)
+        self.delete_line_item_daily_summary_entries_for_date_range_raw(
+            provider_uuid,
+            start_date,
+            end_date,
+            table=OCPUsageLineItemDailySummary,
+            filters={"cost_model_rate_type": rate_type, "report_period_id": report_period_id},
+            null_filters={"monthly_cost_type": "IS NULL"},
+        )
+
+        if not rates_by_name:
+            LOG.info(log_json(msg="removing usage costs (no rates)", context=ctx))
+            return
+
+        sql = pkgutil.get_data("masu.database", "sql/openshift/cost_model/usage_costs.sql")
+        sql = sql.decode("utf-8")
+
+        for rate_entry in rates_by_name:
+            metric = rate_entry["metric"]
+            value = rate_entry["value"]
+            name = rate_entry["name"]
+
+            if not value:
+                continue
+
+            # Only usage metrics, not monthly
+            if metric not in metric_constants.COST_MODEL_USAGE_RATES:
+                continue
+
+            sql_params = {
+                "start_date": start_date,
+                "end_date": end_date,
+                "schema": self.schema,
+                "source_uuid": provider_uuid,
+                "report_period_id": report_period_id,
+                "rate_type": rate_type,
+                "distribution": distribution,
+                "rate_name": name,
+            }
+            # Set all metrics to 0, then override the one for this rate
+            for m in metric_constants.COST_MODEL_USAGE_RATES:
+                sql_params[m] = 0
+            sql_params[metric] = value
+
+            LOG.info(
+                log_json(
+                    msg=f"populating {rate_type} usage costs for rate '{name}'",
+                    context=ctx,
+                )
+            )
+            self._prepare_and_execute_raw_sql_query(table_name, sql, sql_params, operation="INSERT")
 
     def populate_tag_usage_costs(  # noqa: C901
         self,

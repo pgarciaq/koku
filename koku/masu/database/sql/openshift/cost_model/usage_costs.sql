@@ -31,6 +31,7 @@ INSERT INTO {{schema | sqlsafe}}.reporting_ocpusagelineitem_daily_summary (
     volume_labels,
     source_uuid,
     cost_model_rate_type,
+    cost_model_rate_name,
     cost_model_cpu_cost,
     cost_model_memory_cost,
     cost_model_volume_cost,
@@ -101,6 +102,7 @@ SELECT uuid_generate_v4(),
     lids.volume_labels,
     {{source_uuid}} as source_uuid,
     {{rate_type}} as cost_model_rate_type,
+    {{rate_name}} as cost_model_rate_name,
     sum(coalesce(lids.pod_usage_cpu_core_hours, 0)) * {{cpu_core_usage_per_hour}}
         + sum(coalesce(lids.pod_request_cpu_core_hours, 0)) * {{cpu_core_request_per_hour}}
         + sum(coalesce(lids.pod_effective_usage_cpu_core_hours, 0)) * {{cpu_core_effective_usage_per_hour}}

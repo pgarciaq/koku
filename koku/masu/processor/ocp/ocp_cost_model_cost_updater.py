@@ -445,9 +445,18 @@ class OCPCostModelCostUpdater(OCPCloudUpdaterBase):
                     )
 
     def _update_usage_costs(self, start_date, end_date):
-        """Update infrastructure and supplementary usage costs."""
+        """Update infrastructure and supplementary usage costs.
 
-        report_type_map = {
+        Uses populate_usage_costs_by_name for per-rate execution, which produces
+        rows tagged with cost_model_rate_name. Falls back to populate_vm_usage_costs
+        for VM rates (unchanged).
+        """
+        rates_by_name_map = {
+            metric_constants.INFRASTRUCTURE_COST_TYPE: self._infra_rates_by_name,
+            metric_constants.SUPPLEMENTARY_COST_TYPE: self._supplementary_rates_by_name,
+        }
+        # Keep legacy dict for VM rates (not refactored in this PR)
+        legacy_rate_map = {
             metric_constants.INFRASTRUCTURE_COST_TYPE: self._infra_rates,
             metric_constants.SUPPLEMENTARY_COST_TYPE: self._supplementary_rates,
         }
@@ -467,10 +476,13 @@ class OCPCostModelCostUpdater(OCPCloudUpdaterBase):
                 )
                 return
             report_period_id = report_period.id
-            for report_type, report_type_dict in report_type_map.items():
-                report_accessor.populate_usage_costs(
+            for report_type in (
+                metric_constants.INFRASTRUCTURE_COST_TYPE,
+                metric_constants.SUPPLEMENTARY_COST_TYPE,
+            ):
+                report_accessor.populate_usage_costs_by_name(
                     report_type,
-                    filter_dictionary(report_type_dict, metric_constants.COST_MODEL_USAGE_RATES),
+                    rates_by_name_map[report_type],
                     self._distribution,
                     start_date,
                     end_date,
@@ -479,7 +491,7 @@ class OCPCostModelCostUpdater(OCPCloudUpdaterBase):
                 )
                 report_accessor.populate_vm_usage_costs(
                     report_type,
-                    filter_dictionary(report_type_dict, metric_constants.COST_MODEL_VM_USAGE_RATES),
+                    filter_dictionary(legacy_rate_map[report_type], metric_constants.COST_MODEL_VM_USAGE_RATES),
                     start_date,
                     end_date,
                     self._provider.uuid,
