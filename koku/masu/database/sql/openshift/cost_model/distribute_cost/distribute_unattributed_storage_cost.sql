@@ -10,6 +10,7 @@ WITH cte_narrow_dataset as (
         lids.cost_model_cpu_cost,
         lids.cost_model_memory_cost,
         lids.cost_model_volume_cost,
+        lids.cost_model_rate_name,
         lids.report_period_id,
         lids.cluster_id,
         lids.cluster_alias,
@@ -43,10 +44,11 @@ unattributed_storage_cost AS (
             COALESCE(cost_model_memory_cost, 0) +
             COALESCE(cost_model_volume_cost, 0)
         ) as unattributed_cost,
-        filtered.usage_start
+        filtered.usage_start,
+        filtered.cost_model_rate_name
     FROM cte_narrow_dataset as filtered
     WHERE filtered.namespace = 'Storage unattributed'
-    GROUP BY filtered.usage_start
+    GROUP BY filtered.usage_start, filtered.cost_model_rate_name
 ),
 user_defined_project_sum as (
     SELECT sum(pod_effective_usage_cpu_core_hours) as usage_cpu_sum,
@@ -58,7 +60,7 @@ user_defined_project_sum as (
     WHERE filtered.namespace != 'Storage unattributed'
     GROUP BY usage_start, cluster_id, source_uuid
 ),
-cte_line_items as (
+cte_user_distribution as (
     SELECT
         max(report_period_id) as report_period_id,
         filtered.cluster_id,
@@ -75,27 +77,20 @@ cte_line_items as (
         max(node_capacity_memory_gigabyte_hours) as node_capacity_memory_gigabyte_hours,
         max(cluster_capacity_cpu_core_hours) as cluster_capacity_cpu_core_hours,
         max(cluster_capacity_memory_gigabyte_hours) as cluster_capacity_memory_gigabyte_hours,
-        CASE WHEN {{distribution}} = 'cpu' AND namespace != 'Storage unattributed' THEN
+        CASE WHEN {{distribution}} = 'cpu' THEN
             CASE WHEN max(udps.usage_cpu_sum) <= 0 THEN
                 0
             ELSE
                 (sum(pod_effective_usage_cpu_core_hours) / max(udps.usage_cpu_sum)) * max(usc.unattributed_cost)::decimal
             END
-        WHEN {{distribution}} = 'memory' AND namespace != 'Storage unattributed'  THEN
+        WHEN {{distribution}} = 'memory' THEN
             CASE WHEN max(udps.usage_memory_sum) <= 0 THEN
                 0
             ELSE
                 (sum(pod_effective_usage_memory_gigabyte_hours) / max(udps.usage_memory_sum)) * max(usc.unattributed_cost)::decimal
             END
-        WHEN namespace = 'Storage unattributed' THEN
-            0 - SUM(
-                    COALESCE(infrastructure_raw_cost, 0) +
-                    COALESCE(infrastructure_markup_cost, 0) +
-                    COALESCE(cost_model_cpu_cost, 0) +
-                    COALESCE(cost_model_memory_cost, 0) +
-                    COALESCE(cost_model_volume_cost, 0)
-                )
         END AS distributed_cost,
+        usc.cost_model_rate_name,
         max(cost_category_id) as cost_category_id,
         max(raw_currency) as raw_currency
     FROM cte_narrow_dataset as filtered
@@ -105,7 +100,42 @@ cte_line_items as (
         ON udps.usage_start = filtered.usage_start
         AND udps.cluster_id = filtered.cluster_id
     WHERE filtered.namespace IS NOT NULL
-    GROUP BY filtered.usage_start, filtered.node, filtered.namespace, filtered.cluster_id, filtered.cost_category_id, filtered.data_source
+        AND filtered.namespace != 'Storage unattributed'
+    GROUP BY filtered.usage_start, filtered.node, filtered.namespace, filtered.cluster_id, filtered.cost_category_id, filtered.data_source,
+             usc.cost_model_rate_name
+),
+cte_source_negation as (
+    SELECT
+        max(report_period_id) as report_period_id,
+        filtered.cluster_id,
+        max(cluster_alias) as cluster_alias,
+        filtered.data_source as data_source,
+        filtered.usage_start,
+        max(usage_end) as usage_end,
+        filtered.namespace,
+        filtered.node,
+        max(resource_id) as resource_id,
+        max(node_capacity_cpu_cores) as node_capacity_cpu_cores,
+        max(node_capacity_cpu_core_hours) as node_capacity_cpu_core_hours,
+        max(node_capacity_memory_gigabytes) as node_capacity_memory_gigabytes,
+        max(node_capacity_memory_gigabyte_hours) as node_capacity_memory_gigabyte_hours,
+        max(cluster_capacity_cpu_core_hours) as cluster_capacity_cpu_core_hours,
+        max(cluster_capacity_memory_gigabyte_hours) as cluster_capacity_memory_gigabyte_hours,
+        0 - SUM(
+                COALESCE(infrastructure_raw_cost, 0) +
+                COALESCE(infrastructure_markup_cost, 0) +
+                COALESCE(cost_model_cpu_cost, 0) +
+                COALESCE(cost_model_memory_cost, 0) +
+                COALESCE(cost_model_volume_cost, 0)
+            ) AS distributed_cost,
+        filtered.cost_model_rate_name,
+        max(cost_category_id) as cost_category_id,
+        max(raw_currency) as raw_currency
+    FROM cte_narrow_dataset as filtered
+    WHERE filtered.namespace IS NOT NULL
+        AND filtered.namespace = 'Storage unattributed'
+    GROUP BY filtered.usage_start, filtered.node, filtered.namespace, filtered.cluster_id, filtered.cost_category_id, filtered.data_source,
+             filtered.cost_model_rate_name
 )
 INSERT INTO {{schema | sqlsafe}}.reporting_ocpusagelineitem_daily_summary (
     uuid,
@@ -126,6 +156,7 @@ INSERT INTO {{schema | sqlsafe}}.reporting_ocpusagelineitem_daily_summary (
     cluster_capacity_memory_gigabyte_hours,
     source_uuid,
     cost_model_rate_type,
+    cost_model_rate_name,
     distributed_cost,
     cost_category_id,
     raw_currency
@@ -149,8 +180,37 @@ SELECT
     ctl.cluster_capacity_memory_gigabyte_hours,
     UUID '{{source_uuid | sqlsafe}}' as source_uuid,
     {{cost_model_rate_type}} as cost_model_rate_type,
+    ctl.cost_model_rate_name,
     ctl.distributed_cost,
     ctl.cost_category_id,
     ctl.raw_currency
-FROM cte_line_items as ctl
+FROM cte_user_distribution as ctl
+WHERE ctl.distributed_cost != 0
+
+UNION ALL
+
+SELECT
+    uuid_generate_v4(),
+    ctl.report_period_id,
+    ctl.cluster_id,
+    ctl.cluster_alias,
+    ctl.data_source as data_source,
+    ctl.usage_start,
+    ctl.usage_end,
+    ctl.namespace,
+    ctl.node,
+    ctl.resource_id,
+    ctl.node_capacity_cpu_cores,
+    ctl.node_capacity_cpu_core_hours,
+    ctl.node_capacity_memory_gigabytes,
+    ctl.node_capacity_memory_gigabyte_hours,
+    ctl.cluster_capacity_cpu_core_hours,
+    ctl.cluster_capacity_memory_gigabyte_hours,
+    UUID '{{source_uuid | sqlsafe}}' as source_uuid,
+    {{cost_model_rate_type}} as cost_model_rate_type,
+    ctl.cost_model_rate_name,
+    ctl.distributed_cost,
+    ctl.cost_category_id,
+    ctl.raw_currency
+FROM cte_source_negation as ctl
 WHERE ctl.distributed_cost != 0;

@@ -10,6 +10,7 @@ INSERT INTO {{schema | sqlsafe}}.reporting_ocpusagelineitem_daily_summary (
     node,
     source_uuid,
     cost_model_rate_type,
+    cost_model_rate_name,
     distributed_cost
 )
 WITH unattributed_gpu_cost as (
@@ -19,13 +20,14 @@ WITH unattributed_gpu_cost as (
         all_labels::jsonb->>'gpu-model' AS gpu_model,
         cluster_alias,
         cluster_id,
-        report_period_id
+        report_period_id,
+        cost_model_rate_name
     FROM {{schema | sqlsafe}}.reporting_ocpusagelineitem_daily_summary
     WHERE namespace = 'GPU unallocated'
       AND usage_start >= DATE({{start_date}})
       AND usage_start <= DATE({{end_date}})
       AND source_uuid = {{source_uuid}}::uuid
-    GROUP BY node, 3, cluster_alias, cluster_id, report_period_id
+    GROUP BY node, 3, cluster_alias, cluster_id, report_period_id, cost_model_rate_name
 ),
 namespace_usage_information as (
     SELECT gpu_model_name,
@@ -53,6 +55,7 @@ SELECT
     nsp_usage.node,
     {{source_uuid}}::uuid,
     {{cost_model_rate_type}},
+    max(unattributed.cost_model_rate_name) as cost_model_rate_name,
     max(nsp_usage.pod_usage_uptime / total_usage.total_pod_uptime * unattributed.gpu_unallocated_cost) as distributed_cost
 FROM namespace_usage_information as nsp_usage
 JOIN unattributed_gpu_cost as unattributed
@@ -77,6 +80,7 @@ SELECT
     node,
     {{source_uuid}}::uuid,
     {{cost_model_rate_type}},
+    cost_model_rate_name,
     0 - cost_model_gpu_cost as distributed_cost
 FROM {{schema | sqlsafe}}.reporting_ocpusagelineitem_daily_summary
 WHERE namespace = 'GPU unallocated'
