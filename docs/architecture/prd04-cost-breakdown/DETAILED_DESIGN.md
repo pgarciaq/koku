@@ -67,7 +67,7 @@ This document describes the technical design for the "Cost Breakdown for Custom 
 - Cloud service breakdown (`raw` cost by `product_code`/`service_name`) — Phase 2
 - Markup breakdown by service — Phase 2
 - Cost Explorer breakdown — not required per PRD
-- CSV export of breakdown data — follow-up
+- CSV export of breakdown data — included in Phase 1 (flat column approach, see Section 13.7)
 - Pure cloud provider views (AWS/Azure/GCP without OCP) — not required per PRD
 
 ### Environments
@@ -1790,14 +1790,41 @@ When set, the `breakdown` array on each cost category is limited to the top N en
 
 ### 11.6 Serializer Changes
 
-No other serializer changes needed for the report API — the `breakdown` array is an additive extension to the response. Existing serializers for `group_by`, `filter`, and `order_by` remain unchanged.
+Add `breakdown_limit` to the report query parameter serializers (optional integer, min 1, max 100). No other serializer changes needed — the `breakdown` array is an additive extension to the JSON response. Existing serializers for `group_by`, `filter`, and `order_by` remain unchanged.
 
-### 11.5 Files Changed
+### 11.7 CSV Export with Breakdown
+
+The CSV code path in `execute_query()` needs a small addition: when breakdown is requested, swap the query source to the breakdown summary table and add `cost_model_rate_name` to `.values()`.
+
+```python
+def execute_query(self):
+    ...
+    if self.is_csv_output:
+        if self.parameters.get("breakdown_limit") is not None:
+            # Use breakdown table — adds cost_model_rate_name as a dimension
+            breakdown_table = self._mapper.report_type_map.get("tables", {}).get("breakdown")
+            if breakdown_table:
+                query_data = breakdown_table.objects.filter(self.query_filter)
+                query_data = query_data.values(
+                    *self.query_group_by, "cost_model_rate_name"
+                ).annotate(**self.annotations)
+                data = list(query_data)
+            else:
+                data = list(query_data)
+        else:
+            data = list(query_data)
+    ...
+```
+
+This adds `cost_model_rate_name` as a flat column, expanding rows — one row per (date, group_by_value, rate_name). The rest of the CSV pipeline (renderer, pagination) works unchanged. When breakdown is not requested, CSV behavior is identical to today.
+
+### 11.8 Files Changed
 
 | File | Change |
 |------|--------|
 | `koku/api/report/ocp/provider_map.py` | Add breakdown table references |
-| `koku/api/report/ocp/query_handler.py` | Breakdown query, response assembly, `BreakdownMixin` |
+| `koku/api/report/ocp/query_handler.py` | Breakdown query, response assembly, CSV breakdown, `BreakdownMixin` |
+| `koku/api/report/ocp/serializers.py` | Add `breakdown_limit` query parameter |
 | `koku/api/report/all/openshift/provider_map.py` | Add breakdown table references (OCP-All view) |
 | `koku/api/report/all/openshift/query_handler.py` | Use `BreakdownMixin` for breakdown |
 | `koku/api/report/aws/openshift/query_handler.py` | Use `BreakdownMixin` for OCP breakdown on AWS view |
@@ -1926,7 +1953,23 @@ Forecasting uses the existing summary tables. Since we're not modifying those ta
 
 ### 13.7 CSV Export
 
-CSV export currently uses the summary table data. The breakdown data is not included in CSV exports in Phase 1. This is noted as a follow-up item in the PRD.
+CSV export uses a separate flat data path — the query handlers return raw ORM annotations directly to `PaginatedCSVRenderer`, bypassing the nested JSON structure entirely. The `breakdown` array added in `_format_query_response()` is never seen by the CSV renderer.
+
+**CSV breakdown design:** When the user requests breakdown in CSV (e.g., via a query parameter or `Accept: text/csv` with `breakdown_limit` set), the CSV code path queries the **breakdown summary table** instead of the regular summary table and includes `cost_model_rate_name` as a flat column. Each CSV row becomes `(date, group_by_value, cost_model_rate_name)` with the same flat cost fields — no nested structures, no dynamic columns:
+
+```
+date, project, cost_model_rate_name, cost_total, cost_raw, cost_usage, cost_markup, cost_platform_distributed, ...
+2024-01, myapp, CPU rate,           10.50,      0.00,    10.50,      0.00,        3.20, ...
+2024-01, myapp, Memory rate,         5.25,      0.00,     5.25,      0.00,        1.60, ...
+2024-01, myapp, Cloud cost,         49.00,     49.00,     0.00,      4.90,       15.20, ...
+```
+
+This is consistent with the existing CSV pattern: adding a disaggregation dimension adds a column and expands rows, just like every other group-by key. The implementation is straightforward:
+
+1. In `execute_query()` CSV branch, check if breakdown is requested.
+2. If yes, swap the query source to the breakdown summary table (same fields plus `cost_model_rate_name`).
+3. Add `cost_model_rate_name` to `.values()` and the result dict.
+4. The rest of the CSV pipeline (renderer, pagination) works unchanged.
 
 ### 13.8 RBAC / Permissions
 
@@ -2082,7 +2125,7 @@ All questions have been resolved. This section serves as a decision record.
 | 1 | Top-N limiting for breakdown entries | Configurable via `breakdown_limit` query parameter. Default: no limit (full breakdown). Frontend typically shows full breakdown. |
 | 2 | Multiple tiered rates for same metric | Fully supported. List-based rate structures + per-rate SQL execution. Each rate gets its own rows and breakdown entry. |
 | 3 | Infrastructure vs Supplementary in breakdown | Merge under rate name. Rate name is the user-facing concept. |
-| 4 | CSV export of breakdown data | Deferred — follow-up after Phase 1 GA. |
+| 4 | CSV export of breakdown data | Included in Phase 1. CSV treats `cost_model_rate_name` as a flat column (additional disaggregation dimension), expanding rows. Consistent with existing group-by pattern. Queries breakdown summary table when breakdown is requested. See Section 13.7. |
 | 5 | Breakdown for tag group-by view | Supported in Phase 1. Tag group-by queries already run against `OCPUsageLineItemDailySummary` (not a summary table), so breakdown is a secondary query on the same table with `cost_model_rate_name` added to GROUP BY. Minimal performance overhead. |
 | 6 | GPU rate name attribution | Covered in Phase 1. GPU goes through `populate_tag_based_costs()` which reads `name` from `metric_to_tag_params_map`. SQL files updated in PR 8. |
 | 7 | Breakdown summary table cleanup | Same lifecycle as existing UI summary tables. Populated in `populate_ui_summary_tables()`. |
