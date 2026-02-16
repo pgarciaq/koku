@@ -46,6 +46,8 @@ from reporting.provider.all.models import TagMapping
 from reporting.provider.aws.models import TRINO_LINE_ITEM_DAILY_TABLE as AWS_TRINO_LINE_ITEM_DAILY_TABLE
 from reporting.provider.azure.models import TRINO_LINE_ITEM_DAILY_TABLE as AZURE_TRINO_LINE_ITEM_DAILY_TABLE
 from reporting.provider.gcp.models import TRINO_LINE_ITEM_DAILY_TABLE as GCP_TRINO_LINE_ITEM_DAILY_TABLE
+from reporting.provider.ocp.models import BREAKDOWN_SUMMARY_TABLES
+from reporting.provider.ocp.models import BREAKDOWN_VM_SUMMARY_TABLE
 from reporting.provider.ocp.models import OCPCluster
 from reporting.provider.ocp.models import OCPNode
 from reporting.provider.ocp.models import OCPProject
@@ -115,10 +117,21 @@ class OCPReportDBAccessor(SQLScriptAtomicExecutorMixin, ReportDBAccessorBase):
         sql_params["month"] = start_date.strftime("%m")
 
         self._populate_gpu_ui_summary_table_with_usage_only(sql_params)
+        self._populate_breakdown_summary_tables(sql_params)
         if summary_range.summarize_previous_month and not summary_range.is_current_month:
             # Don't resummarize virtualization UI table if we are summarizing previous month
             return
         self._populate_virtualization_ui_summary_table(sql_params)
+
+    def _populate_breakdown_summary_tables(self, sql_params):
+        """Populate breakdown summary tables for cost rate-name granularity."""
+        for table_name in BREAKDOWN_SUMMARY_TABLES:
+            sql = pkgutil.get_data("masu.database", f"sql/openshift/ui_summary/{table_name}.sql")
+            sql = sql.decode("utf-8")
+            self._prepare_and_execute_raw_sql_query(table_name, sql, sql_params, operation="DELETE/INSERT")
+        sql = pkgutil.get_data("masu.database", f"sql/openshift/ui_summary/{BREAKDOWN_VM_SUMMARY_TABLE}.sql")
+        sql = sql.decode("utf-8")
+        self._prepare_and_execute_raw_sql_query(BREAKDOWN_VM_SUMMARY_TABLE, sql, sql_params, operation="DELETE/INSERT")
 
     def _populate_gpu_ui_summary_table_with_usage_only(self, params):
         """

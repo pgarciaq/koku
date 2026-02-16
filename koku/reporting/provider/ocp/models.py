@@ -58,6 +58,14 @@ UI_SUMMARY_TABLES = (
     "reporting_ocp_gpu_summary_p",
 )
 
+BREAKDOWN_SUMMARY_TABLES = (
+    "reporting_ocp_cost_breakdown_p",
+    "reporting_ocp_cost_breakdown_by_project_p",
+    "reporting_ocp_cost_breakdown_by_node_p",
+)
+
+BREAKDOWN_VM_SUMMARY_TABLE = "reporting_ocp_vm_breakdown_p"
+
 # Note the reporting_ocp_vm_summary_p is populated separately.
 VM_UI_SUMMARY_TABLE = "reporting_ocp_vm_summary_p"
 
@@ -1025,6 +1033,152 @@ class OCPGpuSummaryP(models.Model):
     cost_model_memory_cost = models.DecimalField(max_digits=33, decimal_places=15, null=True)
     cost_model_volume_cost = models.DecimalField(max_digits=33, decimal_places=15, null=True)
     cost_model_rate_type = models.TextField(null=True)
+
+
+class OCPCostBreakdownP(models.Model):
+    """Breakdown of costs by rate name for cluster-level view."""
+
+    class PartitionInfo:
+        partition_type = "RANGE"
+        partition_cols = ["usage_start"]
+
+    class Meta:
+        db_table = "reporting_ocp_cost_breakdown_p"
+        indexes = [
+            models.Index(fields=["usage_start"], name="ocp_brkdwn_usage_start"),
+            models.Index(fields=["cost_model_rate_name"], name="ocp_brkdwn_rate_name"),
+        ]
+
+    id = models.UUIDField(primary_key=True)
+    cluster_id = models.TextField()
+    cluster_alias = models.TextField(null=True)
+    usage_start = models.DateField(null=False)
+    usage_end = models.DateField(null=False)
+    cost_model_cpu_cost = models.DecimalField(max_digits=33, decimal_places=15, null=True)
+    cost_model_memory_cost = models.DecimalField(max_digits=33, decimal_places=15, null=True)
+    cost_model_volume_cost = models.DecimalField(max_digits=33, decimal_places=15, null=True)
+    cost_model_gpu_cost = models.DecimalField(max_digits=33, decimal_places=15, null=True)
+    cost_model_rate_type = models.TextField(null=True)
+    cost_model_rate_name = models.TextField(null=True)
+    infrastructure_raw_cost = models.DecimalField(max_digits=33, decimal_places=15, null=True)
+    infrastructure_markup_cost = models.DecimalField(max_digits=33, decimal_places=15, null=True)
+    source_uuid = models.ForeignKey(
+        "reporting.TenantAPIProvider", on_delete=models.CASCADE, unique=False, null=True, db_column="source_uuid"
+    )
+    cost_category = models.ForeignKey("OpenshiftCostCategory", on_delete=models.CASCADE, null=True)
+    raw_currency = models.TextField(null=True)
+    distributed_cost = models.DecimalField(max_digits=33, decimal_places=15, null=True)
+
+
+class OCPCostBreakdownByProjectP(models.Model):
+    """Breakdown of costs by rate name for project-level view."""
+
+    class PartitionInfo:
+        partition_type = "RANGE"
+        partition_cols = ["usage_start"]
+
+    class Meta:
+        db_table = "reporting_ocp_cost_breakdown_by_project_p"
+        indexes = [
+            models.Index(fields=["usage_start"], name="ocp_brkdwn_proj_usage_start"),
+            models.Index(fields=["namespace"], name="ocp_brkdwn_proj_namespace"),
+            models.Index(fields=["cost_model_rate_name"], name="ocp_brkdwn_proj_rate_name"),
+        ]
+
+    id = models.UUIDField(primary_key=True)
+    cluster_id = models.TextField()
+    cluster_alias = models.TextField(null=True)
+    namespace = models.CharField(max_length=253, null=True)
+    usage_start = models.DateField(null=False)
+    usage_end = models.DateField(null=False)
+    cost_model_cpu_cost = models.DecimalField(max_digits=33, decimal_places=15, null=True)
+    cost_model_memory_cost = models.DecimalField(max_digits=33, decimal_places=15, null=True)
+    cost_model_volume_cost = models.DecimalField(max_digits=33, decimal_places=15, null=True)
+    cost_model_gpu_cost = models.DecimalField(max_digits=33, decimal_places=15, null=True)
+    cost_model_rate_type = models.TextField(null=True)
+    cost_model_rate_name = models.TextField(null=True)
+    infrastructure_raw_cost = models.DecimalField(max_digits=33, decimal_places=15, null=True)
+    infrastructure_markup_cost = models.DecimalField(max_digits=33, decimal_places=15, null=True)
+    source_uuid = models.ForeignKey(
+        "reporting.TenantAPIProvider", on_delete=models.CASCADE, unique=False, null=True, db_column="source_uuid"
+    )
+    cost_category = models.ForeignKey("OpenshiftCostCategory", on_delete=models.CASCADE, null=True)
+    raw_currency = models.TextField(null=True)
+    distributed_cost = models.DecimalField(max_digits=33, decimal_places=15, null=True)
+
+
+class OCPCostBreakdownByNodeP(models.Model):
+    """Breakdown of costs by rate name for node-level view."""
+
+    class PartitionInfo:
+        partition_type = "RANGE"
+        partition_cols = ["usage_start"]
+
+    class Meta:
+        db_table = "reporting_ocp_cost_breakdown_by_node_p"
+        indexes = [
+            models.Index(fields=["usage_start"], name="ocp_brkdwn_node_usage_start"),
+            models.Index(fields=["node"], name="ocp_brkdwn_node_node"),
+            models.Index(fields=["cost_model_rate_name"], name="ocp_brkdwn_node_rate_name"),
+        ]
+
+    id = models.UUIDField(primary_key=True)
+    cluster_id = models.TextField()
+    cluster_alias = models.TextField(null=True)
+    node = models.CharField(max_length=253, null=True)
+    usage_start = models.DateField(null=False)
+    usage_end = models.DateField(null=False)
+    cost_model_cpu_cost = models.DecimalField(max_digits=33, decimal_places=15, null=True)
+    cost_model_memory_cost = models.DecimalField(max_digits=33, decimal_places=15, null=True)
+    cost_model_volume_cost = models.DecimalField(max_digits=33, decimal_places=15, null=True)
+    cost_model_gpu_cost = models.DecimalField(max_digits=33, decimal_places=15, null=True)
+    cost_model_rate_type = models.TextField(null=True)
+    cost_model_rate_name = models.TextField(null=True)
+    infrastructure_raw_cost = models.DecimalField(max_digits=33, decimal_places=15, null=True)
+    infrastructure_markup_cost = models.DecimalField(max_digits=33, decimal_places=15, null=True)
+    source_uuid = models.ForeignKey(
+        "reporting.TenantAPIProvider", on_delete=models.CASCADE, unique=False, null=True, db_column="source_uuid"
+    )
+    cost_category = models.ForeignKey("OpenshiftCostCategory", on_delete=models.CASCADE, null=True)
+    raw_currency = models.TextField(null=True)
+    distributed_cost = models.DecimalField(max_digits=33, decimal_places=15, null=True)
+
+
+class OCPVMBreakdownP(models.Model):
+    """Breakdown of costs by rate name for VM-level view."""
+
+    class PartitionInfo:
+        partition_type = "RANGE"
+        partition_cols = ["usage_start"]
+
+    class Meta:
+        db_table = "reporting_ocp_vm_breakdown_p"
+        indexes = [
+            models.Index(fields=["usage_start"], name="ocp_vm_brkdwn_usage_start"),
+            models.Index(fields=["cost_model_rate_name"], name="ocp_vm_brkdwn_rate_name"),
+        ]
+
+    id = models.UUIDField(primary_key=True)
+    cluster_id = models.TextField()
+    cluster_alias = models.TextField(null=True)
+    namespace = models.CharField(max_length=253, null=True)
+    node = models.CharField(max_length=253, null=True)
+    vm_name = models.TextField(null=True)
+    usage_start = models.DateField(null=False)
+    usage_end = models.DateField(null=False)
+    cost_model_cpu_cost = models.DecimalField(max_digits=33, decimal_places=15, null=True)
+    cost_model_memory_cost = models.DecimalField(max_digits=33, decimal_places=15, null=True)
+    cost_model_volume_cost = models.DecimalField(max_digits=33, decimal_places=15, null=True)
+    cost_model_gpu_cost = models.DecimalField(max_digits=33, decimal_places=15, null=True)
+    cost_model_rate_type = models.TextField(null=True)
+    cost_model_rate_name = models.TextField(null=True)
+    infrastructure_raw_cost = models.DecimalField(max_digits=33, decimal_places=15, null=True)
+    infrastructure_markup_cost = models.DecimalField(max_digits=33, decimal_places=15, null=True)
+    source_uuid = models.ForeignKey(
+        "reporting.TenantAPIProvider", on_delete=models.CASCADE, unique=False, null=True, db_column="source_uuid"
+    )
+    raw_currency = models.TextField(null=True)
+    distributed_cost = models.DecimalField(max_digits=33, decimal_places=15, null=True)
 
 
 # Import on-prem line item models so Django can discover them for migrations
