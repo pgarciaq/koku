@@ -20,13 +20,24 @@ from api.report.ocp.serializers import OCPCostQueryParamSerializer
 class OCPCostSerializerBreakdownTest(TestCase):
     """T7.1–T7.3: Tests for breakdown_limit query parameter."""
 
+    def _make_context(self, path="/api/cost-management/v1/reports/openshift/costs/"):
+        """Build a minimal request context for the serializer."""
+        from unittest.mock import Mock
+        from unittest.mock import patch
+
+        self._currency_patcher = patch("api.report.serializers.get_currency", return_value="USD")
+        self._currency_patcher.start()
+        self.addCleanup(self._currency_patcher.stop)
+        request = Mock(path=path)
+        return {"request": request}
+
     def test_breakdown_limit_accepted(self):
         """T7.1: breakdown_limit is accepted as an integer parameter and available in validated_data."""
         params = {
             "breakdown_limit": 5,
             "filter": {"resolution": "monthly", "time_scope_value": "-1", "time_scope_units": "month"},
         }
-        serializer = OCPCostQueryParamSerializer(data=params)
+        serializer = OCPCostQueryParamSerializer(data=params, context=self._make_context())
         self.assertTrue(serializer.is_valid(), serializer.errors)
         # Must actually appear in validated_data (DRF silently ignores unknown fields)
         self.assertIn("breakdown_limit", serializer.validated_data)
@@ -38,7 +49,7 @@ class OCPCostSerializerBreakdownTest(TestCase):
             "breakdown_limit": 0,
             "filter": {"resolution": "monthly", "time_scope_value": "-1", "time_scope_units": "month"},
         }
-        serializer = OCPCostQueryParamSerializer(data=params)
+        serializer = OCPCostQueryParamSerializer(data=params, context=self._make_context())
         self.assertFalse(serializer.is_valid())
 
     def test_breakdown_limit_rejects_over_100(self):
@@ -47,7 +58,7 @@ class OCPCostSerializerBreakdownTest(TestCase):
             "breakdown_limit": 101,
             "filter": {"resolution": "monthly", "time_scope_value": "-1", "time_scope_units": "month"},
         }
-        serializer = OCPCostQueryParamSerializer(data=params)
+        serializer = OCPCostQueryParamSerializer(data=params, context=self._make_context())
         self.assertFalse(serializer.is_valid())
 
 
@@ -245,13 +256,13 @@ class OCPCostQueryHandlerBreakdownTest(IamTestCase):
         url = "?"
         query_params = self.mocked_query_params(url, OCPCostView)
         handler = OCPReportQueryHandler(query_params)
-        self.assertEqual(handler._get_breakdown_table(), OCPCostBreakdownP)
+        self.assertEqual(handler._breakdown_table, OCPCostBreakdownP)
 
         # Node group-by → node breakdown table
         url = "?group_by[node]=*"
         query_params = self.mocked_query_params(url, OCPCostView)
         handler = OCPReportQueryHandler(query_params)
-        self.assertEqual(handler._get_breakdown_table(), OCPCostBreakdownByNodeP)
+        self.assertEqual(handler._breakdown_table, OCPCostBreakdownByNodeP)
 
     def test_costs_by_project_includes_breakdown(self):
         """T7.13c: OCP costs_by_project response includes breakdown per project."""

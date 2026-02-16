@@ -63,10 +63,16 @@ class RateSerializerNameTest(TestCase):
 class CostModelSerializerNameTest(IamTestCase):
     """T1.4–T1.6: Tests for rate name uniqueness within a cost model."""
 
+    def setUp(self):
+        """Set up each test."""
+        super().setUp()
+        self.provider = Provider.objects.filter(type=Provider.PROVIDER_OCP).first()
+
     def test_cost_model_duplicate_rate_names_rejected(self):
         """T1.4: Two rates with the same name in one cost model are rejected."""
         data = {
             "name": "Test Cost Model",
+            "description": "Cost model for testing duplicate rate names",
             "source_type": Provider.PROVIDER_OCP,
             "providers": [{"uuid": str(self.provider.uuid), "name": self.provider.name}],
             "rates": [
@@ -94,6 +100,7 @@ class CostModelSerializerNameTest(IamTestCase):
         """T1.5: Two rates with different names in one cost model are accepted."""
         data = {
             "name": "Test Cost Model",
+            "description": "Cost model for testing rate name uniqueness",
             "source_type": Provider.PROVIDER_OCP,
             "providers": [{"uuid": str(self.provider.uuid), "name": self.provider.name}],
             "rates": [
@@ -117,21 +124,24 @@ class CostModelSerializerNameTest(IamTestCase):
 
     def test_cost_model_api_response_includes_name(self):
         """T1.6: GET cost model response includes name in each rate."""
+        from django_tenants.utils import tenant_context
+
         from cost_models.models import CostModel
 
-        cost_model = CostModel.objects.create(
-            name="Test CM for API",
-            source_type=Provider.PROVIDER_OCP,
-            rates=[
-                {
-                    "name": "CPU charge",
-                    "metric": {"name": "cpu_core_usage_per_hour"},
-                    "tiered_rates": [{"value": 0.05, "unit": "USD"}],
-                    "cost_type": "Infrastructure",
-                },
-            ],
-            currency="USD",
-        )
+        with tenant_context(self.tenant):
+            cost_model = CostModel.objects.create(
+                name="Test CM for API",
+                source_type=Provider.PROVIDER_OCP,
+                rates=[
+                    {
+                        "name": "CPU charge",
+                        "metric": {"name": "cpu_core_usage_per_hour"},
+                        "tiered_rates": [{"value": 0.05, "unit": "USD"}],
+                        "cost_type": "Infrastructure",
+                    },
+                ],
+                currency="USD",
+            )
         client = APIClient()
         response = client.get(
             reverse("cost-models-detail", kwargs={"uuid": cost_model.uuid}),

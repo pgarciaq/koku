@@ -41,6 +41,10 @@ class CostModelDBAccessorRatesByNameTest(MasuTestCase):
                 "cost_type": "Infrastructure",
             },
         ]
+        from cost_models.models import CostModelMap
+
+        with schema_context(self.schema):
+            CostModelMap.objects.filter(provider_uuid=self.ocp_provider_uuid).delete()
         self.cost_model = self.creator.create_cost_model(self.ocp_provider_uuid, Provider.PROVIDER_OCP, self.rates)
 
     def test_infrastructure_rates_by_name_returns_list(self):
@@ -77,7 +81,8 @@ class CostModelDBAccessorRatesByNameTest(MasuTestCase):
         # Replace the cost model from setUp with one containing duplicate-metric rates
         from cost_models.models import CostModelMap
 
-        CostModelMap.objects.filter(provider_uuid=self.ocp_provider_uuid).delete()
+        with schema_context(self.schema):
+            CostModelMap.objects.filter(provider_uuid=self.ocp_provider_uuid).delete()
         self.creator.create_cost_model(self.ocp_provider_uuid, Provider.PROVIDER_OCP, rates_with_dup_metric)
         with CostModelDBAccessor(self.schema, self.ocp_provider_uuid) as accessor:
             by_name = accessor.infrastructure_rates_by_name
@@ -88,6 +93,8 @@ class CostModelDBAccessorRatesByNameTest(MasuTestCase):
 
     def test_supplementary_rates_by_name(self):
         """T3.3: supplementary_rates_by_name returns supplementary rates only."""
+        from cost_models.models import CostModelMap
+
         rates = [
             {
                 "name": "CPU infra",
@@ -102,6 +109,8 @@ class CostModelDBAccessorRatesByNameTest(MasuTestCase):
                 "cost_type": "Supplementary",
             },
         ]
+        with schema_context(self.schema):
+            CostModelMap.objects.filter(provider_uuid=self.ocp_provider_uuid).delete()
         self.creator.create_cost_model(self.ocp_provider_uuid, Provider.PROVIDER_OCP, rates)
         with CostModelDBAccessor(self.schema, self.ocp_provider_uuid) as accessor:
             supp = accessor.supplementary_rates_by_name
@@ -110,6 +119,8 @@ class CostModelDBAccessorRatesByNameTest(MasuTestCase):
 
     def test_tag_rate_names_mapping(self):
         """T3.4: tag_rate_names returns {metric: {tag_key: rate_name}} mapping."""
+        from cost_models.models import CostModelMap
+
         rates = [
             {
                 "name": "JBoss subscription",
@@ -121,6 +132,8 @@ class CostModelDBAccessorRatesByNameTest(MasuTestCase):
                 "cost_type": "Infrastructure",
             },
         ]
+        with schema_context(self.schema):
+            CostModelMap.objects.filter(provider_uuid=self.ocp_provider_uuid).delete()
         self.creator.create_cost_model(self.ocp_provider_uuid, Provider.PROVIDER_OCP, rates)
         with CostModelDBAccessor(self.schema, self.ocp_provider_uuid) as accessor:
             names = accessor.tag_rate_names
@@ -128,6 +141,8 @@ class CostModelDBAccessorRatesByNameTest(MasuTestCase):
 
     def test_metric_to_tag_params_map_includes_name(self):
         """T3.5: metric_to_tag_params_map entries include 'name' key."""
+        from cost_models.models import CostModelMap
+
         rates = [
             {
                 "name": "GPU tag rate",
@@ -139,6 +154,8 @@ class CostModelDBAccessorRatesByNameTest(MasuTestCase):
                 "cost_type": "Infrastructure",
             },
         ]
+        with schema_context(self.schema):
+            CostModelMap.objects.filter(provider_uuid=self.ocp_provider_uuid).delete()
         self.creator.create_cost_model(self.ocp_provider_uuid, Provider.PROVIDER_OCP, rates)
         with CostModelDBAccessor(self.schema, self.ocp_provider_uuid) as accessor:
             tag_map = accessor.metric_to_tag_params_map
@@ -198,12 +215,16 @@ class OCPReportDBAccessorRateNameTest(MasuTestCase):
     @patch("masu.database.ocp_report_db_accessor.OCPReportDBAccessor._prepare_and_execute_raw_sql_query")
     def test_populate_tag_cost_sql_includes_rate_name(self, mock_execute):
         """T3.12: populate_tag_cost_sql passes rate_name in SQL params."""
+        case_dict = {
+            "cost": ("cpu_case_sql", "memory_case_sql", "volume_case_sql"),
+            "labels": "labels_sql",
+        }
         with self.accessor as acc:
             acc.populate_tag_cost_sql(
                 "Node",
                 "node_cost_per_month",
                 "workload",
-                {"jboss": Decimal("40")},
+                case_dict,
                 self.dh.this_month_start,
                 self.dh.this_month_end,
                 "cpu",

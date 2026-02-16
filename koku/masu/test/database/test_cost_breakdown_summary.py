@@ -29,6 +29,12 @@ class BreakdownSummaryTableTest(MasuTestCase):
             start_date=self.dh.this_month_start,
             end_date=self.dh.this_month_end,
         )
+        self.sql_params = {
+            "start_date": self.dh.this_month_start,
+            "end_date": self.dh.this_month_end,
+            "schema": self.schema,
+            "source_uuid": self.ocp_provider_uuid,
+        }
 
     def test_breakdown_models_exist(self):
         """T6.1: All four breakdown models are importable."""
@@ -52,7 +58,7 @@ class BreakdownSummaryTableTest(MasuTestCase):
     def test_populate_breakdown_summary_tables(self):
         """T6.3: Breakdown summary tables are populated from line item data."""
         with self.accessor as acc:
-            acc._populate_breakdown_summary_tables(self.summary_range, self.ocp_provider_uuid)
+            acc._populate_breakdown_summary_tables(self.sql_params)
         with schema_context(self.schema):
             from reporting.provider.ocp.models import OCPCostBreakdownP
 
@@ -67,7 +73,7 @@ class BreakdownSummaryTableTest(MasuTestCase):
     def test_breakdown_by_project_includes_namespace(self):
         """T6.4: OCPCostBreakdownByProjectP rows carry namespace dimension."""
         with self.accessor as acc:
-            acc._populate_breakdown_summary_tables(self.summary_range, self.ocp_provider_uuid)
+            acc._populate_breakdown_summary_tables(self.sql_params)
         with schema_context(self.schema):
             from reporting.provider.ocp.models import OCPCostBreakdownByProjectP
 
@@ -82,21 +88,52 @@ class BreakdownSummaryTableTest(MasuTestCase):
         from reporting.provider.ocp.models import OCPCostBreakdownP
 
         with self.accessor as acc:
-            acc._populate_breakdown_summary_tables(self.summary_range, self.ocp_provider_uuid)
+            acc._populate_breakdown_summary_tables(self.sql_params)
         with schema_context(self.schema):
             count_1 = OCPCostBreakdownP.objects.filter(source_uuid=self.ocp_provider_uuid).count()
         with self.accessor as acc:
-            acc._populate_breakdown_summary_tables(self.summary_range, self.ocp_provider_uuid)
+            acc._populate_breakdown_summary_tables(self.sql_params)
         with schema_context(self.schema):
             count_2 = OCPCostBreakdownP.objects.filter(source_uuid=self.ocp_provider_uuid).count()
         self.assertEqual(count_1, count_2)
 
     def test_breakdown_groups_by_rate_name(self):
         """T6.6: Breakdown table has separate rows for each (rate_type, rate_name) combination."""
+        import uuid
         from reporting.provider.ocp.models import OCPCostBreakdownP
 
+        # The default test fixtures only have one Infrastructure rate name.
+        # Ensure at least two distinct Infrastructure rate names exist in the
+        # line item table so the breakdown aggregation has something to group by.
+        with schema_context(self.schema):
+            ref_row = OCPUsageLineItemDailySummary.objects.filter(
+                source_uuid=self.ocp_provider_uuid,
+                cost_model_rate_type="Infrastructure",
+                usage_start__gte=self.dh.this_month_start,
+            ).first()
+            if ref_row:
+                existing_name = ref_row.cost_model_rate_name or "Rate A"
+                second_name = (
+                    "CPU charge (fixture)" if existing_name != "CPU charge (fixture)" else "Memory charge (fixture)"
+                )
+                OCPUsageLineItemDailySummary.objects.create(
+                    uuid=uuid.uuid4(),
+                    cluster_id=ref_row.cluster_id,
+                    cluster_alias=ref_row.cluster_alias,
+                    data_source=ref_row.data_source,
+                    namespace=ref_row.namespace,
+                    node=ref_row.node,
+                    usage_start=ref_row.usage_start,
+                    usage_end=ref_row.usage_end,
+                    source_uuid=self.ocp_provider_uuid,
+                    report_period_id=ref_row.report_period_id,
+                    cost_model_cpu_cost=Decimal("10.00"),
+                    cost_model_rate_type="Infrastructure",
+                    cost_model_rate_name=second_name,
+                )
+
         with self.accessor as acc:
-            acc._populate_breakdown_summary_tables(self.summary_range, self.ocp_provider_uuid)
+            acc._populate_breakdown_summary_tables(self.sql_params)
         with schema_context(self.schema):
             combos = list(
                 OCPCostBreakdownP.objects.filter(
@@ -107,10 +144,21 @@ class BreakdownSummaryTableTest(MasuTestCase):
             )
             rate_type_name_pairs = {(c["cost_model_rate_type"], c["cost_model_rate_name"]) for c in combos}
             infra_names = {n for t, n in rate_type_name_pairs if t == "Infrastructure" and n}
-            self.assertGreaterEqual(len(infra_names), 2)
+            self.assertGreaterEqual(
+                len(infra_names),
+                2,
+                f"Expected at least 2 distinct Infrastructure rate names in breakdown, "
+                f"got {infra_names}. Verify that the line item table has rows with different "
+                f"cost_model_rate_name values for cost_model_rate_type='Infrastructure'.",
+            )
 
+    @patch(
+        "masu.database.ocp_report_db_accessor.OCPReportDBAccessor.schema_exists_trino",
+        return_value=False,
+    )
+    @patch("masu.database.ocp_report_db_accessor.trino_table_exists", return_value=False)
     @patch("masu.database.ocp_report_db_accessor.OCPReportDBAccessor._populate_breakdown_summary_tables")
-    def test_populate_ui_summary_calls_breakdown(self, mock_breakdown):
+    def test_populate_ui_summary_calls_breakdown(self, mock_breakdown, mock_trino, mock_schema_trino):
         """T6.7: populate_ui_summary_tables also populates breakdown tables."""
         with self.accessor as acc:
             acc.populate_ui_summary_tables(self.summary_range, self.ocp_provider_uuid)
@@ -119,7 +167,7 @@ class BreakdownSummaryTableTest(MasuTestCase):
     def test_vm_breakdown_populates_vm_name(self):
         """T6.8: OCPVMBreakdownP rows include vm_name extracted from labels."""
         with self.accessor as acc:
-            acc._populate_breakdown_summary_tables(self.summary_range, self.ocp_provider_uuid)
+            acc._populate_breakdown_summary_tables(self.sql_params)
         with schema_context(self.schema):
             from reporting.provider.ocp.models import OCPVMBreakdownP
 
@@ -145,7 +193,7 @@ class BreakdownSummaryTableTest(MasuTestCase):
                 cluster_id=self.ocp_cluster_id,
             )
         with self.accessor as acc:
-            acc._populate_breakdown_summary_tables(self.summary_range, self.ocp_provider_uuid)
+            acc._populate_breakdown_summary_tables(self.sql_params)
         with schema_context(self.schema):
             from reporting.provider.ocp.models import OCPCostBreakdownP
 

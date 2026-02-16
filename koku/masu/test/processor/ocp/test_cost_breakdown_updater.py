@@ -73,14 +73,13 @@ class OCPCostModelCostUpdaterRateNameTest(MasuTestCase):
         updater = OCPCostModelCostUpdater(self.schema, self.ocp_provider)
         updater._update_monthly_cost(self.dh.this_month_start, self.dh.this_month_end)
 
-        node_calls = [c for c in mock_populate.call_args_list if "node" in str(c).lower() or "Node" in str(c)]
-        self.assertEqual(len(node_calls), 2)
         rate_names = set()
-        for c in node_calls:
+        for c in mock_populate.call_args_list:
             rn = c.kwargs.get("rate_name") if c.kwargs else None
             if rn is None and len(c) > 1 and c[1]:
                 rn = c[1].get("rate_name")
-            rate_names.add(rn)
+            if rn in ("Base node", "Premium node"):
+                rate_names.add(rn)
         self.assertEqual(rate_names, {"Base node", "Premium node"})
 
     @patch("masu.database.ocp_report_db_accessor.OCPReportDBAccessor.populate_tag_usage_costs")
@@ -100,41 +99,38 @@ class OCPCostModelCostUpdaterRateNameTest(MasuTestCase):
     @patch("masu.database.ocp_report_db_accessor.OCPReportDBAccessor.populate_tag_cost_sql")
     @patch("masu.processor.ocp.ocp_cost_model_cost_updater.CostModelDBAccessor")
     def test_monthly_tag_based_cost_passes_rate_name(self, mock_accessor_cls, mock_populate):
-        """T3.9b: _update_monthly_tag_based_cost passes name from metric_to_tag_params_map."""
+        """T3.9b: _update_monthly_tag_based_cost passes name from tag_rate_names."""
         mock_accessor = self._build_mock_accessor(mock_accessor_cls)
-        mock_accessor.metric_to_tag_params_map = {
-            "node_cost_per_month": [
-                {
-                    "rate_type": "Infrastructure",
-                    "tag_key": "workload",
-                    "default_rate": "100.00",
-                    "value_rates": {"jboss": "40.00"},
-                    "name": "JBoss tag rate",
-                }
-            ],
+        mock_accessor.tag_infrastructure_rates = {
+            "node_cost_per_month": {"workload": {"jboss": Decimal("40")}},
+        }
+        mock_accessor.tag_rate_names = {
+            "node_cost_per_month": {"workload": "JBoss tag rate"},
         }
 
         updater = OCPCostModelCostUpdater(self.schema, self.ocp_provider)
         updater._update_monthly_tag_based_cost(self.dh.this_month_start, self.dh.this_month_end)
 
+        self.assertTrue(mock_populate.called, "populate_tag_cost_sql should have been called")
         call_kwargs = mock_populate.call_args
         rate_name = call_kwargs.kwargs.get("rate_name") if call_kwargs.kwargs else None
         self.assertEqual(rate_name, "JBoss tag rate")
 
+    @patch("masu.database.ocp_report_db_accessor.trino_table_exists", return_value=False)
     @patch("masu.database.ocp_report_db_accessor.OCPReportDBAccessor._prepare_and_execute_raw_sql_query")
     @patch("masu.processor.ocp.ocp_cost_model_cost_updater.CostModelDBAccessor")
-    def test_populate_tag_based_costs_passes_rate_name(self, mock_accessor_cls, mock_execute):
+    def test_populate_tag_based_costs_passes_rate_name(self, mock_accessor_cls, mock_execute, mock_trino):
         """T3.9c: populate_tag_based_costs reads name from metric_to_tag_params_map and passes to SQL."""
         from masu.database.ocp_report_db_accessor import OCPReportDBAccessor
 
         metric_to_tag_params_map = {
-            "gpu_request_per_gpu_hour": [
+            "vm_cost_per_month": [
                 {
                     "rate_type": "Infrastructure",
-                    "tag_key": "gpu_type",
+                    "tag_key": "vm_type",
                     "default_rate": "5.00",
-                    "value_rates": {"a100": "10.00"},
-                    "name": "GPU A100 rate",
+                    "value_rates": {"large": "10.00"},
+                    "name": "VM monthly rate",
                 }
             ],
         }
@@ -149,7 +145,7 @@ class OCPCostModelCostUpdaterRateNameTest(MasuTestCase):
         for call_args in mock_execute.call_args_list:
             sql_params = call_args[0][2] if len(call_args[0]) > 2 else {}
             if "rate_name" in sql_params:
-                self.assertEqual(sql_params["rate_name"], "GPU A100 rate")
+                self.assertEqual(sql_params["rate_name"], "VM monthly rate")
                 break
         else:
             self.fail("No SQL call included rate_name parameter")

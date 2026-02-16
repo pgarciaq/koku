@@ -7,6 +7,9 @@
 Covers: T5.1–T5.5 (distribution SQL per-rate-name tracking).
 All tests are expected to FAIL until the production code is implemented.
 """
+import uuid
+from decimal import Decimal
+
 from django.db.models import Sum
 from django_tenants.utils import schema_context
 
@@ -115,41 +118,84 @@ class DistributionRateNameTest(MasuTestCase):
             )
             self.assertTrue(user_rows.exists(), "Should have user distribution rows")
 
-    def test_all_five_distribution_types_track_rate_name(self):
-        """T5.5: All distribution types (platform, worker, storage, network, GPU) carry rate_name."""
-        # Each tuple: (distribution_info overrides, expected cost_model_rate_type in DB)
-        distribution_types = [
-            (
-                {
-                    metric_constants.PLATFORM_COST: True,
-                    metric_constants.WORKER_UNALLOCATED: False,
-                    metric_constants.GPU_UNALLOCATED: False,
-                    "distribution_type": "cpu",
-                },
-                "platform_distributed",
-            ),
-            (
-                {
-                    metric_constants.PLATFORM_COST: False,
-                    metric_constants.WORKER_UNALLOCATED: True,
-                    metric_constants.GPU_UNALLOCATED: False,
-                    "distribution_type": "cpu",
-                },
-                "worker_distributed",
-            ),
-        ]
-        for config, rate_type in distribution_types:
-            with self.subTest(rate_type=rate_type):
-                with self.accessor as acc:
-                    acc.populate_distributed_cost_sql(
-                        self.summary_range,
-                        self.ocp_provider_uuid,
-                        config,
-                    )
-                with schema_context(self.schema):
-                    rows = OCPUsageLineItemDailySummary.objects.filter(
-                        cost_model_rate_type=rate_type,
-                        usage_start__gte=self.dh.this_month_start,
-                    )
-                    has_rate_names = rows.exclude(cost_model_rate_name__isnull=True).exists()
-                    self.assertTrue(has_rate_names, f"{rate_type} should have rate-named rows")
+    def _assert_distribution_tracks_rate_name(self, config, rate_type):
+        """Helper: run distribution and assert rows carry rate_name."""
+        with self.accessor as acc:
+            acc.populate_distributed_cost_sql(
+                self.summary_range,
+                self.ocp_provider_uuid,
+                config,
+            )
+        with schema_context(self.schema):
+            rows = OCPUsageLineItemDailySummary.objects.filter(
+                cost_model_rate_type=rate_type,
+                usage_start__gte=self.dh.this_month_start,
+            )
+            self.assertTrue(
+                rows.exists(),
+                f"populate_distributed_cost_sql should produce {rate_type} rows "
+                f"(check that test fixtures include the prerequisite data, e.g. "
+                f"'Worker unallocated' namespace rows for worker_distributed)",
+            )
+            has_rate_names = rows.exclude(cost_model_rate_name__isnull=True).exists()
+            self.assertTrue(has_rate_names, f"{rate_type} should have rate-named rows")
+
+    def test_platform_distribution_tracks_rate_name(self):
+        """T5.5a: Platform distribution rows carry rate_name."""
+        config = {
+            metric_constants.PLATFORM_COST: True,
+            metric_constants.WORKER_UNALLOCATED: False,
+            metric_constants.GPU_UNALLOCATED: False,
+            "distribution_type": "cpu",
+        }
+        self._assert_distribution_tracks_rate_name(config, "platform_distributed")
+
+    def test_worker_distribution_tracks_rate_name(self):
+        """T5.5b: Worker distribution rows carry rate_name."""
+        # The worker distribution SQL distributes cost from "Worker unallocated"
+        # namespace rows to user namespaces.  The standard test fixtures do not
+        # include Worker unallocated rows, so we synthesize them here.
+        with schema_context(self.schema):
+            # Grab a reference row from the same provider to copy cluster metadata
+            ref_row = OCPUsageLineItemDailySummary.objects.filter(
+                source_uuid=self.ocp_provider_uuid,
+                usage_start__gte=self.dh.this_month_start,
+                data_source="Pod",
+                namespace="koku",
+            ).first()
+            if not ref_row:
+                self.fail("No reference row in 'koku' namespace to build Worker fixture from")
+
+            report_period_id = ref_row.report_period_id
+            # Create Worker unallocated rows with known rate names and costs
+            for rate_name in ("CPU rate", "Memory rate"):
+                OCPUsageLineItemDailySummary.objects.create(
+                    uuid=uuid.uuid4(),
+                    cluster_id=ref_row.cluster_id,
+                    cluster_alias=ref_row.cluster_alias,
+                    data_source="Pod",
+                    namespace="Worker unallocated",
+                    node=ref_row.node,
+                    usage_start=self.dh.this_month_start,
+                    usage_end=self.dh.this_month_start,
+                    source_uuid=self.ocp_provider_uuid,
+                    report_period_id=report_period_id,
+                    cost_model_cpu_cost=Decimal("50.00"),
+                    cost_model_memory_cost=Decimal("30.00"),
+                    cost_model_rate_name=rate_name,
+                    cost_model_rate_type="Infrastructure",
+                    pod_effective_usage_cpu_core_hours=Decimal("100.0"),
+                    pod_effective_usage_memory_gigabyte_hours=Decimal("50.0"),
+                    node_capacity_cpu_core_hours=ref_row.node_capacity_cpu_core_hours,
+                    node_capacity_memory_gigabyte_hours=ref_row.node_capacity_memory_gigabyte_hours,
+                    cluster_capacity_cpu_core_hours=ref_row.cluster_capacity_cpu_core_hours,
+                    cluster_capacity_memory_gigabyte_hours=ref_row.cluster_capacity_memory_gigabyte_hours,
+                )
+
+        config = {
+            metric_constants.PLATFORM_COST: False,
+            metric_constants.WORKER_UNALLOCATED: True,
+            metric_constants.GPU_UNALLOCATED: False,
+            "distribution_type": "cpu",
+        }
+        self._assert_distribution_tracks_rate_name(config, "worker_distributed")

@@ -8,6 +8,7 @@ Covers: T-E2E.1–T-E2E.4 (full pipeline: cost model → cost application → br
 These tests require ALL 8 PRs to be merged. Expected to FAIL until then.
 """
 from decimal import Decimal
+from unittest.mock import patch
 
 from django.urls import reverse
 from django_tenants.utils import schema_context
@@ -64,12 +65,36 @@ class CostBreakdownE2ETest(IamTestCase):
                 source_type=Provider.PROVIDER_OCP,
                 rates=self.cost_model_rates,
                 markup={"value": Decimal("10"), "unit": "percent"},
+                distribution_info={"platform_cost": True, "worker_unallocated": False, "distribution_type": "cpu"},
                 currency="USD",
             )
             CostModelMap.objects.create(
                 cost_model_id=self.cost_model.uuid,
                 provider_uuid=self.ocp_provider.uuid,
             )
+
+        # Mock external services (Trino, Unleash) that are unavailable in the
+        # unit-test environment.  The cost-model pipeline only needs the local
+        # PostgreSQL database; Trino/Unleash are called by ancillary helpers
+        # (GPU UI table, virtualization UI table, feature-flag checks).
+        trino_patch = patch(
+            "masu.database.ocp_report_db_accessor.trino_table_exists",
+            return_value=False,
+        )
+        schema_trino_patch = patch(
+            "masu.database.ocp_report_db_accessor.OCPReportDBAccessor.schema_exists_trino",
+            return_value=False,
+        )
+        unleash_patch = patch(
+            "masu.database.ocp_report_db_accessor.is_feature_flag_enabled_by_schema",
+            return_value=False,
+        )
+        trino_patch.start()
+        schema_trino_patch.start()
+        unleash_patch.start()
+        self.addCleanup(trino_patch.stop)
+        self.addCleanup(schema_trino_patch.stop)
+        self.addCleanup(unleash_patch.stop)
 
         # Apply costs using the updater pipeline (this runs all cost application steps)
         summary_range = SummaryRangeConfig(
@@ -80,8 +105,14 @@ class CostBreakdownE2ETest(IamTestCase):
         updater.update_summary_cost_model_costs(summary_range)
 
         # Populate breakdown summary tables (PR 6)
+        sql_params = {
+            "start_date": summary_range.start_date,
+            "end_date": summary_range.end_date,
+            "schema": self.schema_name,
+            "source_uuid": self.ocp_provider.uuid,
+        }
         with OCPReportDBAccessor(self.schema_name) as acc:
-            acc._populate_breakdown_summary_tables(summary_range, self.ocp_provider.uuid)
+            acc._populate_breakdown_summary_tables(sql_params)
 
     def test_full_pipeline_rate_names_in_api_response(self):
         """T-E2E.1: API response contains breakdown with all three rate names."""
@@ -105,15 +136,23 @@ class CostBreakdownE2ETest(IamTestCase):
         data = response.json()
         total = data["meta"]["total"]
         cost = total["cost"]
-        if "platform_distributed" in cost:
-            pd = cost["platform_distributed"]
-            self.assertIn("breakdown", pd)
-            breakdown = pd["breakdown"]
-            self.assertTrue(len(breakdown) > 0)
-            for entry in breakdown:
-                self.assertIn("name", entry)
-                self.assertIn("source", entry)
-                self.assertIn(entry["source"], ("rate", "cloud"))
+        self.assertIn("platform_distributed", cost, "Response must include platform_distributed cost category")
+        pd = cost["platform_distributed"]
+        pd_value = pd.get("value", 0)
+        self.assertNotEqual(
+            pd_value,
+            0,
+            "platform_distributed value is 0 — distribution did not produce cost. "
+            "Verify the cost model has distribution_info={'platform_cost': True} "
+            "and the test data includes a Platform cost category with assigned namespaces.",
+        )
+        self.assertIn("breakdown", pd, f"Non-zero platform_distributed ({pd_value}) should have a breakdown array")
+        breakdown = pd["breakdown"]
+        self.assertTrue(len(breakdown) > 0, "breakdown array should not be empty")
+        for entry in breakdown:
+            self.assertIn("name", entry)
+            self.assertIn("source", entry)
+            self.assertIn(entry["source"], ("rate", "cloud"))
 
     def test_full_pipeline_csv_breakdown(self):
         """T-E2E.3: CSV export with breakdown_limit includes rate name rows."""
@@ -139,3 +178,26 @@ class CostBreakdownE2ETest(IamTestCase):
             if key in cost:
                 self.assertIn("value", cost[key])
                 self.assertIn("units", cost[key])
+
+    def test_full_pipeline_breakdown_limit(self):
+        """API with breakdown_limit=1 returns at most one named entry plus optional Other."""
+        url = reverse("reports-openshift-costs") + "?breakdown_limit=1"
+        client = APIClient()
+        response = client.get(url, **self.headers)
+        data = response.json()
+        total = data["meta"]["total"]
+        usage = total["cost"]["usage"]
+        self.assertIn("breakdown", usage, "Response must include breakdown array on cost.usage")
+        breakdown = usage["breakdown"]
+        if len(breakdown) > 1:
+            named_entries = [e for e in breakdown if e.get("source") != "other"]
+            other_entries = [e for e in breakdown if e.get("source") == "other"]
+            self.assertLessEqual(
+                len(named_entries),
+                1,
+                "With breakdown_limit=1, at most one named entry should exist",
+            )
+            for other_entry in other_entries:
+                self.assertEqual(other_entry.get("source"), "other")
+                self.assertIn("value", other_entry)
+                self.assertIsInstance(other_entry["value"], (int, float))
