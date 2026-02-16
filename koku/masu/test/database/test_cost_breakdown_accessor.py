@@ -58,7 +58,9 @@ class CostModelDBAccessorRatesByNameTest(MasuTestCase):
 
     def test_infrastructure_rates_by_name_preserves_duplicates(self):
         """T3.2: Two rates for same metric both appear in the list."""
-        rates = [
+        # Use a single cost model with both rates for the same metric.
+        # (Only one cost model can be mapped to a provider.)
+        rates_with_dup_metric = [
             {
                 "name": "Base CPU",
                 "metric": {"name": "cpu_core_usage_per_hour"},
@@ -72,7 +74,11 @@ class CostModelDBAccessorRatesByNameTest(MasuTestCase):
                 "cost_type": "Infrastructure",
             },
         ]
-        self.creator.create_cost_model(self.ocp_provider_uuid, Provider.PROVIDER_OCP, rates)
+        # Replace the cost model from setUp with one containing duplicate-metric rates
+        from cost_models.models import CostModelMap
+
+        CostModelMap.objects.filter(provider_uuid=self.ocp_provider_uuid).delete()
+        self.creator.create_cost_model(self.ocp_provider_uuid, Provider.PROVIDER_OCP, rates_with_dup_metric)
         with CostModelDBAccessor(self.schema, self.ocp_provider_uuid) as accessor:
             by_name = accessor.infrastructure_rates_by_name
         cpu_rates = [r for r in by_name if r["metric"] == "cpu_core_usage_per_hour"]

@@ -10,6 +10,7 @@ All tests are expected to FAIL until the production code is implemented.
 from django.db.models import Sum
 from django_tenants.utils import schema_context
 
+from api.metrics import constants as metric_constants
 from masu.database.ocp_report_db_accessor import OCPReportDBAccessor
 from masu.test import MasuTestCase
 from masu.util.common import SummaryRangeConfig
@@ -26,6 +27,14 @@ class DistributionRateNameTest(MasuTestCase):
             start_date=self.dh.this_month_start,
             end_date=self.dh.this_month_end,
         )
+        # Build a distribution_info dict consistent with actual CostModelDBAccessor output.
+        # Keys come from metric_constants: "platform_cost", "worker_unallocated", etc.
+        self.distribution_info = {
+            metric_constants.PLATFORM_COST: True,
+            metric_constants.WORKER_UNALLOCATED: False,
+            metric_constants.GPU_UNALLOCATED: False,
+            "distribution_type": "cpu",
+        }
 
     def test_distributed_rows_carry_rate_name_from_source(self):
         """T5.1: After distribution, user-namespace rows carry cost_model_rate_name from Platform source."""
@@ -33,7 +42,7 @@ class DistributionRateNameTest(MasuTestCase):
             acc.populate_distributed_cost_sql(
                 self.summary_range,
                 self.ocp_provider_uuid,
-                {"platform_cost": True, "worker_cost": False, "gpu_unallocated": False},
+                self.distribution_info,
             )
         with schema_context(self.schema):
             distributed_rows = OCPUsageLineItemDailySummary.objects.filter(
@@ -51,7 +60,7 @@ class DistributionRateNameTest(MasuTestCase):
             acc.populate_distributed_cost_sql(
                 self.summary_range,
                 self.ocp_provider_uuid,
-                {"platform_cost": True, "worker_cost": False, "gpu_unallocated": False},
+                self.distribution_info,
             )
         with schema_context(self.schema):
             sums = (
@@ -76,7 +85,7 @@ class DistributionRateNameTest(MasuTestCase):
             acc.populate_distributed_cost_sql(
                 self.summary_range,
                 self.ocp_provider_uuid,
-                {"platform_cost": True, "worker_cost": False, "gpu_unallocated": False},
+                self.distribution_info,
             )
         with schema_context(self.schema):
             platform_negations = OCPUsageLineItemDailySummary.objects.filter(
@@ -96,7 +105,7 @@ class DistributionRateNameTest(MasuTestCase):
             acc.populate_distributed_cost_sql(
                 self.summary_range,
                 self.ocp_provider_uuid,
-                {"platform_cost": True, "worker_cost": False, "gpu_unallocated": False},
+                self.distribution_info,
             )
         with schema_context(self.schema):
             user_rows = OCPUsageLineItemDailySummary.objects.filter(
@@ -108,11 +117,25 @@ class DistributionRateNameTest(MasuTestCase):
 
     def test_all_five_distribution_types_track_rate_name(self):
         """T5.5: All distribution types (platform, worker, storage, network, GPU) carry rate_name."""
+        # Each tuple: (distribution_info overrides, expected cost_model_rate_type in DB)
         distribution_types = [
-            ({"platform_cost": True, "worker_cost": False, "gpu_unallocated": False}, "platform_distributed"),
             (
-                {"platform_cost": False, "worker_cost": True, "gpu_unallocated": False},
-                "worker_unallocated_distributed",
+                {
+                    metric_constants.PLATFORM_COST: True,
+                    metric_constants.WORKER_UNALLOCATED: False,
+                    metric_constants.GPU_UNALLOCATED: False,
+                    "distribution_type": "cpu",
+                },
+                "platform_distributed",
+            ),
+            (
+                {
+                    metric_constants.PLATFORM_COST: False,
+                    metric_constants.WORKER_UNALLOCATED: True,
+                    metric_constants.GPU_UNALLOCATED: False,
+                    "distribution_type": "cpu",
+                },
+                "worker_distributed",
             ),
         ]
         for config, rate_type in distribution_types:

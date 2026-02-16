@@ -194,6 +194,9 @@ class OCPCostQueryHandlerBreakdownTest(IamTestCase):
 
     def test_provider_map_has_breakdown_views(self):
         """T7.13b: Provider map defines breakdown_views for costs, costs_by_project, and VMs."""
+        from django_tenants.utils import tenant_context
+
+        from api.models import Provider as ProviderModel
         from api.report.ocp.provider_map import OCPProviderMap
 
         try:
@@ -204,7 +207,13 @@ class OCPCostQueryHandlerBreakdownTest(IamTestCase):
         except ImportError:
             self.fail("Breakdown models not yet created")
 
-        provider_map = OCPProviderMap(self.provider, "costs")
+        with tenant_context(self.tenant):
+            provider_map = OCPProviderMap(
+                provider=ProviderModel.PROVIDER_OCP,
+                report_type="costs",
+                schema_name=self.schema_name,
+            )
+
         self.assertIn("costs", provider_map.breakdown_views)
         self.assertEqual(provider_map.breakdown_views["costs"]["default"], OCPCostBreakdownP)
         self.assertEqual(provider_map.breakdown_views["costs"][("node",)], OCPCostBreakdownByNodeP)
@@ -227,13 +236,18 @@ class OCPCostQueryHandlerBreakdownTest(IamTestCase):
             self.fail("Breakdown models not yet created")
 
         from api.report.ocp.query_handler import OCPReportQueryHandler
+        from api.report.ocp.view import OCPCostView
 
-        url = "?filter[time_scope_value]=-1&filter[time_scope_units]=month"
-        handler = OCPReportQueryHandler(url, self.tenant, **{"accept_type": "application/json"})
+        # No group-by → default breakdown table
+        url = "?"
+        query_params = self.mocked_query_params(url, OCPCostView)
+        handler = OCPReportQueryHandler(query_params)
         self.assertEqual(handler._get_breakdown_table(), OCPCostBreakdownP)
 
-        url = "?filter[time_scope_value]=-1&filter[time_scope_units]=month&group_by[node]=*"
-        handler = OCPReportQueryHandler(url, self.tenant, **{"accept_type": "application/json"})
+        # Node group-by → node breakdown table
+        url = "?group_by[node]=*"
+        query_params = self.mocked_query_params(url, OCPCostView)
+        handler = OCPReportQueryHandler(query_params)
         self.assertEqual(handler._get_breakdown_table(), OCPCostBreakdownByNodeP)
 
     def test_costs_by_project_includes_breakdown(self):

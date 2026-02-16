@@ -147,20 +147,19 @@ class CostModelSerializerNameTest(IamTestCase):
 class RateNameMigrationTest(TestCase):
     """T1.7–T1.11: Tests for the rate name data migration logic.
 
-    These test the _generate_name function directly. The function will be
-    created as a module-level utility in the migration file.
+    Tests the _generate_name function directly. The function is extracted
+    as a module-level utility in cost_models.rate_name_utils for testability,
+    then imported by the migration.
     """
 
     def _get_generate_name(self):
-        """Import _generate_name from the migration module.
+        """Import _generate_name from the rate name utilities module.
 
-        This import is inline because the migration doesn't exist yet (RED phase).
+        This import is inline because the module doesn't exist yet (RED phase).
         """
-        # The migration module path will be determined when PR 1 is implemented.
-        # For now, attempt to import from a known location.
-        from cost_models.migrations import _generate_name  # noqa: F401
+        from cost_models.rate_name_utils import generate_name
 
-        return _generate_name
+        return generate_name
 
     def test_migration_generates_name_from_description(self):
         """T1.7: Rate with description gets name derived from description."""
