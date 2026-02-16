@@ -4,6 +4,7 @@
 #
 """Test the CostModelDBAccessor utility object."""
 import random
+from decimal import Decimal
 
 from django_tenants.utils import schema_context
 
@@ -440,3 +441,198 @@ class CostModelDBAccessorTagRatesPriceListTest(MasuTestCase):
         with CostModelDBAccessor(self.schema, self.provider_uuid) as cost_model_accessor:
             result_infra_rates = cost_model_accessor.tag_infrastructure_rates.get("node_cost_per_month")
             self.assertEqual(result_infra_rates, expected)
+
+
+class CostModelDBAccessorRatesByNameTest(MasuTestCase):
+    """Test Cases for CostModelDBAccessor infrastructure_rates_by_name and supplementary_rates_by_name."""
+
+    def setUp(self):
+        """Set up a test with database objects."""
+        super().setUp()
+        self.provider_uuid = self.ocpaws_provider_uuid
+        self.creator = ReportObjectCreator(self.schema)
+        rates = [
+            {
+                "name": "CPU infrastructure",
+                "metric": {"name": "cpu_core_usage_per_hour"},
+                "tiered_rates": [{"value": 0.05, "unit": "USD"}],
+                "cost_type": "Infrastructure",
+            },
+            {
+                "name": "Memory infrastructure",
+                "metric": {"name": "memory_gb_usage_per_hour"},
+                "tiered_rates": [{"value": 0.03, "unit": "USD"}],
+                "cost_type": "Infrastructure",
+            },
+            {
+                "name": "Node supplementary",
+                "metric": {"name": "node_cost_per_month"},
+                "tiered_rates": [{"value": 100.0, "unit": "USD"}],
+                "cost_type": "Supplementary",
+            },
+        ]
+        self.cost_model = self.creator.create_cost_model(self.provider_uuid, Provider.PROVIDER_OCP, rates)
+
+    def test_infrastructure_rates_by_name_returns_list(self):
+        """Verify infrastructure_rates_by_name returns a list of dicts with metric, value, name."""
+        with CostModelDBAccessor(self.schema, self.provider_uuid) as cost_model_accessor:
+            rates = cost_model_accessor.infrastructure_rates_by_name
+        self.assertIsInstance(rates, list)
+        self.assertEqual(len(rates), 2)
+        for r in rates:
+            self.assertIn("metric", r)
+            self.assertIn("value", r)
+            self.assertIn("name", r)
+
+    def test_supplementary_rates_by_name_returns_list(self):
+        """Verify supplementary_rates_by_name returns a list of dicts with metric, value, name."""
+        with CostModelDBAccessor(self.schema, self.provider_uuid) as cost_model_accessor:
+            rates = cost_model_accessor.supplementary_rates_by_name
+        self.assertIsInstance(rates, list)
+        self.assertEqual(len(rates), 1)
+        for r in rates:
+            self.assertIn("metric", r)
+            self.assertIn("value", r)
+            self.assertIn("name", r)
+
+    def test_rates_by_name_preserves_multiple_rates_for_same_metric(self):
+        """Verify both infrastructure rates for cpu_core_usage_per_hour appear in infrastructure_rates_by_name."""
+        from cost_models.models import CostModelMap
+
+        rates = [
+            {
+                "name": "Base CPU rate",
+                "metric": {"name": "cpu_core_usage_per_hour"},
+                "tiered_rates": [{"value": 0.05, "unit": "USD"}],
+                "cost_type": "Infrastructure",
+            },
+            {
+                "name": "Premium CPU rate",
+                "metric": {"name": "cpu_core_usage_per_hour"},
+                "tiered_rates": [{"value": 0.10, "unit": "USD"}],
+                "cost_type": "Infrastructure",
+            },
+        ]
+        with schema_context(self.schema):
+            CostModelMap.objects.filter(provider_uuid=self.provider_uuid).delete()
+        self.creator.create_cost_model(self.provider_uuid, Provider.PROVIDER_OCP, rates)
+        with CostModelDBAccessor(self.schema, self.provider_uuid) as cost_model_accessor:
+            by_name = cost_model_accessor.infrastructure_rates_by_name
+        cpu_rates = [r for r in by_name if r["metric"] == "cpu_core_usage_per_hour"]
+        self.assertEqual(len(cpu_rates), 2)
+        names = {r["name"] for r in cpu_rates}
+        self.assertEqual(names, {"Base CPU rate", "Premium CPU rate"})
+
+    def test_tag_rate_names_property(self):
+        """Verify tag_rate_names returns {metric: {tag_key: rate_name}}."""
+        from cost_models.models import CostModelMap
+
+        rates = [
+            {
+                "name": "JBoss tag rate",
+                "metric": {"name": "cpu_core_usage_per_hour"},
+                "tag_rates": {
+                    "tag_key": "workload",
+                    "tag_values": [{"tag_value": "jboss", "value": 40.0, "unit": "USD"}],
+                },
+                "cost_type": "Infrastructure",
+            },
+        ]
+        with schema_context(self.schema):
+            CostModelMap.objects.filter(provider_uuid=self.provider_uuid).delete()
+        self.creator.create_cost_model(self.provider_uuid, Provider.PROVIDER_OCP, rates)
+        with CostModelDBAccessor(self.schema, self.provider_uuid) as cost_model_accessor:
+            names = cost_model_accessor.tag_rate_names
+        self.assertEqual(names["cpu_core_usage_per_hour"]["workload"], "JBoss tag rate")
+
+
+class CostModelRateNameThreadingTest(MasuTestCase):
+    """Test that monthly cost SQL and tag usage SQL accept and use rate_name."""
+
+    def setUp(self):
+        """Set up a test with database objects."""
+        super().setUp()
+        self.provider_uuid = self.ocp_provider_uuid
+
+    def test_populate_monthly_cost_sql_with_rate_name(self):
+        """Verify populate_monthly_cost_sql with rate_name sets cost_model_rate_name on line items."""
+        from masu.database.ocp_report_db_accessor import OCPReportDBAccessor
+        from reporting.models import OCPUsageLineItemDailySummary
+
+        with OCPReportDBAccessor(schema=self.schema) as acc:
+            acc.populate_monthly_cost_sql(
+                cost_type="Node",
+                rate_type="Infrastructure",
+                rate=Decimal("100.00"),
+                start_date=self.dh.this_month_start,
+                end_date=self.dh.today,
+                distribution="cpu",
+                provider_uuid=self.provider_uuid,
+                rate_name="Node monthly",
+            )
+        with schema_context(self.schema):
+            rows = OCPUsageLineItemDailySummary.objects.filter(
+                monthly_cost_type="Node",
+                cost_model_rate_type="Infrastructure",
+                usage_start__gte=self.dh.this_month_start,
+            )
+            self.assertTrue(
+                rows.exists(),
+                "populate_monthly_cost_sql should create Node monthly cost rows " "for the OCP-on-Prem cluster.",
+            )
+            for row in rows:
+                self.assertEqual(
+                    row.cost_model_rate_name,
+                    "Node monthly",
+                    f"Monthly cost row {row.uuid} should carry rate_name='Node monthly' "
+                    f"but got '{row.cost_model_rate_name}'",
+                )
+
+    def test_populate_tag_usage_costs_with_tag_rate_names(self):
+        """Verify populate_tag_usage_costs with tag_rate_names sets cost_model_rate_name on line items."""
+        from masu.database.ocp_report_db_accessor import OCPReportDBAccessor
+        from reporting.models import OCPUsageLineItemDailySummary
+
+        # Use tag key "app" and value "banking" which are known to exist in the
+        # test fixtures (seeded by ModelBakeryDataLoader on OCP-on-Prem cluster).
+        infrastructure_rates = {"cpu_core_usage_per_hour": {"app": {"banking": Decimal("40")}}}
+        supplementary_rates = {}
+        tag_rate_names = {"cpu_core_usage_per_hour": {"app": "CPU app tag rate"}}
+
+        # Clean up any previous Tag rows so we start from a known state
+        with schema_context(self.schema):
+            OCPUsageLineItemDailySummary.objects.filter(
+                monthly_cost_type="Tag",
+                cluster_id=self.ocp_cluster_id,
+                usage_start__gte=self.dh.this_month_start,
+            ).delete()
+
+        with OCPReportDBAccessor(schema=self.schema) as acc:
+            acc.populate_tag_usage_costs(
+                infrastructure_rates,
+                supplementary_rates,
+                start_date=self.dh.this_month_start,
+                end_date=self.dh.today,
+                cluster_id=self.ocp_cluster_id,
+                tag_rate_names=tag_rate_names,
+            )
+        with schema_context(self.schema):
+            tag_rows = OCPUsageLineItemDailySummary.objects.filter(
+                monthly_cost_type="Tag",
+                usage_start__gte=self.dh.this_month_start,
+                cluster_id=self.ocp_cluster_id,
+            )
+            self.assertTrue(
+                tag_rows.exists(),
+                "populate_tag_usage_costs should create Tag rows for the app:banking "
+                "tag that exists in the test fixture data. If this fails, verify that "
+                "the OCP-on-Prem cluster has rows with pod_labels containing "
+                '{"app": "banking"}.',
+            )
+            for row in tag_rows:
+                self.assertEqual(
+                    row.cost_model_rate_name,
+                    "CPU app tag rate",
+                    f"Tag row {row.uuid} should carry rate_name='CPU app tag rate' "
+                    f"but got '{row.cost_model_rate_name}'",
+                )

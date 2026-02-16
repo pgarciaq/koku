@@ -22,6 +22,7 @@ from api.provider.models import Provider
 from api.utils import get_currency
 from cost_models.models import CostModel
 from cost_models.models import CostModelMap
+from cost_models.rate_name_utils import generate_name
 from cost_models.serializers import CostModelSerializer
 from cost_models.serializers import DistributionSerializer
 from cost_models.serializers import RateSerializer
@@ -968,3 +969,102 @@ class CostModelSerializerTest(IamTestCase):
                     self.assertIsNotNone(instance)
                     expected_distrib_obj = {**DEFAULT_DISTRIBUTION_INFO, **test_case}
                     self.assertEqual(instance.distribution_info, expected_distrib_obj)
+
+    def test_rate_name_required(self):
+        """Verify that omitting name from a rate causes validation error."""
+        data = dict(self.ocp_data)
+        data["rates"] = [dict(self.ocp_data["rates"][0])]
+        del data["rates"][0]["name"]
+        with tenant_context(self.tenant):
+            serializer = CostModelSerializer(data=data, context=self.request_context)
+            self.assertFalse(serializer.is_valid())
+            self.assertIn("rates", serializer.errors)
+            self.assertIn("name", serializer.errors["rates"][0])
+
+    def test_rate_name_max_length(self):
+        """Verify that a name >50 chars causes validation error."""
+        data = dict(self.ocp_data)
+        data["rates"] = [dict(self.ocp_data["rates"][0])]
+        data["rates"][0]["name"] = "X" * 51
+        with tenant_context(self.tenant):
+            serializer = CostModelSerializer(data=data, context=self.request_context)
+            self.assertFalse(serializer.is_valid())
+            self.assertIn("rates", serializer.errors)
+            self.assertIn("name", serializer.errors["rates"][0])
+
+    def test_rate_name_uniqueness_within_cost_model(self):
+        """Verify that two rates with the same name in one cost model causes validation error."""
+        rate1 = dict(self.ocp_data["rates"][0])
+        rate2 = {
+            "name": rate1["name"],
+            "metric": {"name": metric_constants.OCP_METRIC_MEM_GB_USAGE_HOUR},
+            "tiered_rates": [{"unit": "USD", "value": 0.15}],
+        }
+        data = dict(self.ocp_data)
+        data["rates"] = [rate1, rate2]
+        with tenant_context(self.tenant):
+            serializer = CostModelSerializer(data=data, context=self.request_context)
+            with self.assertRaises(serializers.ValidationError) as ctx:
+                serializer.is_valid(raise_exception=True)
+            self.assertIn("unique", str(ctx.exception).lower())
+
+    def test_rate_name_accepted_and_stored(self):
+        """Verify a valid rate with name is accepted and stored in the CostModel.rates JSON."""
+        rate_name = "My CPU usage rate"
+        data = dict(self.ocp_data)
+        data["rates"] = [dict(self.ocp_data["rates"][0])]
+        data["rates"][0]["name"] = rate_name
+        with tenant_context(self.tenant):
+            serializer = CostModelSerializer(data=data, context=self.request_context)
+            self.assertTrue(serializer.is_valid(raise_exception=True))
+            instance = serializer.save()
+            self.assertIsNotNone(instance)
+            self.assertIsNotNone(instance.rates)
+            self.assertEqual(len(instance.rates), 1)
+            self.assertEqual(instance.rates[0]["name"], rate_name)
+
+    def test_generate_name_from_description(self):
+        """Test generate_name with a rate that has a description <= 50 chars."""
+        rate = {
+            "description": "JBoss middleware license",
+            "metric": {"name": "cpu_core_usage_per_hour"},
+            "cost_type": "Infrastructure",
+        }
+        used_names = set()
+        name = generate_name(rate, used_names)
+        self.assertEqual(name, "JBoss middleware license")
+
+    def test_generate_name_truncates_long_description(self):
+        """Test generate_name with description >50 chars (should truncate to 47+'...')."""
+        rate = {
+            "description": "A" * 60,
+            "metric": {"name": "cpu_core_usage_per_hour"},
+            "cost_type": "Infrastructure",
+        }
+        used_names = set()
+        name = generate_name(rate, used_names)
+        self.assertEqual(len(name), 50)
+        self.assertTrue(name.endswith("..."))
+        self.assertEqual(name[:47], "A" * 47)
+
+    def test_generate_name_deduplicates(self):
+        """Test generate_name with used_names containing the candidate — should produce numeric suffix."""
+        rate = {
+            "description": "CPU rate",
+            "metric": {"name": "cpu_core_usage_per_hour"},
+            "cost_type": "Infrastructure",
+        }
+        used_names = {"CPU rate"}
+        name = generate_name(rate, used_names)
+        self.assertEqual(name, "CPU rate_000")
+        self.assertNotIn(name, used_names)
+
+    def test_generate_name_no_description(self):
+        """Test generate_name with no description — should fall back to metric_cost_type pattern."""
+        rate = {
+            "metric": {"name": "cpu_core_usage_per_hour"},
+            "cost_type": "Infrastructure",
+        }
+        used_names = set()
+        name = generate_name(rate, used_names)
+        self.assertEqual(name, "cpu_core_usage_per_hour_infrastructure")
