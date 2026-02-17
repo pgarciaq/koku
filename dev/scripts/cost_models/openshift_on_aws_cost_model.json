@@ -5,7 +5,137 @@
     "source_uuids": [
         "PROVIDER_UUID"
     ],
-    "rates": [],
+    "distribution": "cpu",
+    "distribution_info": {
+        "distribution_type": "cpu",
+        "platform_cost": true,
+        "worker_cost": true,
+        "network_unattributed": true,
+        "storage_unattributed": true,
+        "gpu_unallocated": true
+    },
+    "rates": [
+        {
+            "name": "CPU usage rate",
+            "metric": {
+                "name": "cpu_core_usage_per_hour"
+            },
+            "tiered_rates": [
+                {
+                    "unit": "USD",
+                    "value": 0.007,
+                    "usage_start": null,
+                    "usage_end": null
+                }
+            ],
+            "cost_type": "Supplementary"
+        },
+        {
+            "name": "CPU request rate",
+            "metric": {
+                "name": "cpu_core_request_per_hour"
+            },
+            "tiered_rates": [
+                {
+                    "unit": "USD",
+                    "value": 0.2,
+                    "usage_start": null,
+                    "usage_end": null
+                }
+            ],
+            "cost_type": "Supplementary"
+        },
+        {
+            "name": "Memory usage rate",
+            "metric": {
+                "name": "memory_gb_usage_per_hour"
+            },
+            "tiered_rates": [
+                {
+                    "unit": "USD",
+                    "value": 0.009,
+                    "usage_start": null,
+                    "usage_end": null
+                }
+            ],
+            "cost_type": "Supplementary"
+        },
+        {
+            "name": "Memory request rate",
+            "metric": {
+                "name": "memory_gb_request_per_hour"
+            },
+            "tiered_rates": [
+                {
+                    "unit": "USD",
+                    "value": 0.05,
+                    "usage_start": null,
+                    "usage_end": null
+                }
+            ],
+            "cost_type": "Supplementary"
+        },
+        {
+            "name": "Storage usage rate",
+            "metric": {
+                "name": "storage_gb_usage_per_month"
+            },
+            "tiered_rates": [
+                {
+                    "unit": "USD",
+                    "value": 0.01,
+                    "usage_start": null,
+                    "usage_end": null
+                }
+            ],
+            "cost_type": "Supplementary"
+        },
+        {
+            "name": "Storage request rate",
+            "metric": {
+                "name": "storage_gb_request_per_month"
+            },
+            "tiered_rates": [
+                {
+                    "unit": "USD",
+                    "value": 0.01,
+                    "usage_start": null,
+                    "usage_end": null
+                }
+            ],
+            "cost_type": "Supplementary"
+        },
+        {
+            "name": "Node cost (infrastructure)",
+            "metric": {
+                "name": "node_cost_per_month"
+            },
+            "tiered_rates": [
+                {
+                    "unit": "USD",
+                    "value": 1000,
+                    "usage_start": null,
+                    "usage_end": null
+                }
+            ],
+            "cost_type": "Infrastructure"
+        },
+        {
+            "name": "Cluster cost (infrastructure)",
+            "metric": {
+                "name": "cluster_cost_per_month"
+            },
+            "tiered_rates": [
+                {
+                    "unit": "USD",
+                    "value": 10000,
+                    "usage_start": null,
+                    "usage_end": null
+                }
+            ],
+            "cost_type": "Infrastructure"
+        }
+    ],
     "markup": {
         "value": 10,
         "unit": "percent"
