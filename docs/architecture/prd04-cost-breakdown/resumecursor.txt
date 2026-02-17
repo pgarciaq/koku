@@ -1,0 +1,44 @@
+Resume After Reboot — Cost Breakdown Development Environment
+============================================================
+
+Branches:
+  koku:    pgarciaq-prd04-cost-breakdown
+  koku-ui: pgarciaq-prd04-cost-breakdown-ui
+
+1. Start the backend (~15 seconds)
+-----------------------------------
+cd ~/dev/koku/koku
+docker compose up -d db valkey unleash koku-server masu-server koku-worker koku-beat
+sleep 15
+docker exec koku_valkey redis-cli FLUSHALL
+
+2. Verify the API
+------------------
+IDENTITY=$(echo -n '{"identity":{"account_number":"10001","org_id":"1234567","type":"User","user":{"username":"user_dev","email":"user_dev@foo.com","is_org_admin":true,"access":{}}},"entitlements":{"cost_management":{"is_entitled":true}}}' | base64 -w0)
+curl -s -H "x-rh-identity: $IDENTITY" http://localhost:8000/api/cost-management/v1/reports/openshift/costs/ | python3 -c "import json,sys; d=json.load(sys.stdin); print('API OK, total:', d['meta']['total']['cost']['total']['value'])"
+
+3. Start the frontend
+----------------------
+cd ~/dev/koku/koku-ui
+lsof -ti :9000 | xargs kill 2>/dev/null || true
+API_TOKEN=$(echo -n '{"identity":{"account_number":"10001","org_id":"1234567","type":"User","user":{"username":"user_dev","email":"user_dev@foo.com","is_org_admin":true,"access":{}}},"entitlements":{"cost_management":{"is_entitled":true}}}' | base64 -w0) npx webpack serve --config apps/koku-ui-onprem/webpack.config.ts
+
+4. Open browser
+----------------
+Navigate to http://localhost:9000/openshift/details
+Click a project (e.g. analytics, catalog, cost-management, install-test)
+Select "Distribute through cost models" in the Overhead cost dropdown
+
+What persists across reboot:
+  - PostgreSQL data (OCP usage data, cost models, manifests) — Docker volume
+  - Git commits on both branches
+
+What does NOT persist:
+  - Docker containers — restart with docker compose up -d
+  - Valkey cache — starts empty (good: no stale data)
+  - Webpack dev server — restart manually (step 3)
+  - Browser cache — hard-refresh (Ctrl+Shift+R) on first load
+
+Key gotcha:
+  After ANY backend code change: (1) docker compose restart koku-server,
+  (2) docker exec koku_valkey redis-cli FLUSHALL, (3) Ctrl+Shift+R in browser.
