@@ -42,3 +42,31 @@ What does NOT persist:
 Key gotcha:
   After ANY backend code change: (1) docker compose restart koku-server,
   (2) docker exec koku_valkey redis-cli FLUSHALL, (3) Ctrl+Shift+R in browser.
+
+Starting a New Cursor Session
+==============================
+
+Open Cursor with workspace rooted at ~/dev/koku/koku (or its parent so both
+repos are visible). Then paste this as your opening prompt:
+
+  Read the following documents to understand the project context:
+  1. ~/dev/koku/koku/AGENTS.md — backend architecture, dev environment setup
+  2. ~/dev/koku/koku-ui/AGENTS.md — frontend architecture, gotchas
+  3. ~/dev/koku/koku/docs/architecture/prd04-cost-breakdown/resumecursor.txt — resume instructions
+  4. ~/dev/koku/koku/docs/architecture/prd04-cost-breakdown/README.md — PRD
+  5. ~/dev/koku/koku/docs/architecture/prd04-cost-breakdown/DETAILED_DESIGN.md — detailed design
+  6. ~/dev/koku/koku-ui/docs/architecture/prd04-cost-breakdown/FRONTEND_PLAN.md — frontend plan
+
+  I'm working on the "Cost Breakdown for Custom Costs" feature (PRD04).
+  The backend is in ~/dev/koku/koku on branch pgarciaq-prd04-cost-breakdown.
+  The frontend is in ~/dev/koku/koku-ui on branch pgarciaq-prd04-cost-breakdown-ui.
+
+  Follow the resume instructions in resumecursor.txt to start the dev
+  environment, then [describe your next task here].
+
+Tips:
+  - AGENTS.md files are the most important — they have architecture,
+    setup, troubleshooting, and the cache-flushing gotcha.
+  - resumecursor.txt has exact copy-paste commands to get running.
+  - If you can only reference one file, point to ~/dev/koku/koku/AGENTS.md
+    — it cross-references everything else.
