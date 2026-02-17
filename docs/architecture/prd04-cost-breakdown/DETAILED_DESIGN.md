@@ -1924,6 +1924,37 @@ class BreakdownMixin:
         return breakdown_table.objects.filter(source_uuid_filter, date_filter)
 ```
 
+#### Critical: Entity Scoping in `_breakdown_query_filter`
+
+The `_breakdown_query_filter` builds a Q filter for the OCP breakdown tables.
+It must scope the query to the same entities as the main report query. This
+requires extracting entity filters from the request parameters, including
+**all operator prefixes** (`exact:`, `and:`, `or:`).
+
+The frontend breakdown page sends:
+```
+filter[exact:project]=<name>&group_by[project]=*
+```
+
+The `_apply_entity_scope()` method handles this by checking `get_group_by()`,
+`get_filter()`, `get_filter('exact:...')`, `get_filter('and:...')`, and
+`get_filter('or:...')` for each entity key (`project→namespace`,
+`node→node`, `cluster→cluster_id`). Wildcard values (`*`) are skipped.
+
+Without this scoping, `meta.total.cost.usage.breakdown` returns cluster-wide
+totals instead of per-entity values.
+
+#### Critical: Per-Row Breakdown Injection in Grouped Responses
+
+The `_walk_data_rows()` method must traverse into the `values` nesting
+present in grouped responses:
+```json
+data[].projects[] = { "project": "x", "values": [{ "cost": {...} }] }
+```
+
+The breakdown is injected into `values[0].cost`, NOT directly into the
+project-level dict (which has no `cost` key at the top level).
+
 ### 11.4 Tag Group-By Breakdown
 
 Tag group-by queries (e.g., `group_by[tag:app]=*`) already run against `OCPUsageLineItemDailySummary` because the cost summary tables lack tag data. Since the line item table has `cost_model_rate_name` (after PR 2), the breakdown for tag group-by is a secondary query on the same table with `cost_model_rate_name` added to the GROUP BY alongside the tag value. No additional tables needed. Performance overhead is minimal — same filters, same partitions, one more grouping dimension.

@@ -996,6 +996,55 @@ API_PROXY_URL=http://localhost:8000 API_TOKEN=$IDENTITY npm run start --workspac
 | API returns `403 Forbidden` | Wrong identity header | Use `account_number: "10001"`, `org_id: "1234567"` (matches test customer) |
 | Frontend proxy returns `404` | `pathRewrite` strips API prefix | Remove `pathRewrite` from `webpack.config.ts` — backend expects full `/api/cost-management/v1/` path |
 | `mc: config is not a recognized command` | Old MinIO `mc` CLI version | Use `mc alias set` instead of `mc config host add` |
+| API returns correct data but UI shows stale values | Django `cache_page` + browser HTTP cache | Flush server cache: `docker exec koku_valkey redis-cli FLUSHALL`, then hard-refresh browser (`Ctrl+Shift+R`) |
+| Breakdown values are cluster-wide instead of per-project | `_breakdown_query_filter` missing entity filter | Fixed: `_apply_entity_scope()` now checks `group_by`, `filter`, and `exact:` prefixed variants |
+
+### Cache Flushing (Important!)
+
+The Koku API uses Django `cache_page` (backed by Valkey/Redis) with a 1-hour
+default TTL. After ANY backend code change that affects API responses, you MUST:
+
+```bash
+# 1. Restart the server (picks up code changes from mounted volume)
+docker compose restart koku-server
+
+# 2. Flush the server-side cache
+docker exec koku_valkey redis-cli FLUSHALL
+
+# 3. Hard-refresh the browser (Ctrl+Shift+R) to bypass browser HTTP cache
+```
+
+Forgetting step 2 or 3 is the #1 cause of "I fixed it but it's still broken".
+
+### Resuming After a Reboot
+
+```bash
+cd ~/dev/koku/koku
+
+# Start the backend stack
+docker compose up -d db valkey unleash koku-server masu-server koku-worker koku-beat
+
+# Wait for services to be ready (~15 seconds)
+sleep 15
+
+# Flush cache to ensure fresh responses
+docker exec koku_valkey redis-cli FLUSHALL
+
+# Verify the API is responding
+IDENTITY=$(echo -n '{"identity":{"account_number":"10001","org_id":"1234567","type":"User","user":{"username":"user_dev","email":"user_dev@foo.com","is_org_admin":true,"access":{}}},"entitlements":{"cost_management":{"is_entitled":true}}}' | base64 -w0)
+curl -s -H "x-rh-identity: $IDENTITY" http://localhost:8000/api/cost-management/v1/reports/openshift/costs/ | python3 -c "import json,sys; d=json.load(sys.stdin); print('API OK, total:', d['meta']['total']['cost']['total']['value'])"
+
+# Start the frontend (on-prem mode)
+cd ~/dev/koku/koku-ui
+# Kill anything on port 9000 first
+lsof -ti :9000 | xargs kill 2>/dev/null || true
+API_TOKEN=$(echo -n '{"identity":{"account_number":"10001","org_id":"1234567","type":"User","user":{"username":"user_dev","email":"user_dev@foo.com","is_org_admin":true,"access":{}}},"entitlements":{"cost_management":{"is_entitled":true}}}' | base64 -w0) npx webpack serve --config apps/koku-ui-onprem/webpack.config.ts &
+
+# Open browser to http://localhost:9000/openshift/details
+```
+
+**Data and cost models persist** in the PostgreSQL volume across reboots —
+no need to re-ingest or re-apply cost models.
 
 ### Database Queries for Debugging
 
