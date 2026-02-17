@@ -314,3 +314,40 @@ class OCPCostQueryHandlerBreakdownTest(IamTestCase):
                 usage = cost.get("usage", {})
                 if usage.get("value", 0) > 0:
                     self.assertIn("breakdown", usage)
+
+    def test_total_breakdown_scoped_to_entity_filter(self):
+        """T7.15: meta.total.cost.usage.breakdown is scoped to the filtered entity.
+
+        When group_by[project]=<name> is specified, the breakdown sum must equal
+        the usage value for that project (not the cluster-wide total).
+        """
+        # First get all projects
+        url = reverse("reports-openshift-costs") + "?group_by[project]=*"
+        client = APIClient()
+        response = client.get(url, **self.headers)
+        data = response.json()
+
+        # Collect project names from the response
+        projects = []
+        for date_entry in data.get("data", []):
+            for proj in date_entry.get("projects", []):
+                pname = proj.get("project")
+                if pname and pname not in projects:
+                    projects.append(pname)
+
+        # For each project with non-zero usage, verify breakdown sum == usage value
+        for project in projects:
+            url = reverse("reports-openshift-costs") + f"?group_by[project]={project}"
+            response = client.get(url, **self.headers)
+            rdata = response.json()
+            usage = rdata.get("meta", {}).get("total", {}).get("cost", {}).get("usage", {})
+            usage_value = usage.get("value", 0)
+            breakdown = usage.get("breakdown", [])
+            if usage_value and breakdown:
+                breakdown_sum = sum(e.get("value", 0) for e in breakdown)
+                self.assertAlmostEqual(
+                    float(usage_value),
+                    float(breakdown_sum),
+                    delta=max(abs(float(usage_value)) * 1e-9, 0.01),
+                    msg=f"Project '{project}': usage.value ({usage_value}) != " f"sum(breakdown) ({breakdown_sum})",
+                )

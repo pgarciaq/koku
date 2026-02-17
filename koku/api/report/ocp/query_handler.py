@@ -382,7 +382,12 @@ class OCPReportQueryHandler(ReportQueryHandler):
         return group_by_value[0] if group_by_value else None
 
     def _walk_data_rows(self, data, breakdown_index, api_group_key, db_group_field, breakdown_limit):
-        """Walk the nested data structure and inject breakdown into each row's cost."""
+        """Walk the nested data structure and inject breakdown into each row's cost.
+
+        Grouped responses nest cost inside ``values``:
+        ``data[].projects[] = {project: "x", values: [{cost: {...}}]}``
+        so we must traverse into ``values`` before injecting.
+        """
         for date_entry in data:
             date_str = str(date_entry.get("date", ""))
             if api_group_key:
@@ -391,7 +396,10 @@ class OCPReportQueryHandler(ReportQueryHandler):
                     group_value = str(row.get(api_group_key, "__all__"))
                     row_entries = breakdown_index.get((date_str, group_value), [])
                     if row_entries:
-                        self._inject_into_cost_if_present(row, row_entries, breakdown_limit)
+                        for val in row.get("values", []):
+                            self._inject_into_cost_if_present(val, row_entries, breakdown_limit)
+                        if not row.get("values"):
+                            self._inject_into_cost_if_present(row, row_entries, breakdown_limit)
             else:
                 row_entries = breakdown_index.get((date_str, "__all__"), [])
                 if row_entries:
