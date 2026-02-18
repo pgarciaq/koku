@@ -36,6 +36,7 @@ Cloud Providers --> [AWS CUR / Azure API / GCP BigQuery] ------> Koku Backend (C
 3. **OCI is deprecated/removed** — do not implement OCI support.
 4. **Feature flags** (Unleash): Only gate features behind flags when explicitly required.
 5. **Supported providers**: AWS, Azure, GCP, OpenShift (and OCP-on-cloud: OCP_AWS, OCP_Azure, OCP_GCP).
+6. **Default to on-prem mode**: Unless explicitly told otherwise, always start Cost Management services (koku-server, masu-server, koku-worker, koku-beat, etc.) with `ONPREM=True`. This uses the PostgreSQL-only code path and avoids requiring Trino, Hive Metastore, or other cloud-only infrastructure. In practice this means exporting `ONPREM=True` before running `docker compose up` (e.g. `export ONPREM=True && export USER_ID=$(id -u) && export GROUP_ID=$(id -g) && docker compose up -d ...`). Without this flag the ingestion pipeline will fail trying to connect to Trino.
 
 ---
 
