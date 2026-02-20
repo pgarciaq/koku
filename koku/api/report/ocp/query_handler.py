@@ -16,6 +16,7 @@ from django.db.models import CharField
 from django.db.models import DecimalField
 from django.db.models import F
 from django.db.models import Max
+from django.db.models import Q
 from django.db.models import Sum
 from django.db.models import Value
 from django.db.models import When
@@ -265,14 +266,51 @@ class OCPReportQueryHandler(ReportQueryHandler):
         except KeyError:
             return breakdown_views.get(self._report_type, {}).get("default")
 
+    @cached_property
+    def _breakdown_query_filter(self):
+        """Build a simplified Q filter for breakdown tables.
+
+        Breakdown tables carry a limited set of columns compared to the main
+        report tables — they lack tag, label, and many filter dimensions.
+        We therefore build the filter from scratch using only fields that are
+        guaranteed to exist: ``usage_start``, ``source_uuid``, and
+        entity-scoping columns when present on the selected table.
+        """
+        q = Q(
+            usage_start__gte=self.start_datetime.date(),
+            usage_start__lte=self.end_datetime.date(),
+        )
+        source_filter = self.parameters.get_filter("source")
+        if source_filter:
+            q &= Q(source_uuid__in=source_filter)
+
+        breakdown_table = self._breakdown_table
+        if not breakdown_table:
+            return q
+
+        valid_fields = {f.name for f in breakdown_table._meta.get_fields()}
+        entity_map = {
+            "project": "namespace",
+            "node": "node",
+            "cluster": "cluster_id",
+        }
+        for api_key, db_field in entity_map.items():
+            if db_field not in valid_fields:
+                continue
+            collected = list(self.parameters.get_group_by(api_key) or [])
+            collected.extend(self.parameters.get_filter(api_key) or [])
+            collected.extend(self.parameters.get_filter(f"exact:{api_key}") or [])
+            values = [v for v in set(collected) if v and v != "*"]
+            if values:
+                q &= Q(**{f"{db_field}__in": values})
+        return q
+
     def _query_breakdown_aggregate(self, breakdown_table, extra_group_fields=None):
         """Query the breakdown table and aggregate by rate type and name.
 
         Returns a QuerySet of dicts with total_cost, total_distributed, etc.
         """
-        breakdown_qs = breakdown_table.objects.filter(self.query_filter)
-        if self.query_exclusions:
-            breakdown_qs = breakdown_qs.exclude(self.query_exclusions)
+        breakdown_qs = breakdown_table.objects.filter(self._breakdown_query_filter)
 
         group_fields = ["cost_model_rate_type", "cost_model_rate_name"]
         if extra_group_fields:
@@ -321,9 +359,7 @@ class OCPReportQueryHandler(ReportQueryHandler):
         if group_by_field:
             extra_group.append(group_by_field)
 
-        breakdown_qs = breakdown_table.objects.filter(self.query_filter)
-        if self.query_exclusions:
-            breakdown_qs = breakdown_qs.exclude(self.query_exclusions)
+        breakdown_qs = breakdown_table.objects.filter(self._breakdown_query_filter)
 
         qs_fields = ["cost_model_rate_type", "cost_model_rate_name"]
         annotate_fields = {
@@ -547,9 +583,7 @@ class OCPReportQueryHandler(ReportQueryHandler):
                     data = [{"date": date_string, "vm_names": query_data}]
                 elif self.parameters.get("breakdown_limit") is not None and self._breakdown_table:
                     csv_breakdown_table = self._breakdown_table
-                    csv_query = csv_breakdown_table.objects.filter(self.query_filter)
-                    if self.query_exclusions:
-                        csv_query = csv_query.exclude(self.query_exclusions)
+                    csv_query = csv_breakdown_table.objects.filter(self._breakdown_query_filter)
                     csv_query = csv_query.annotate(**self.annotations)
                     csv_group_by = query_group_by + ["cost_model_rate_name"]
                     csv_data = csv_query.values(*csv_group_by).annotate(
