@@ -233,7 +233,7 @@ class OCPReportQueryHandler(ReportQueryHandler):
             output["delta"] = self.query_delta
 
         breakdown_table = self._breakdown_table
-        if breakdown_table and not self.is_csv_output:
+        if breakdown_table and not self.is_csv_output and self._breakdown_query_filter is not None:
             breakdown_limit = self.parameters.get("breakdown_limit")
             with tenant_context(self.tenant):
                 self._attach_total_breakdown(output, breakdown_table, breakdown_limit)
@@ -267,6 +267,25 @@ class OCPReportQueryHandler(ReportQueryHandler):
             return breakdown_views.get(self._report_type, {}).get("default")
 
     @cached_property
+    def _has_unscopeable_tag_filters(self):
+        """Return True when the request narrows by tag values that breakdown tables cannot represent.
+
+        Breakdown tables have no tag columns, so any tag-based filter or
+        group_by with a specific (non-``*``) value would scope the main query
+        but not the breakdown query — leading to misleading totals.
+        """
+        for key, values in (self.parameters.get("filter") or {}).items():
+            base = key.replace("exact:", "").replace("and:", "").replace("or:", "")
+            if base.startswith("tag:"):
+                if any(v and v != "*" for v in (values if isinstance(values, list) else [values])):
+                    return True
+        for key, values in (self.parameters.get("group_by") or {}).items():
+            if key.startswith("tag:"):
+                if any(v and v != "*" for v in (values if isinstance(values, list) else [values])):
+                    return True
+        return False
+
+    @cached_property
     def _breakdown_query_filter(self):
         """Build a simplified Q filter for breakdown tables.
 
@@ -275,7 +294,15 @@ class OCPReportQueryHandler(ReportQueryHandler):
         We therefore build the filter from scratch using only fields that are
         guaranteed to exist: ``usage_start``, ``source_uuid``, and
         entity-scoping columns when present on the selected table.
+
+        Returns ``None`` when the request contains tag-based filters that
+        cannot be represented on the breakdown table (see
+        ``_has_unscopeable_tag_filters``).  Callers must treat ``None`` as
+        "breakdown is not applicable for this request".
         """
+        if self._has_unscopeable_tag_filters:
+            return None
+
         q = Q(
             usage_start__gte=self.start_datetime.date(),
             usage_start__lte=self.end_datetime.date(),
@@ -581,7 +608,11 @@ class OCPReportQueryHandler(ReportQueryHandler):
                 if self._report_type == "virtual_machines":
                     date_string = self.date_to_string(self.time_interval[0])
                     data = [{"date": date_string, "vm_names": query_data}]
-                elif self.parameters.get("breakdown_limit") is not None and self._breakdown_table:
+                elif (
+                    self.parameters.get("breakdown_limit") is not None
+                    and self._breakdown_table
+                    and self._breakdown_query_filter is not None
+                ):
                     csv_breakdown_table = self._breakdown_table
                     csv_query = csv_breakdown_table.objects.filter(self._breakdown_query_filter)
                     csv_query = csv_query.annotate(**self.annotations)

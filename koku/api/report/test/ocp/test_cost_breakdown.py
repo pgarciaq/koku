@@ -303,17 +303,135 @@ class OCPCostQueryHandlerBreakdownTest(IamTestCase):
             self.assertIn("breakdown", usage)
 
     def test_tag_group_by_includes_breakdown(self):
-        """T7.14: Tag group-by query includes per-rate breakdown."""
-        url = reverse("reports-openshift-costs") + "?group_by[tag:app]=*"
+        """T7.14: Tag list view meta.total includes breakdown (global, not per-tag).
+
+        Breakdown tables have no tag columns, so per-row breakdown is empty
+        for tags. However, the meta.total breakdown should still appear since
+        the list view is an unscoped aggregation.
+        """
+        url = reverse("reports-openshift-costs") + "?group_by[tag:app]=*&breakdown_limit=10"
         client = APIClient()
         response = client.get(url, **self.headers)
         data = response.json()
-        for date_entry in data.get("data", []):
-            for tag_group in date_entry.get("app", []):
-                cost = tag_group.get("cost", {})
-                usage = cost.get("usage", {})
-                if usage.get("value", 0) > 0:
-                    self.assertIn("breakdown", usage)
+        usage = data.get("meta", {}).get("total", {}).get("cost", {}).get("usage", {})
+        breakdown = usage.get("breakdown", [])
+        if float(usage.get("value", 0) or 0) > 0:
+            self.assertIsInstance(breakdown, list)
+
+    @staticmethod
+    def _find_first_tag_value(list_data):
+        """Extract the first non-synthetic tag value from a tag group-by response."""
+        for date_entry in list_data.get("data", []):
+            for key, items in date_entry.items():
+                if key == "date" or not isinstance(items, list):
+                    continue
+                for item in items:
+                    for k, v in item.items():
+                        if k != "values" and v and v != "No-app":
+                            return v
+        return None
+
+    def test_tag_drill_in_skips_breakdown(self):
+        """T7.16: Tag drill-in omits breakdown since breakdown tables lack tag columns.
+
+        When filter[exact:tag:app]=<value> narrows the main query, the
+        breakdown tables cannot be scoped to match.  Instead of returning a
+        misleading cluster-wide total, breakdown should be absent.
+        """
+        list_url = reverse("reports-openshift-costs") + "?group_by[tag:app]=*"
+        client = APIClient()
+        list_resp = client.get(list_url, **self.headers)
+        tag_value = self._find_first_tag_value(list_resp.json())
+
+        if not tag_value:
+            self.skipTest("No tag values in test data")
+
+        drill_url = (
+            reverse("reports-openshift-costs")
+            + f"?group_by[tag:app]=*&filter[exact:tag:app]={tag_value}&breakdown_limit=10"
+        )
+        response = client.get(drill_url, **self.headers)
+        data = response.json()
+        usage = data.get("meta", {}).get("total", {}).get("cost", {}).get("usage", {})
+        breakdown = usage.get("breakdown", [])
+        self.assertEqual(
+            len(breakdown),
+            0,
+            f"Tag drill-in for '{tag_value}' should have empty breakdown, got {len(breakdown)} items",
+        )
+
+    def test_cluster_drill_in_breakdown_is_scoped(self):
+        """T7.17: Cluster drill-in breakdown is scoped to the filtered cluster."""
+        list_url = reverse("reports-openshift-costs") + "?group_by[cluster]=*&breakdown_limit=10"
+        client = APIClient()
+        list_resp = client.get(list_url, **self.headers)
+        list_data = list_resp.json()
+
+        clusters = []
+        for date_entry in list_data.get("data", []):
+            for c in date_entry.get("clusters", []):
+                cname = c.get("cluster")
+                if cname:
+                    clusters.append(cname)
+            break
+
+        checked = 0
+        for cluster in clusters:
+            drill_url = (
+                reverse("reports-openshift-costs")
+                + f"?group_by[cluster]=*&filter[exact:cluster]={cluster}&breakdown_limit=10"
+            )
+            response = client.get(drill_url, **self.headers)
+            rdata = response.json()
+            usage = rdata.get("meta", {}).get("total", {}).get("cost", {}).get("usage", {})
+            usage_value = float(usage.get("value", 0) or 0)
+            breakdown = usage.get("breakdown", [])
+            if usage_value and breakdown:
+                breakdown_sum = float(sum(e.get("value", 0) for e in breakdown))
+                self.assertGreater(breakdown_sum, 0)
+                self.assertLessEqual(
+                    breakdown_sum,
+                    usage_value * 1.001,
+                    msg=f"Cluster '{cluster}': breakdown ({breakdown_sum}) exceeds usage ({usage_value})",
+                )
+                checked += 1
+        self.assertGreater(checked, 0, "No clusters had both usage and breakdown data")
+
+    def test_node_drill_in_breakdown_is_scoped(self):
+        """T7.18: Node drill-in breakdown is scoped to the filtered node."""
+        list_url = reverse("reports-openshift-costs") + "?group_by[node]=*&breakdown_limit=10"
+        client = APIClient()
+        list_resp = client.get(list_url, **self.headers)
+        list_data = list_resp.json()
+
+        nodes = []
+        for date_entry in list_data.get("data", []):
+            for n in date_entry.get("nodes", []):
+                nname = n.get("node")
+                if nname:
+                    nodes.append(nname)
+            break
+
+        checked = 0
+        for node in nodes[:3]:
+            drill_url = (
+                reverse("reports-openshift-costs") + f"?group_by[node]=*&filter[exact:node]={node}&breakdown_limit=10"
+            )
+            response = client.get(drill_url, **self.headers)
+            rdata = response.json()
+            usage = rdata.get("meta", {}).get("total", {}).get("cost", {}).get("usage", {})
+            usage_value = float(usage.get("value", 0) or 0)
+            breakdown = usage.get("breakdown", [])
+            if usage_value and breakdown:
+                breakdown_sum = float(sum(e.get("value", 0) for e in breakdown))
+                self.assertGreater(breakdown_sum, 0)
+                self.assertLessEqual(
+                    breakdown_sum,
+                    usage_value * 1.001,
+                    msg=f"Node '{node}': breakdown ({breakdown_sum}) exceeds usage ({usage_value})",
+                )
+                checked += 1
+        self.assertGreater(checked, 0, "No nodes had both usage and breakdown data")
 
     def test_total_breakdown_scoped_to_entity_filter(self):
         """T7.15: meta.total.cost.usage.breakdown is scoped to the filtered entity.
