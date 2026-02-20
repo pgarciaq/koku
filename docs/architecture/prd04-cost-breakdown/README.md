@@ -6,9 +6,7 @@ Provide a detailed cost breakdown in the Sankey diagram using concepts and items
 
 ## Who Is Asking for It?
 
-Many customers.
-
-Design validated by Pau with a customer on 12/15/2025.
+Many customers. Design validated by Pau with a customer on 12/15/2025.
 
 ## Who Is It For?
 
