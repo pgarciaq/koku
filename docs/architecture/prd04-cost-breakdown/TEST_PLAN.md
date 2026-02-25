@@ -2129,3 +2129,5 @@ E2E tests (T-E2E.1–T-E2E.4)      → full pipeline verification
 | PR 8 | 3 | SQL file content verification |
 | E2E | 4 | Full pipeline, backward compat |
 | **Total** | **79** | |
+
+**Note:** In addition to the 79 backend tests above, the frontend has 49 tests documented in the [Frontend Test Plan](../../../koku-ui/docs/architecture/prd04-cost-breakdown/TEST_PLAN.md), including 17 tests for the new "Cost details" tree table component (`costDetails.test.tsx`) covering loading states, tree hierarchy, zero-value rows, percentage calculations, expand/collapse, and duplicate rate name handling.

@@ -45,6 +45,8 @@ That was confusing so with COST-5852 we evolved that into the current Sankey dia
 
 The Sankey adds a new layer of detail on the left side, breaking down each cost category into its constituent rate names (Phase 1) and cloud services (Phase 2). The flow direction matches the existing chart: parts compose into aggregates left-to-right.
 
+In addition, a **"Cost details" tab** in the OpenShift breakdown page presents the same breakdown data as a PatternFly tree table, providing an accessible, tabular alternative to the Sankey diagram. The tree hierarchy mirrors the Sankey structure (Total cost → Project / Overhead → cost categories → per-rate entries) with columns for Name, Cost, and % of cost.
+
 **Phase 1 (rate names):** Usage cost and each overhead type get a breakdown layer:
 
 ```
@@ -658,6 +660,7 @@ For the common case where a user has exactly one rate per resource type (one CPU
 - [ ] Sankey diagram renders individual rate names as new nodes on the left side, flowing into the existing cost category nodes (usage, overhead types). The flow direction is parts-to-total (left-to-right), consistent with the current chart.
 - [ ] Overhead types (platform distributed, worker unallocated, etc.) receive flow from constituent rate name nodes on the left side.
 - [ ] The `raw`, `markup`, and `credit` nodes remain unchanged (no breakdown sub-layer in Phase 1).
+- [ ] A new "Cost details" tab in the OpenShift breakdown page renders the same breakdown data as a PatternFly tree table, providing an accessible, tabular alternative to the Sankey diagram. The tree hierarchy mirrors the Sankey structure: Total cost → Project (All other costs) / Overhead cost → cost categories → per-rate breakdown entries. Columns: Name (with expand/collapse and category icon), Cost, % of cost. All rows shown (including zero-value), fully expanded by default, with a loading skeleton while data is fetched.
 
 ### Phase 2 (COST-4415)
 

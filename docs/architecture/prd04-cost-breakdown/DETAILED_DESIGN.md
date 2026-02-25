@@ -22,10 +22,11 @@
 11. [PR 7: API Layer — Provider Map, Query Handler, Serializers](#11-pr-7-api-layer--provider-map-query-handler-serializers)
 12. [PR 8: Trino and Self-Hosted SQL Paths](#12-pr-8-trino-and-self-hosted-sql-paths)
 13. [Cross-Cutting Concerns](#13-cross-cutting-concerns)
-14. [Phase 2 Notes (COST-4415)](#14-phase-2-notes-cost-4415)
-15. [Testing Strategy](#15-testing-strategy) *(expanded with practical implementation guidance)*
-16. [Migration and Rollback Plan](#16-migration-and-rollback-plan)
-17. [Open Questions and Decisions](#17-open-questions-and-decisions)
+14. [Frontend: Cost Details Tree Table](#14-frontend-cost-details-tree-table)
+15. [Phase 2 Notes (COST-4415)](#15-phase-2-notes-cost-4415)
+16. [Testing Strategy](#16-testing-strategy) *(expanded with practical implementation guidance)*
+17. [Migration and Rollback Plan](#17-migration-and-rollback-plan)
+18. [Open Questions and Decisions](#18-open-questions-and-decisions)
 
 ---
 
@@ -61,7 +62,7 @@ This document describes the technical design for the "Cost Breakdown for Custom 
 - New breakdown summary tables for cluster, project, node, and VM perspectives
 - API response extension with `breakdown` array on cost categories
 - Pre-computed per-rate overhead breakdown via distribution SQL (not query-time approximation)
-- Frontend: cost model editor `name` field, Sankey diagram per-rate nodes
+- Frontend: cost model editor `name` field, Sankey diagram per-rate nodes, "Cost details" tree table tab
 
 ### Out of Scope (Phase 1)
 
@@ -2160,7 +2161,113 @@ The breakdown data follows the same permission model as the existing cost data. 
 
 ---
 
-## 14. Phase 2 Notes (COST-4415)
+## 14. Frontend: Cost Details Tree Table
+
+In addition to the Sankey diagram (which visualizes cost flow), a **"Cost details" tab** has been implemented in the OpenShift breakdown page. This provides an accessible, tabular alternative to the Sankey chart, presenting the same breakdown data as a PatternFly tree table.
+
+### 14.1 Motivation
+
+The Sankey diagram excels at showing flow relationships but can be difficult to scan for exact dollar amounts and percentages. The tree table addresses this by presenting the same hierarchical breakdown in a structured, sortable format that is easier to audit and accessible to screen readers.
+
+### 14.2 Tab Placement
+
+The "Cost details" tab is positioned between "Cost overview" and "Historical data" in the OpenShift breakdown page. It is conditionally rendered — `breakdownBase.tsx` only adds the tab when a `costDetailsComponent` prop is provided, so non-OCP breakdown pages are unaffected.
+
+### 14.3 Component: `CostDetails`
+
+**File:** `routes/details/ocpBreakdown/costDetails.tsx`
+
+The `CostDetails` component is a React functional component wrapped with `injectIntl`. It receives the following props:
+
+| Prop | Type | Source |
+|------|------|--------|
+| `costDistribution` | `string` | Redux `mapStateToProps` in `ocpBreakdown.tsx` |
+| `currency` | `string` | Redux `mapStateToProps` |
+| `report` | `Report` | Redux — same report fetched for the Sankey chart |
+| `reportFetchStatus` | `FetchStatus` | Redux — tracks API call state |
+
+**Data source:** The component reads `report.meta.total.cost` — the exact same data object the Sankey chart consumes. No additional API call is made.
+
+### 14.4 Tree Hierarchy
+
+The tree always shows the full hierarchy regardless of the cost distribution setting:
+
+```
+Total cost                              (MoneyBillIcon)
+├── Project (All other costs)           (OpenshiftIcon)
+│   ├── Raw cost                        (CogsIcon)
+│   ├── Markup                          (PercentIcon)
+│   ├── Usage cost                      (TachometerAltIcon)
+│   │   ├── CPU charge                  (leaf — from usage.breakdown)
+│   │   ├── Memory charge               (leaf)
+│   │   └── ...
+│   └── Credit                          (CreditCardIcon — conditional, only when cost.credit exists)
+└── Overhead cost                       (InfrastructureIcon)
+    ├── GPU unallocated                 (MicrochipIcon)
+    ├── Network unattributed            (NetworkIcon)
+    ├── Platform distributed            (ClusterIcon)
+    │   ├── Node monthly                (leaf — from platform_distributed.breakdown)
+    │   ├── Cloud cost                  (leaf)
+    │   └── ...
+    ├── Storage unattributed            (StorageDomainIcon)
+    └── Worker unallocated              (ServerIcon)
+        ├── Worker rate                 (leaf — from worker_unallocated_distributed.breakdown)
+        └── ...
+```
+
+### 14.5 Table Columns
+
+| Column | Width | Content |
+|--------|-------|---------|
+| Name | 50% | Node name with PatternFly tree expand/collapse toggle and category icon |
+| Cost | 25% | Formatted currency value via `formatCurrency(value, units)` |
+| % of cost | 25% | `(value / totalCost * 100).toFixed(2)%` — relative to the root "Total cost" node |
+
+### 14.6 Key Behaviors
+
+- **Fully expanded by default:** A `useEffect` collects all parent node IDs on first render and sets them as expanded.
+- **All rows shown:** Zero-value rows (e.g., GPU unallocated = $0.00) are always visible.
+- **Unique IDs for duplicate rate names:** Breakdown entry IDs are prefixed with the parent category ID (`${parentId}--${entry.name}-${idx}`) to prevent React key collisions when the same rate name appears under multiple cost categories.
+- **Expand/collapse toggle:** Only rendered on nodes with children (`childCount > 0` via PatternFly's `aria-setsize` prop).
+- **Loading skeleton:** When `reportFetchStatus === FetchStatus.inProgress` or `report` is undefined/null, a series of `Skeleton` components is rendered.
+- **No checkboxes:** The tree table is read-only; no row selection.
+
+### 14.7 Implementation Pattern
+
+The component uses a two-phase data transformation:
+
+1. **`tree` memo:** Builds a hierarchical `TreeNode[]` from `report.meta.total.cost`, assigning i18n names, icons, and breakdown children for each cost category.
+2. **`flatRows` memo:** Flattens the tree into a linear `FlatRow[]` array with PatternFly tree table ARIA attributes (`aria-level`, `aria-posinset`, `aria-setsize`, `isExpanded`, `isHidden`).
+
+Collapse/expand is managed via a `Set<string>` of expanded node IDs in React state.
+
+### 14.8 Files Modified
+
+| File | Change |
+|------|--------|
+| `routes/details/ocpBreakdown/costDetails.tsx` | New file — `CostDetails` component |
+| `routes/details/ocpBreakdown/costDetails.test.tsx` | New file — 17 unit tests |
+| `routes/details/ocpBreakdown/ocpBreakdown.tsx` | Passes `costDetailsComponent` prop with `<CostDetails>` instance |
+| `routes/details/components/breakdown/breakdownBase.tsx` | Added `costDetails` to `BreakdownTab` enum and tab rendering logic |
+| `locales/messages.ts` | Added `breakdownCostDetailsTitle` and `breakdownCostDetailsPercentColumn` messages |
+
+### 14.9 Test Coverage
+
+17 unit tests in `costDetails.test.tsx` covering:
+
+| Category | Tests | What is verified |
+|----------|-------|-----------------|
+| Loading state | 2 | Skeleton rendering during fetch and when report is undefined |
+| Tree structure | 7 | Root node, grouping nodes, all cost categories, per-rate breakdown entries, conditional Credit node |
+| Zero-value rows | 1 | Zero-value categories remain visible |
+| Percentage column | 2 | 100% for total, 0% when total is zero |
+| Expand/collapse | 3 | Default expansion, collapse hides children, re-expand shows children |
+| No breakdown | 1 | Graceful rendering when breakdown arrays are absent |
+| Duplicate rate names | 1 | Same rate name under different categories renders as separate rows |
+
+---
+
+## 15. Phase 2 Notes (COST-4415)
 
 Phase 2 adds cloud service breakdown for raw cost. Here's a brief sketch of the required changes:
 
@@ -2212,9 +2319,9 @@ The `breakdown` array gains `"source": "service"` entries alongside `"source": "
 
 ---
 
-## 15. Testing Strategy
+## 16. Testing Strategy
 
-### 15.1 Test Infrastructure
+### 16.1 Test Infrastructure
 
 **Database requirement:** Tests need PostgreSQL 16 on `localhost:15432` (user `postgres`, password `postgres`). Start it before running tests:
 
@@ -2234,7 +2341,7 @@ tox -e py311 -- masu.test.database.test_cost_breakdown_usage
 cd koku && pipenv run python koku/manage.py test masu.test.database.test_cost_breakdown_usage --no-input -v 2
 ```
 
-### 15.2 Test Base Classes
+### 16.2 Test Base Classes
 
 | Class | Module | Use When |
 |-------|--------|----------|
@@ -2243,7 +2350,7 @@ cd koku && pipenv run python koku/manage.py test masu.test.database.test_cost_br
 
 Both classes provide `self.dh` (DateHelper) for date ranges.
 
-### 15.3 Mocking Requirements
+### 16.3 Mocking Requirements
 
 External services are unavailable in unit tests. **Always mock these at the import location, not the definition location:**
 
@@ -2283,7 +2390,7 @@ class CostBreakdownE2ETest(IamTestCase):
         self.addCleanup(unleash_patch.stop)
 ```
 
-### 15.4 Test Data and Fixture Requirements
+### 16.4 Test Data and Fixture Requirements
 
 **Seeded test data:** `KokuTestRunner.setup_databases()` seeds providers, report periods, daily summary rows, and cost models via `ModelBakeryDataLoader`. OCP cluster IDs: `"OCP-on-Prem"`, `"OCP-on-AWS"`, `"OCP-on-Azure"`, `"OCP-on-GCP"`.
 
@@ -2336,7 +2443,7 @@ with schema_context(self.schema):
 
 The same applies to "Storage unattributed", "Network unattributed", and "GPU unallocated" distribution tests if those namespaces are not in the test fixtures.
 
-### 15.5 Known Behavioral Gotchas
+### 16.5 Known Behavioral Gotchas
 
 **`cluster_cost_per_hour` produces legitimate zero-cost rows:** The `usage_costs.sql` distributes `cluster_cost_per_hour` proportional to node CPU/memory usage. Rows on nodes with no `pod_effective_usage` (e.g., GPU-only nodes, storage `data_source` rows) get zero `cost_model_cpu_cost` and `cost_model_memory_cost`. This is correct behavior — do NOT weaken assertions to accept these as failures. Instead, assert that **at least some rows** have non-zero costs:
 
@@ -2355,7 +2462,7 @@ self.assertTrue(
 
 **`ForeignKey` to `TenantAPIProvider`:** `OCPUsageReportPeriod.provider` is a FK to `TenantAPIProvider` (tenant-scoped), NOT to `Provider` (public). Filter with `provider_id=uuid`, not `provider=provider_instance`.
 
-### 15.6 Test Database Debugging
+### 16.6 Test Database Debugging
 
 When tests fail, inspect the database directly:
 
@@ -2377,7 +2484,7 @@ WHERE cost_model_rate_type = 'platform_distributed'
 GROUP BY cost_model_rate_name;
 ```
 
-### 15.7 Unit Tests
+### 16.7 Unit Tests
 
 | Component | Test Focus |
 |-----------|------------|
@@ -2391,7 +2498,7 @@ GROUP BY cost_model_rate_name;
 | Breakdown summary SQL | Correct GROUP BY including `cost_model_rate_name`, row counts match `rate_type × rate_name × entity` |
 | Query handler | Breakdown query, overhead breakdown from pre-computed distribution, `_apply_breakdown_limit` top-N |
 
-### 15.8 Integration Tests
+### 16.8 Integration Tests
 
 | Scenario | Verification |
 |----------|-------------|
@@ -2411,7 +2518,7 @@ GROUP BY cost_model_rate_name;
 | Existing API response unchanged | All existing fields/values identical when `breakdown` not requested |
 | CSV with breakdown | `cost_model_rate_name` appears as flat column, rows expanded per rate name |
 
-### 15.9 Concrete Test Files (Phase 1)
+### 16.9 Concrete Test Files (Phase 1)
 
 | Test File | PR Coverage | Key Tests |
 |-----------|-------------|-----------|
@@ -2421,7 +2528,7 @@ GROUP BY cost_model_rate_name;
 | `koku/masu/test/database/test_cost_breakdown_distribution.py` | PR 5 | Platform/worker distribution tracks `cost_model_rate_name`, sum-to-zero validation |
 | `koku/api/report/test/ocp/test_cost_breakdown_e2e.py` | PRs 6-7 | Full pipeline: cost model → cost application → breakdown summary → API response with `breakdown` array |
 
-### 15.10 Performance Tests
+### 16.10 Performance Tests
 
 | Scenario | Metric | Threshold |
 |----------|--------|-----------|
@@ -2432,9 +2539,9 @@ GROUP BY cost_model_rate_name;
 
 ---
 
-## 16. Migration and Rollback Plan
+## 17. Migration and Rollback Plan
 
-### 16.1 Forward Migration
+### 17.1 Forward Migration
 
 1. **PR 1** merges: Data migration populates `name` on existing rates. API accepts `name` on create/update.
 2. **PR 2** merges: `cost_model_rate_name` column added (NULL, no data yet). No behavioral change.
@@ -2444,7 +2551,7 @@ GROUP BY cost_model_rate_name;
 6. **PR 7** merges: API returns `breakdown` array. For projects not yet re-processed, `breakdown` is empty.
 7. **PR 8** merges: Trino and self-hosted paths also write `cost_model_rate_name`.
 
-### 16.2 Backfill Strategy
+### 17.2 Backfill Strategy
 
 After all PRs merge, historical data needs re-processing to populate `cost_model_rate_name`.
 
@@ -2466,7 +2573,7 @@ After all PRs merge, historical data needs re-processing to populate `cost_model
 
 **Timing:** For a deployment with ~1000 providers, this batch job may take several hours. It should be run during a maintenance window or off-peak period. Progress can be monitored via Celery flower or log aggregation.
 
-### 16.3 Rollback
+### 17.3 Rollback
 
 Each PR can be reverted independently:
 - **PR 7 revert**: API stops returning `breakdown`. No data loss.
@@ -2478,7 +2585,7 @@ Each PR can be reverted independently:
 
 ---
 
-## 17. Decisions Log
+## 18. Decisions Log
 
 All questions have been resolved. This section serves as a decision record.
 
@@ -2505,3 +2612,5 @@ All questions have been resolved. This section serves as a decision record.
 | 19 | Breakdown table selection by group-by | Use `self._mapper.breakdown_views` — a parallel dict to `self.views` that maps `(report_type, group_by_tuple) → breakdown_table`. Resolved via `_get_breakdown_table()` using the same group-by logic as existing table selection. This ensures node group-by gets `OCPCostBreakdownByNodeP` (which has the `node` column), not `OCPCostBreakdownP`. |
 | 20 | `breakdown_limit` applied to per-row data | Yes. The same `breakdown_limit` (top-N with "Other" aggregation) is applied to both the total breakdown and each per-row breakdown, for consistency. Passed through `_attach_breakdown_to_data_rows()` → `_inject_breakdown_into_cost()`. |
 | 21 | `rate_name` default: `None` vs `""` | Use `None` (→ SQL `NULL`), not `""` (→ SQL `''`). The column is `TextField(null=True)` and cloud-sourced costs naturally have `NULL`. PostgreSQL treats `NULL` and `''` as different `GROUP BY` buckets. Using `None` keeps all unnamed rows in one bucket. JinjaSql + psycopg2 correctly translates Python `None` to SQL `NULL`. |
+| 22 | Cost Details tree table — separate tab vs. inline | Separate "Cost details" tab between "Cost overview" and "Historical data". Provides accessible tabular alternative to the Sankey without cluttering the overview. Same data source (`report.meta.total.cost`), no extra API call. Tree always shows full hierarchy regardless of cost distribution setting. |
+| 23 | Cost Details tree table — always expanded by default | All parent nodes expanded on initial render. Users see the full breakdown immediately without clicking. Collapse is supported for focus, but the default is maximum visibility. |
