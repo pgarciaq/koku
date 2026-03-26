@@ -22,7 +22,7 @@ class TestROSReportShipperCustomTimeframes(TestCase):
             request_id="req-1",
             manifest=cls.manifest,
             source_id="1",
-            provider_uuid="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            provider_uuid="12345678-1234-4234-a234-123456789abc",
             provider_type="OCP",
             cluster_alias="test-alias",
             account_id="10001",

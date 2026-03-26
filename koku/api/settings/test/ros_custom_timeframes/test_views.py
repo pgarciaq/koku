@@ -2,6 +2,8 @@
 # Copyright 2021 Red Hat Inc.
 # SPDX-License-Identifier: Apache-2.0
 #
+from unittest.mock import patch
+
 from django_tenants.utils import schema_context
 from rest_framework import status
 from rest_framework.test import APIClient
@@ -82,15 +84,15 @@ class TestROSCustomTimeframesView(IamTestCase):
         self.assertEqual(bh["timezone"], "America/New_York")
         self.assertEqual(bh["weekdays"], [1, 2, 3, 4, 5])
 
-    def test_non_admin_rejected(self):
-        """Non-admin users get 403 on PUT."""
-        self.client.force_authenticate(user=None)
+    @patch("api.settings.views.SettingsAccessPermission.has_permission", return_value=False)
+    def test_non_admin_rejected(self, _mock_perm):
+        """Non-admin users get 403 on PUT when SettingsAccessPermission denies."""
         payload = {
             "terms": [{"name": "term1", "duration_days": 5}],
             "business_hours": {"enabled": False},
         }
-        response = self.client.put(self.url, data=payload, format="json")
-        self.assertIn(response.status_code, [status.HTTP_401_UNAUTHORIZED, status.HTTP_403_FORBIDDEN])
+        response = self.client.put(self.url, data=payload, format="json", **self.headers)
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
 
     def test_put_replaces_full_config(self):
         """PUT 3 terms then PUT 1 term: GET returns only 1 term, not merged."""
