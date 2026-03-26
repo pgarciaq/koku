@@ -127,6 +127,7 @@ class TestROSReportShipper(TestCase):
                 "cluster_uuid": self.cluster_id,
                 "operator_version": self.manifest.operator_version,
                 "cluster_alias": self.cluster_alias,
+                "custom_timeframes": None,
             },
             "files": ["report1_url"],
             "object_keys": ["path1"],

@@ -20,6 +20,9 @@ from rest_framework.views import APIView
 from api.common.pagination import ListPaginator
 from api.common.permissions.settings_access import SettingsAccessPermission
 from api.provider.models import Provider
+from api.settings.ros_custom_timeframes import get_ros_custom_timeframes
+from api.settings.ros_custom_timeframes import ROSCustomTimeframesSerializer
+from api.settings.ros_custom_timeframes import set_ros_custom_timeframes
 from api.settings.serializers import UserSettingSerializer
 from api.settings.serializers import UserSettingUpdateCostTypeSerializer
 from api.settings.serializers import UserSettingUpdateCurrencySerializer
@@ -113,3 +116,23 @@ class UserCostTypeSettings(APIView):
     def get(self, request):
         """Gets a list for all supported cost_typs currently available."""
         return ListPaginator(COST_TYPES, request).paginated_response
+
+
+class ROSCustomTimeframesView(APIView):
+    """Settings for ROS custom timeframes (per tenant)."""
+
+    permission_classes = [SettingsAccessPermission]
+
+    @method_decorator(never_cache)
+    def get(self, request):
+        schema_name = request.user.customer.schema_name
+        config = get_ros_custom_timeframes(schema_name)
+        return ListPaginator([config], request).get_paginated_response([config])
+
+    @method_decorator(never_cache)
+    def put(self, request):
+        serializer = ROSCustomTimeframesSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        set_ros_custom_timeframes(request.user.customer.schema_name, serializer.validated_data)
+        invalidate_view_cache_for_tenant_and_all_source_types(request.user.customer.schema_name)
+        return Response(status=status.HTTP_204_NO_CONTENT)

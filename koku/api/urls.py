@@ -88,6 +88,7 @@ from api.views import OCPVirtualMachinesView
 from api.views import OCPVolumeView
 from api.views import openapi
 from api.views import ResourceTypeView
+from api.views import ROSCustomTimeframesView
 from api.views import SettingsAWSCategoryKeyView
 from api.views import SettingsDisableAWSCategoryKeyView
 from api.views import SettingsDisableTagView
@@ -127,6 +128,7 @@ urlpatterns = [
     path("currency/", get_currency, name="currency"),
     path("exchange-rates/", get_exchange_rates, name="exchange-rates"),
     path("cost-type/", UserCostTypeSettings.as_view(), name="cost-type"),
+    path("account-settings/ros-custom-timeframes/", ROSCustomTimeframesView.as_view(), name="ros-custom-timeframes"),
     path("account-settings/", AccountSettings.as_view(), name="account-settings"),
     path("account-settings/<str:setting>/", AccountSettings.as_view(), name="get-account-setting"),
     path("status/", StatusView.as_view(), name="server-status"),

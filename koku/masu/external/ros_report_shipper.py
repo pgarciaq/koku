@@ -11,8 +11,10 @@ from botocore.config import Config
 from botocore.exceptions import ClientError
 from botocore.exceptions import EndpointConnectionError
 from django.conf import settings
+from django_tenants.utils import schema_context
 
 from api.common import log_json
+from api.settings.ros_custom_timeframes import ROS_CUSTOM_TIMEFRAMES_KEY
 from api.utils import DateHelper
 from kafka_utils.utils import delivery_callback
 from kafka_utils.utils import get_producer
@@ -20,6 +22,7 @@ from kafka_utils.utils import ROS_TOPIC
 from masu.config import Config as masu_config
 from masu.prometheus_stats import KAFKA_CONNECTION_ERRORS_COUNTER
 from masu.util.ocp import common as utils
+from reporting.user_settings.models import UserSettings
 
 LOG = logging.getLogger(__name__)
 
@@ -129,19 +132,36 @@ class ROSReportShipper:
             return
         return uploaded_obj_url, upload_key
 
+    def _get_ros_custom_timeframes(self):
+        try:
+            with schema_context(self.schema_name):
+                row = UserSettings.objects.first()
+                if not row or ROS_CUSTOM_TIMEFRAMES_KEY not in row.settings:
+                    return None
+                return row.settings[ROS_CUSTOM_TIMEFRAMES_KEY]
+        except Exception:
+            return None
+
     @KAFKA_CONNECTION_ERRORS_COUNTER.count_exceptions()
     def send_kafka_message(self, msg):
         """Sends a kafka message to the ROS topic with the S3 keys for the uploaded reports."""
         producer = get_producer()
-        producer.produce(ROS_TOPIC, value=msg, callback=delivery_callback)
+        org_id = self.metadata.get("org_id")
+        key = bytes(str(org_id), "utf-8") if org_id is not None else b""
+        producer.produce(ROS_TOPIC, value=msg, key=key, callback=delivery_callback)
         producer.poll(0)
 
     def build_ros_msg(self, presigned_urls, upload_keys):
         """Gathers the relevant information for the kafka message and returns the message to be delivered."""
+        custom_tf = None
+        try:
+            custom_tf = self._get_ros_custom_timeframes()
+        except Exception:
+            custom_tf = None
         ros_json = {
             "request_id": self.request_id,
             "b64_identity": self.b64_identity,
-            "metadata": self.metadata | {"cluster_alias": self.cluster_alias},
+            "metadata": self.metadata | {"cluster_alias": self.cluster_alias, "custom_timeframes": custom_tf},
             "files": presigned_urls,
             "object_keys": upload_keys,
         }

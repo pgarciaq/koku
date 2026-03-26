@@ -86,6 +86,7 @@ from api.settings.tags.view import SettingsDisableTagView
 from api.settings.tags.view import SettingsEnableTagView
 from api.settings.tags.view import SettingsTagView
 from api.settings.views import AccountSettings
+from api.settings.views import ROSCustomTimeframesView
 from api.settings.views import UserCostTypeSettings
 from api.status.views import StatusView
 from api.tags.all.openshift.view import OCPAllTagView
