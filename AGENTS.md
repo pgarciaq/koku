@@ -1432,3 +1432,42 @@ make test         # Run tests (Ginkgo + envtest)
 make docker-build # Build container image
 make deploy       # Deploy operator via Kustomize
 ```
+
+---
+
+# COST-ONPREM CHART DEPLOYMENT PITFALLS
+
+When deploying cost-onprem (Helm chart in `~/dev/koku/cost-onprem-chart/`),
+especially on aarch64 SNO clusters, watch for these recurring issues.
+Full details in `cost-onprem-chart/.cursor/rules/aarch64-sno-deployment.mdc`.
+
+## The "orgorg" Bug
+
+Koku prepends `org` to the JWT `org_id` claim to form the tenant schema name.
+If Keycloak has `org_id: "org1234567"`, the schema becomes `orgorg1234567`.
+**Always set `org_id` to the bare number `"1234567"` in Keycloak.**
+
+## S3 Bucket Names
+
+Three buckets are required with exact names: `insights-upload-perma`,
+`koku-bucket`, `ros-data`. The names come from Helm values. Creating
+buckets with other names (e.g., `cost-data`) causes silent failures.
+
+## Nise Data Generation
+
+Use `--write-monthly`, NOT `--daily-reports`, when generating data locally.
+`--daily-reports` requires `INSIGHTS_ACCOUNT_ID` and `INSIGHTS_ORG_ID` env
+vars and silently produces no output without them.
+
+## aarch64 Images
+
+Six images must be built on the aarch64 machine: koku, ros-ocp-backend,
+insights-ingress-go, autotune (Kruize), postgresql:16, valkey. Build all
+of them proactively before attempting any Helm install.
+
+## RHBK v26 (Keycloak)
+
+- Hostnames must be full `https://` URLs, not bare hostnames
+- Admin username is `temp-admin` (read from secret, don't hardcode `admin`)
+- Custom user attributes require `ADMIN_EDIT` unmanaged attribute policy
+- If token fails with "Account is not fully set up", delete and recreate the user
