@@ -1452,3 +1452,68 @@ of them proactively before attempting any Helm install.
 - Admin username is `temp-admin` (read from secret, don't hardcode `admin`)
 - Custom user attributes require `ADMIN_EDIT` unmanaged attribute policy
 - If token fails with "Account is not fully set up", delete and recreate the user
+
+## Nise `--insights-upload` Produces Combined Reports That Break Processing
+
+Nise's `--insights-upload` mode generates combined `openshift_report.X.csv` files
+that contain mixed column types (pod usage + node capacity in the same CSV). The
+Koku listener's Parquet processor cannot determine a single `report_type` for these
+files, causing `KeyError: None` in `TRINO_LINE_ITEM_TABLE_MAP`.
+
+**Workaround:** Use nise's `-w` (write-monthly) mode instead, which generates
+properly typed individual files (`ocp_pod_usage.csv`, `ocp_storage_usage.csv`,
+`ocp_node_label.csv`, `ocp_namespace_label.csv`, `ocp_vm_usage.csv`,
+`ocp_gpu_usage.csv`). Then manually create the manifest and tarball:
+
+```bash
+# Generate typed files
+nise report ocp --static-report-file config.yml \
+  --ocp-cluster-id CLUSTER_UUID -w --ros-ocp-info
+
+# Create tarball from the typed files (see next pitfall for tarball format)
+```
+
+## Tarball `./` Prefix Prevents ROS File Detection
+
+When creating a tarball with `tar czf archive.tar.gz .`, the member names get a
+`./` prefix (e.g., `./ocp_ros_usage.csv`). The Koku listener compares manifest
+filenames against extracted payload filenames using exact string matching. Since
+the manifest lists `ocp_ros_usage.csv` (no prefix), the ROS files are not found,
+and the listener logs `No ROS reports to handle in the current payload.`
+
+**Fix:** Strip the `./` prefix when creating the tarball:
+
+```bash
+tar czf upload.tar.gz --transform='s|^\./||' .
+```
+
+## Cost Models Are Lost After Full Data Prune
+
+When truncating/dropping tenant schema data (e.g., `org1234567`), the `cost_model`
+and `cost_model_map` tables are also cleared. After re-ingesting data, all cost
+values will be `0.00` because no cost model is assigned.
+
+**Fix:** After data prune + re-ingestion, recreate the cost model via the API:
+
+```bash
+curl -X POST -H "x-rh-identity: $IDENTITY" -H "Content-Type: application/json" \
+  -d '{"name":"OCP Cost Model","source_type":"OCP","source_uuids":["PROVIDER_UUID"],
+       "rates":[...],"markup":{"value":10,"unit":"percent"}}' \
+  http://localhost:8000/api/cost-management/v1/cost-models/
+```
+
+This automatically triggers cost model recalculation on the existing summary data.
+
+## Kubernetes `imagePullPolicy: IfNotPresent` Ignores New Images
+
+When pushing a new image with the **same tag** (e.g., `phase6`), Kubernetes won't
+pull it if `imagePullPolicy` is `IfNotPresent` and the old image is already cached.
+The pod continues running the old binary even after `oc rollout restart`.
+
+**Fix:** Always use a **new tag** when pushing updated images:
+
+```bash
+podman tag ros-ocp-backend:latest registry/cost-onprem/ros-ocp-backend:phase7
+podman push registry/cost-onprem/ros-ocp-backend:phase7
+oc set image deployment/cost-onprem-ros-processor ros-processor=registry/.../ros-ocp-backend:phase7
+```
