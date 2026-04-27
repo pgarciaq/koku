@@ -15,6 +15,7 @@ from masu.api.db_performance.dbp_views import schema_sizes
 from masu.api.db_performance.dbp_views import stat_activity
 from masu.api.db_performance.dbp_views import stat_statements
 from masu.api.download import download_report
+from masu.api.effective_rates import effective_rates
 from masu.api.enabled_tags import EnabledTagView
 from masu.api.expired_data import expired_data
 from masu.api.expired_data import expired_trino_partitions
