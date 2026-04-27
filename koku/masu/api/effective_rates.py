@@ -109,7 +109,9 @@ def _get_namespace_aggregates(schema_name: str, cluster_id: str, start_date: str
             AND data_source = 'Pod'
             AND (cost_model_rate_type IN (
                     'Infrastructure', 'Supplementary',
-                    'platform_distributed', 'worker_distributed'
+                    'platform_distributed', 'worker_distributed',
+                    'unattributed_storage', 'unattributed_network',
+                    'gpu_distributed'
                  ) OR cost_model_rate_type IS NULL)
         GROUP BY namespace
     """
