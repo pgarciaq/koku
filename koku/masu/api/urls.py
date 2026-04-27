@@ -19,6 +19,7 @@ from masu.api.views import crawl_account_hierarchy
 from masu.api.views import db_performance_redirect
 from masu.api.views import dbsettings
 from masu.api.views import download_report
+from masu.api.views import effective_rates
 from masu.api.views import EnabledTagView
 from masu.api.views import expired_data
 from masu.api.views import expired_trino_partitions
@@ -58,6 +59,7 @@ urlpatterns = [
     path("ingress_reports/", ingress_reports, name="ingress_reports"),
     path("update_exchange_rates/", update_exchange_rates, name="update_exchange_rates"),
     path("update_azure_storage_capacity/", update_azure_storage_capacity, name="update_azure_storage_capacity"),
+    path("effective_rates/", effective_rates, name="effective_rates"),
     path("enabled_tags/", EnabledTagView.as_view(), name="enabled_tags"),
     path("expired_data/", expired_data, name="expired_data"),
     path("hcs_report_data/", hcs_report_data, name="hcs_report_data"),
