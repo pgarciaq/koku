@@ -106,7 +106,7 @@ def _get_namespace_aggregates(schema_name: str, cluster_id: str, start_date: str
         FROM reporting_ocpusagelineitem_daily_summary
         WHERE cluster_id = %s
             AND usage_start BETWEEN %s AND %s
-            AND data_source = 'Pod'
+            AND data_source IN ('Pod', 'GPU')
             AND (cost_model_rate_type IN (
                     'Infrastructure', 'Supplementary',
                     'platform_distributed', 'worker_distributed',
