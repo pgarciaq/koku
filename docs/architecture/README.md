@@ -193,6 +193,7 @@ Output: proposed new/changed markdown files only (no application code unless ask
 | Document | Summary |
 |----------|---------|
 | [`mig-gpu-support.md`](mig-gpu-support.md) | MIG GPU cost tracking, allocation, distribution, API, testing |
+| [`ros-ocp-integration.md`](ros-ocp-integration.md) | ROS-OCP integration: effective_rates endpoint, data flow, native engine |
 
 ---
 
