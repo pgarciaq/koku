@@ -494,6 +494,13 @@ def extract_payload(payload_path, request_id, b64_identity, context):  # noqa: C
         for ros_file in manifest_ros_files
         if ros_file in payload_files
     ]
+    # Route additional cost-pipeline files that ros-ocp-backend also needs (e.g. PVC storage usage).
+    _ros_extra_patterns = ("storage-usage",)
+    ros_reports.extend(
+        (f, payload_path.with_name(f))
+        for f in manifest_files
+        if any(pat in f for pat in _ros_extra_patterns) and f in payload_files
+    )
     ros_processor = ROSReportShipper(payload, b64_identity, context)
     try:
         ros_processor.process_manifest_reports(ros_reports)
