@@ -462,7 +462,7 @@ def extract_payload(url, request_id, b64_identity, context):  # noqa: C901
         (ros_file, payload_path.with_name(ros_file)) for ros_file in manifest_ros_files if ros_file in payload_files
     ]
     # Route additional cost-pipeline files that ros-ocp-backend also needs (e.g. PVC storage usage).
-    _ros_extra_patterns = ("storage-usage",)
+    _ros_extra_patterns = ("storage-usage", "snapshot-inventory")
     ros_reports.extend(
         (f, payload_path.with_name(f))
         for f in manifest_files
