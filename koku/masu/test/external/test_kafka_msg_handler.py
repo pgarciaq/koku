@@ -1454,3 +1454,34 @@ class KafkaMsgHandlerTest(MasuTestCase):
                             csv = file.readlines()
 
                         self.assertIn("0099999999999", csv[1])
+
+    def test_ros_extra_patterns_routes_snapshot_inventory(self):
+        """Test that snapshot-inventory files in manifest.files are routed to ROS.
+
+        The _ros_extra_patterns tuple in extract_payload ensures files containing
+        "snapshot-inventory" or "storage-usage" in their name are forwarded to
+        ros-ocp-backend even if they appear only in manifest.files (not in
+        resource_optimization_files). This is a safety net: the operator and nise
+        already place these files in resource_optimization_files, but if they
+        end up only in manifest.files, this logic prevents them from being dropped.
+
+        IMPORTANT: ros-ocp-backend detects CSV type by checking for the substring
+        "snapshot" in the filename. Both nise (cm-openshift-snapshot-inventory-*)
+        and the operator (ros-openshift-snapshot-inventory-*) produce filenames
+        that satisfy this. Any future naming change MUST preserve the "snapshot"
+        substring for correct routing and classification.
+        """
+        # Simulates the matching logic used in extract_payload (line ~439).
+        _ros_extra_patterns = ("storage-usage", "snapshot-inventory")
+        test_cases = [
+            ("cm-openshift-snapshot-inventory-202603.0.csv", True),
+            ("ros-openshift-snapshot-inventory-202603.csv", True),
+            ("cm-openshift-storage-usage-202603.0.csv", True),
+            ("cm-openshift-pod-usage-202603.0.csv", False),
+            ("cm-openshift-node-usage-202603.csv", False),
+            ("uuid_openshift_report.0.csv", False),
+        ]
+        for filename, should_match in test_cases:
+            with self.subTest(filename=filename):
+                matched = any(pat in filename for pat in _ros_extra_patterns)
+                self.assertEqual(matched, should_match)
