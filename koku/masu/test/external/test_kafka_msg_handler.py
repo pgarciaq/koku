@@ -1578,12 +1578,8 @@ class KafkaMsgHandlerTest(MasuTestCase):
     def test_ros_extra_patterns_routes_snapshot_inventory(self):
         """Test that snapshot-inventory files in manifest.files are routed to ROS.
 
-        The _ros_extra_patterns tuple in extract_payload ensures files containing
-        "snapshot-inventory" or "storage-usage" in their name are forwarded to
-        ros-ocp-backend even if they appear only in manifest.files (not in
-        resource_optimization_files). This is a safety net: the operator and nise
-        already place these files in resource_optimization_files, but if they
-        end up only in manifest.files, this logic prevents them from being dropped.
+        Uses the actual ROS_EXTRA_PATTERNS constant from kafka_msg_handler to ensure
+        that if the tuple is ever modified, this test will catch regressions.
 
         IMPORTANT: ros-ocp-backend detects CSV type by checking for the substring
         "snapshot" in the filename. Both nise (cm-openshift-snapshot-inventory-*)
@@ -1591,8 +1587,11 @@ class KafkaMsgHandlerTest(MasuTestCase):
         that satisfy this. Any future naming change MUST preserve the "snapshot"
         substring for correct routing and classification.
         """
-        # Simulates the matching logic used in extract_payload (line ~439).
-        _ros_extra_patterns = ("storage-usage", "snapshot-inventory")
+        from masu.external.kafka_msg_handler import ROS_EXTRA_PATTERNS
+
+        self.assertIn("snapshot-inventory", ROS_EXTRA_PATTERNS)
+        self.assertIn("storage-usage", ROS_EXTRA_PATTERNS)
+
         test_cases = [
             ("cm-openshift-snapshot-inventory-202603.0.csv", True),
             ("ros-openshift-snapshot-inventory-202603.csv", True),
@@ -1603,5 +1602,5 @@ class KafkaMsgHandlerTest(MasuTestCase):
         ]
         for filename, should_match in test_cases:
             with self.subTest(filename=filename):
-                matched = any(pat in filename for pat in _ros_extra_patterns)
+                matched = any(pat in filename for pat in ROS_EXTRA_PATTERNS)
                 self.assertEqual(matched, should_match)
