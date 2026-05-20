@@ -4,6 +4,7 @@
 #
 """View for effective_rates masu admin endpoint."""
 import logging
+from datetime import date
 from decimal import Decimal
 
 from django.db import connection
@@ -171,6 +172,21 @@ def effective_rates(request):
     dh = DateHelper()
     start_date = params.get("start_date", dh.this_month_start.strftime("%Y-%m-%d"))
     end_date = params.get("end_date", dh.today.strftime("%Y-%m-%d"))
+
+    # Validate date format (YYYY-MM-DD) and logical ordering.
+    try:
+        parsed_start = date.fromisoformat(start_date)
+        parsed_end = date.fromisoformat(end_date)
+    except (ValueError, TypeError):
+        return Response(
+            {"Error": "start_date and end_date must be valid YYYY-MM-DD strings."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    if parsed_start > parsed_end:
+        return Response(
+            {"Error": "start_date must not be after end_date."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
 
     configured_rates, distribution_type, markup_pct = _get_configured_rates(schema_name, provider_uuid)
     namespace_aggregates = _get_namespace_aggregates(schema_name, cluster_id, start_date, end_date)
