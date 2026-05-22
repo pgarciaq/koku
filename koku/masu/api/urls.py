@@ -38,6 +38,7 @@ from masu.api.views import pg_engine_version
 from masu.api.views import purge_trino_files
 from masu.api.views import recheck_infra_map
 from masu.api.views import report_data
+from masu.api.views import reship_ros
 from masu.api.views import running_celery_tasks
 from masu.api.views import schema_sizes
 from masu.api.views import stat_activity
@@ -69,6 +70,7 @@ urlpatterns = [
     path("notification/", notification, name="notification"),
     path("recheck_infra_map/", recheck_infra_map, name="recheck_infra_map"),
     path("update_cost_model_costs/", update_cost_model_costs, name="update_cost_model_costs"),
+    path("reship_ros/", reship_ros, name="reship_ros"),
     path("crawl_account_hierarchy/", crawl_account_hierarchy, name="crawl_account_hierarchy"),
     path("additional_context/", additional_context, name="additional_context"),
     path("running_celery_tasks/", running_celery_tasks, name="running_celery_tasks"),
