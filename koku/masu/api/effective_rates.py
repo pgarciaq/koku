@@ -60,23 +60,35 @@ def _parse_rates_list(rates_list: list) -> dict:
     return configured_rates
 
 
-def _get_configured_rates(schema_name: str, provider_uuid: str) -> tuple[dict, str, float]:
-    """Extract configured cost model rates, distribution type, and markup for a provider.
+def _extract_currency(rates_list: list) -> str:
+    """Return the currency unit from the first tiered rate, defaulting to USD."""
+    for rate in rates_list:
+        tiered = rate.get("tiered_rates") or []
+        if tiered and isinstance(tiered, list):
+            unit = tiered[0].get("unit")
+            if unit:
+                return str(unit)
+    return "USD"
 
-    Returns (configured_rates_dict, distribution_type, markup_pct).
+
+def _get_configured_rates(schema_name: str, provider_uuid: str) -> tuple[dict, str, float, str]:
+    """Extract configured cost model rates, distribution type, markup, and currency for a provider.
+
+    Returns (configured_rates_dict, distribution_type, markup_pct, currency).
     """
     configured_rates: dict = {}
     distribution_type = "cpu"
     markup_pct = 0.0
+    currency = "USD"
 
     with schema_context(schema_name):
         cost_model_map = CostModelMap.objects.filter(provider_uuid=provider_uuid).first()
         if not cost_model_map:
-            return configured_rates, distribution_type, markup_pct
+            return configured_rates, distribution_type, markup_pct, currency
 
         cost_model: CostModel = cost_model_map.cost_model
         if not cost_model:
-            return configured_rates, distribution_type, markup_pct
+            return configured_rates, distribution_type, markup_pct, currency
 
         distribution_type = cost_model.distribution or "cpu"
 
@@ -87,8 +99,9 @@ def _get_configured_rates(schema_name: str, provider_uuid: str) -> tuple[dict, s
         rates_list = cost_model.rates or []
         if isinstance(rates_list, list):
             configured_rates = _parse_rates_list(rates_list)
+            currency = _extract_currency(rates_list)
 
-    return configured_rates, distribution_type, markup_pct
+    return configured_rates, distribution_type, markup_pct, currency
 
 
 def _get_namespace_aggregates(schema_name: str, cluster_id: str, start_date: str, end_date: str) -> dict:
@@ -188,7 +201,7 @@ def effective_rates(request):
             status=status.HTTP_400_BAD_REQUEST,
         )
 
-    configured_rates, distribution_type, markup_pct = _get_configured_rates(schema_name, provider_uuid)
+    configured_rates, distribution_type, markup_pct, currency = _get_configured_rates(schema_name, provider_uuid)
     namespace_aggregates = _get_namespace_aggregates(schema_name, cluster_id, start_date, end_date)
 
     return Response(
@@ -197,6 +210,7 @@ def effective_rates(request):
             "provider_uuid": provider_uuid,
             "distribution_type": distribution_type,
             "markup_pct": markup_pct,
+            "currency": currency,
             "configured_rates": configured_rates,
             "namespace_aggregates": namespace_aggregates,
         }

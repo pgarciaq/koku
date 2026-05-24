@@ -7,12 +7,33 @@ import uuid
 from decimal import Decimal
 from unittest.mock import patch
 
+from django.test import SimpleTestCase
 from django.test.utils import override_settings
 from django.urls import reverse
 from django_tenants.utils import schema_context
 
+from masu.api import effective_rates as er
 from masu.test import MasuTestCase
 from reporting.provider.ocp.models import OCPUsageLineItemDailySummary
+
+
+class EffectiveRatesCurrencyTest(SimpleTestCase):
+    """Unit tests for currency extraction (no database)."""
+
+    def test_extract_currency_from_first_tiered_rate(self):
+        rates = [
+            {
+                "metric": {"name": "cpu_core_usage_per_hour"},
+                "tiered_rates": [{"unit": "EUR", "value": 0.007}],
+                "cost_type": "Supplementary",
+            }
+        ]
+        self.assertEqual(er._extract_currency(rates), "EUR")
+
+    def test_extract_currency_defaults_to_usd_when_missing(self):
+        self.assertEqual(er._extract_currency([]), "USD")
+        self.assertEqual(er._extract_currency([{"tiered_rates": []}]), "USD")
+        self.assertEqual(er._extract_currency([{"tiered_rates": [{}]}]), "USD")
 
 
 @override_settings(ROOT_URLCONF="masu.urls")
@@ -31,11 +52,13 @@ class EffectiveRatesTest(MasuTestCase):
         self.assertIn("provider_uuid", body)
         self.assertIn("distribution_type", body)
         self.assertIn("markup_pct", body)
+        self.assertIn("currency", body)
         self.assertIn("configured_rates", body)
         self.assertIn("namespace_aggregates", body)
         self.assertEqual(body["cluster_id"], self.ocp_cluster_id)
         self.assertEqual(body["provider_uuid"], self.ocp_provider_uuid)
         self.assertIn(body["distribution_type"], ("cpu", "memory"))
+        self.assertEqual(body["currency"], "USD")
 
     @patch("koku.middleware.MASU", return_value=True)
     def test_get_effective_rates_missing_cluster_id(self, _):

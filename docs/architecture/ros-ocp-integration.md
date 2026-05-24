@@ -96,6 +96,7 @@ Returns aggregated per-namespace cost data including:
 - Infrastructure costs (raw + markup)
 - Distributed overhead (platform, worker, storage, network, GPU)
 - Configured cost model rates (`cpu_core_usage_per_hour`, `memory_gb_usage_per_hour`, `gpu_cost_per_month`, etc.)
+- `currency` — ISO 4217 code from the cost model's `tiered_rates[0].unit` (default `"USD"`)
 
 The SQL query aggregates from `reporting_ocpusagelineitem_daily_summary`
 with `data_source IN ('Pod', 'GPU')` to include GPU distribution costs.
