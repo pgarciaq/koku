@@ -145,26 +145,100 @@ for backward compatibility.
 
 ## Tag Sync (Koku → ROS)
 
-When `ROS_TAGS_ENABLED=true`, Koku pushes enabled OCP namespace tags to ROS after:
+When `ROS_TAGS_ENABLED=true`, Koku pushes enabled OCP namespace tags to ROS.
 
-- Tag enable/disable in Settings
-- Tag mapping changes
-- OCP report summarization completes
+**Task:** [`masu/processor/ros_tag_sync.py`](../../koku/masu/processor/ros_tag_sync.py)
 
-**Task:** [`masu/processor/ros_tag_sync.py`](../../koku/masu/processor/ros_tag_sync.py) — `sync_ros_ocp_tags`
+| Task | Trigger |
+|------|---------|
+| `sync_ros_ocp_tags` | Tag settings mutations, OCP summarization complete, periodic safety-net |
+| `sync_ros_ocp_tags_periodic` | Celery beat every 6 hours (safety-net for missed events) |
 
-**ROS endpoint:** `POST /api/cost-management/v1/internal/tags/sync`
+**ROS endpoints:**
 
-Payload applies namespace-level tags to all containers in matching `(cluster_uuid, namespace)` rows
-in `org_container_keys.resolved_tags`. Push uses full-replace semantics per org.
+| Method | Path | Purpose |
+|--------|------|---------|
+| `POST` | `/api/cost-management/v1/internal/tags/sync` | Full-replace sync for one org |
+| `GET` | `/api/cost-management/v1/internal/tags/status?org_id=` | Per-org sync freshness |
+
+### Sync Triggers
+
+```
+┌─────────────────────┐     immediate      ┌──────────────────┐
+│ Tag Settings API    │ ─────────────────▶ │ sync_ros_ocp_tags│
+│ (enable/disable/    │                    │ (per tenant)     │
+│  mapping change)    │                    └────────┬─────────┘
+└─────────────────────┘                             │
+                                                    ▼
+┌─────────────────────┐     after summary  ┌──────────────────┐
+│ OCP summarization   │ ─────────────────▶ │ POST /internal/│
+│ (daily new data)    │                    │ tags/sync        │
+└─────────────────────┘                    └────────┬─────────┘
+                                                    │
+┌─────────────────────┐     every 6h       ┌────────▼─────────┐
+│ Celery beat         │ ─────────────────▶ │ ros-ocp-backend  │
+│ sync_ros_ocp_tags_  │   (all tenants)    │ org_container_   │
+│ periodic            │                    │ keys.resolved_tags│
+└─────────────────────┘                    └──────────────────┘
+```
+
+- **Settings mutations** — Immediate sync when tags are enabled, disabled, or mappings change.
+- **Summarization** — After `update_summary_tables` completes for an OCP provider, sync runs for that tenant. New tag values only appear after new data is processed, so daily summarization is sufficient for value freshness.
+- **Periodic safety-net** — Every 6 hours, all tenants are queued for sync to recover from network failures or missed events.
+
+### Payload and Full-Replace Semantics
+
+Koku sends all **enabled** OCP tag keys with their **current** values from the latest
+billing period (`OCPUsageLineItemDailySummary.all_labels`). Disabled keys are omitted.
+
+```json
+{
+  "org_id": "1234567",
+  "synced_at": "2026-05-25T18:00:00Z",
+  "tag_keys": [
+    {"key": "environment", "values": ["production", "staging"]},
+    {"key": "team", "values": []}
+  ],
+  "namespace_tags": [
+    {"cluster_uuid": "...", "namespace": "payments", "tags": {"environment": "production"}}
+  ]
+}
+```
+
+ROS applies org-scoped **full-replace**:
+
+1. Reset all `org_container_keys.resolved_tags` to `{}` for the org.
+2. Apply each `namespace_tags` entry to matching rows.
+3. Store `synced_at` and `tag_keys` in `org_tag_sync_metadata`.
+
+Namespaces not in the payload end up with empty tags. The `synced_at` timestamp lets
+operators detect staleness via the status endpoint.
+
+### Tag Lifecycle Scenarios
+
+| Scenario | Behavior |
+|----------|----------|
+| Tag key disappears from pods (still enabled in Settings) | Next summarization + sync sends key in `tag_keys` with fewer/empty `values`; namespace maps omit the key → ROS filters stop matching removed values |
+| Tag disabled in Settings | Settings mutation triggers immediate sync; key omitted from payload → full-replace removes it from all containers |
+| New tag value appears | Included after next summarization processes line items with the new value |
+| Missed sync event | Periodic 6-hour task retries for all tenants |
+
+### Authentication
+
+**Current:** Kubernetes ServiceAccount token validation via TokenReview API.
+Koku worker sends `Authorization: Bearer <service-account-token>`; ROS validates via
+the in-cluster TokenReview API. Zero-config in-cluster; `ROS_TAGS_DEV_TOKEN` for local dev.
+
+**Future: mTLS** — Planned upgrade for on-prem deployments. Mutual TLS between Koku and
+ros-ocp-backend (cert-manager or service-mesh sidecar) will provide bidirectional
+authentication and eliminate token rotation concerns. See ros-ocp-backend
+[`docs/operations/tag-sync-auth.md`](../../../../ros-ocp-backend/docs/operations/tag-sync-auth.md).
 
 | Koku setting | Default | Description |
 |--------------|---------|-------------|
 | `ROS_TAGS_ENABLED` | `false` | Feature gate for tag sync task |
 | `ROS_OCP_BACKEND_URL` | `http://cost-onprem-ros-api:8000` | ROS API base URL |
 | `ROS_TAGS_DEV_TOKEN` | (empty) | Dev bearer token when SA token is unavailable |
-
-Auth uses the pod ServiceAccount token (`Authorization: Bearer`) or `ROS_TAGS_DEV_TOKEN` for local dev.
 
 ---
 
