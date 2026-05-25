@@ -699,6 +699,14 @@ ENABLE_SUBS_PROVIDER_TYPES = ENVIRONMENT.list("ENABLE_SUBS_PROVIDER_TYPES", defa
 # ROS debugging
 DISABLE_ROS_MSG = ENVIRONMENT.bool("DISABLE_ROS_MSG", default=False)
 
+# ROS-OCP tag sync (Koku → ros-ocp-backend resolved_tags)
+ROS_OCP_BACKEND_URL = ENVIRONMENT.get_value("ROS_OCP_BACKEND_URL", default="http://cost-onprem-ros-api:8000")
+ROS_TAGS_ENABLED = ENVIRONMENT.bool("ROS_TAGS_ENABLED", default=False)
+ROS_TAGS_DEV_TOKEN = ENVIRONMENT.get_value("ROS_TAGS_DEV_TOKEN", default="")
+ROS_TAGS_SA_TOKEN_PATH = ENVIRONMENT.get_value(
+    "ROS_TAGS_SA_TOKEN_PATH", default="/var/run/secrets/kubernetes.io/serviceaccount/token"
+)
+
 # Delay Celery Tasks Timeout
 DELAYED_TASK_TIME = ENVIRONMENT.int("DELAYED_TASK_TIME", default=3600)
 

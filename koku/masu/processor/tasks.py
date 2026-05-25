@@ -656,6 +656,11 @@ def update_summary_tables(  # noqa: C901
     # Mark summary complete time
     set_summary_timestamp(ManifestState.END, manifest_id)
 
+    if provider_type == Provider.PROVIDER_OCP:
+        from masu.processor.ros_tag_sync import schedule_ros_tag_sync
+
+        schedule_ros_tag_sync(schema)
+
     LOG.info(log_json(tracing_id, msg="triggering ocp on cloud summary", context=context))
     trigger_ocp_on_cloud_summary(
         context, schema, provider_uuid, manifest_id, tracing_id, start_date, end_date, queue_name, synchronous

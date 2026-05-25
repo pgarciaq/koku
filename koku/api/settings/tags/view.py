@@ -84,6 +84,10 @@ class SettingsTagUpdateView(APIView):
         objects.update(enabled=self.enabled)
         EnabledTagKeys.objects.bulk_update(objects, ["enabled"])
 
+        from masu.processor.ros_tag_sync import schedule_ros_tag_sync
+
+        schedule_ros_tag_sync(self.request.user.customer.schema_name)
+
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 
