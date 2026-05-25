@@ -216,12 +216,37 @@ operators detect staleness via the status endpoint.
 
 ### Tag Lifecycle Scenarios
 
-| Scenario | Behavior |
-|----------|----------|
-| Tag key disappears from pods (still enabled in Settings) | Next summarization + sync sends key in `tag_keys` with fewer/empty `values`; namespace maps omit the key → ROS filters stop matching removed values |
-| Tag disabled in Settings | Settings mutation triggers immediate sync; key omitted from payload → full-replace removes it from all containers |
-| New tag value appears | Included after next summarization processes line items with the new value |
-| Missed sync event | Periodic 6-hour task retries for all tenants |
+| Scenario | Koku behavior | ROS result |
+|----------|---------------|------------|
+| Tag key enabled in Settings | Immediate sync queued | Key appears in `tag_keys` catalog; filters available |
+| Tag key disabled in Settings | Immediate sync; key omitted from payload | Full-replace removes key from all `resolved_tags` |
+| Tag mapping changed | Immediate sync with new resolution | Namespace maps overwritten |
+| Tag key disappears from pods (still enabled) | Next summarization + sync: key in `tag_keys` with empty/fewer `values`; namespace maps omit key | Filters stop matching removed values; key remains in metadata until disabled |
+| New tag values appear | Next summarization adds values to payload | ROS updated on next successful sync |
+| Tag values disappear (pods deleted/relabeled) | Next summarization sends only current values | Full-replace removes stale values |
+| Network failure during sync | Celery retries; 6-hour periodic safety-net | Previous tags retained until sync succeeds (eventual consistency) |
+| ROS pod restart | N/A | No state loss — tags persisted in `org_container_keys` |
+
+See ros-ocp-backend [`docs/features/tag-filtering.md`](../../../../ros-ocp-backend/docs/features/tag-filtering.md)
+for full edge-case documentation.
+
+### Sync Robustness
+
+- **Transactional full-replace** — A failed sync mid-transaction rolls back; the last successful sync remains visible.
+- **Periodic safety-net** — `sync_ros_ocp_tags_periodic` runs every 6 hours for all tenants when `ROS_TAGS_ENABLED=true`.
+- **Freshness endpoint** — `GET /internal/tags/status?org_id=` exposes `synced_at` and the enabled-key catalog for monitoring.
+- **Auth failures are non-destructive** — Invalid tokens are rejected before any database mutation.
+
+### List API Filtering
+
+Container list endpoints accept bracket syntax only:
+
+```
+?filter[tag:environment]=production,staging
+```
+
+Multiple tag keys AND together; comma-separated values OR within a key. Requires
+`ROS_TAGS_ENABLED=true` on ROS and prior successful sync.
 
 ### Authentication
 
