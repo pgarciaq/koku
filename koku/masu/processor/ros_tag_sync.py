@@ -8,15 +8,17 @@ from __future__ import annotations
 import json
 import logging
 from collections import defaultdict
-from datetime import timedelta
+from datetime import datetime
+from datetime import timezone
 
 import requests
 from django.conf import settings
+from django.db.models import Max
 from django_tenants.utils import schema_context
 
 from api.common import log_json
+from api.iam.models import Tenant
 from api.provider.models import Provider
-from api.utils import DateHelper
 from common.queues import PriorityQueue
 from koku import celery_app
 from reporting.provider.all.models import EnabledTagKeys
@@ -26,7 +28,6 @@ LOG = logging.getLogger(__name__)
 
 DEFAULT_SA_TOKEN_PATH = "/var/run/secrets/kubernetes.io/serviceaccount/token"
 TAG_SYNC_PATH = "/api/cost-management/v1/internal/tags/sync"
-TAG_LOOKBACK_DAYS = 7
 
 
 def org_id_from_schema(schema_name: str) -> str:
@@ -68,24 +69,37 @@ def _extract_enabled_tags(labels: dict | None, enabled_keys: set[str]) -> dict[s
     return resolved
 
 
+def _latest_usage_period_start(schema_name: str):
+    """Return the latest usage_start date with OCP pod line items, if any."""
+    with schema_context(schema_name):
+        return OCPUsageLineItemDailySummary.objects.aggregate(latest=Max("usage_start"))["latest"]
+
+
 def build_namespace_tags_payload(schema_name: str) -> dict:
     """Build ros-ocp-backend tag sync payload for a tenant schema."""
     org_id = org_id_from_schema(schema_name)
-    dh = DateHelper()
-    lookback_start = dh.today - timedelta(days=TAG_LOOKBACK_DAYS)
+    synced_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
     with schema_context(schema_name):
-        enabled_keys = set(
+        enabled_keys = sorted(
             EnabledTagKeys.objects.filter(provider_type=Provider.PROVIDER_OCP, enabled=True).values_list(
                 "key", flat=True
             )
         )
         if not enabled_keys:
-            return {"org_id": org_id, "namespace_tags": []}
+            return {
+                "org_id": org_id,
+                "synced_at": synced_at,
+                "tag_keys": [],
+                "namespace_tags": [],
+            }
 
+        enabled_key_set = set(enabled_keys)
+        latest_period = _latest_usage_period_start(schema_name)
+
+        rows = OCPUsageLineItemDailySummary.objects.filter(usage_start=latest_period) if latest_period else []
         rows = (
-            OCPUsageLineItemDailySummary.objects.filter(usage_start__gte=lookback_start)
-            .exclude(namespace__isnull=True)
+            rows.exclude(namespace__isnull=True)
             .exclude(namespace="")
             .exclude(cluster_id__isnull=True)
             .exclude(cluster_id="")
@@ -94,12 +108,16 @@ def build_namespace_tags_payload(schema_name: str) -> dict:
         )
 
         namespace_tags: dict[tuple[str, str], dict[str, str]] = defaultdict(dict)
+        key_values: dict[str, set[str]] = defaultdict(set)
+
         for row in rows:
-            tags = _extract_enabled_tags(row.get("all_labels"), enabled_keys)
-            if not tags:
-                continue
+            tags = _extract_enabled_tags(row.get("all_labels"), enabled_key_set)
             cluster_namespace = (row["cluster_id"], row["namespace"])
             namespace_tags[cluster_namespace].update(tags)
+            for key, value in tags.items():
+                key_values[key].add(value)
+
+        tag_keys = [{"key": key, "values": sorted(key_values.get(key, set()))} for key in enabled_keys]
 
     payload_tags = [
         {
@@ -109,7 +127,12 @@ def build_namespace_tags_payload(schema_name: str) -> dict:
         }
         for (cluster_id, namespace), tags in sorted(namespace_tags.items())
     ]
-    return {"org_id": org_id, "namespace_tags": payload_tags}
+    return {
+        "org_id": org_id,
+        "synced_at": synced_at,
+        "tag_keys": tag_keys,
+        "namespace_tags": payload_tags,
+    }
 
 
 def push_namespace_tags(schema_name: str, payload: dict | None = None) -> int:
@@ -149,9 +172,40 @@ def sync_ros_ocp_tags(schema_name: str, tracing_id: str | None = None) -> None:
             log_json(
                 tracing_id,
                 msg="ROS tag sync completed",
-                context={**context, "namespace_count": len(payload["namespace_tags"]), "updated": updated},
+                context={
+                    **context,
+                    "namespace_count": len(payload["namespace_tags"]),
+                    "tag_key_count": len(payload["tag_keys"]),
+                    "synced_at": payload["synced_at"],
+                    "updated": updated,
+                },
             )
         )
     except Exception as exc:
         LOG.error(log_json(tracing_id, msg="ROS tag sync failed", context=context, error=str(exc)))
         raise
+
+
+@celery_app.task(name="masu.processor.ros_tag_sync.sync_ros_ocp_tags_periodic", queue=PriorityQueue.DEFAULT)
+def sync_ros_ocp_tags_periodic(tracing_id: str | None = None) -> None:
+    """Safety-net sync: queue tag sync for every tenant when the feature gate is enabled."""
+    if not settings.ROS_TAGS_ENABLED:
+        LOG.debug(log_json(tracing_id, msg="ROS periodic tag sync disabled"))
+        return
+
+    schema_names = [
+        tenant["schema_name"]
+        for tenant in Tenant.objects.values("schema_name")
+        if tenant.get("schema_name") and tenant["schema_name"] != "public"
+    ]
+
+    for schema_name in schema_names:
+        sync_ros_ocp_tags.delay(schema_name, tracing_id=tracing_id)
+
+    LOG.info(
+        log_json(
+            tracing_id,
+            msg="ROS periodic tag sync scheduled",
+            context={"tenant_count": len(schema_names)},
+        )
+    )
