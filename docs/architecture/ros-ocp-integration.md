@@ -143,23 +143,46 @@ for backward compatibility.
 
 ---
 
-## Tag Sync (Koku → ROS)
+## Tag Sync (Koku ↔ ROS)
 
-When `ROS_TAGS_ENABLED=true`, Koku pushes enabled OCP namespace tags to ROS.
+When `ROS_TAGS_ENABLED=true`, ROS list APIs can filter recommendations by OpenShift tags.
+The data path depends on `ROS_TAGS_SOURCE`:
 
-**Task:** [`masu/processor/ros_tag_sync.py`](../../koku/masu/processor/ros_tag_sync.py)
+| Source | When | How tags reach ROS list queries |
+|--------|------|----------------------------------|
+| `db` (default) | On-prem (shared PostgreSQL) | ROS reads Koku tenant tables at query time — no HTTP sync |
+| `api` | SaaS / separate databases | Koku Celery pushes to ROS; filters use `org_container_keys.resolved_tags` |
 
-| Task | Trigger |
-|------|---------|
+**Koku push task (api source only):** [`masu/processor/ros_tag_sync.py`](../../koku/masu/processor/ros_tag_sync.py)
+
+| Task | Trigger (api source only) |
+|------|---------------------------|
 | `sync_ros_ocp_tags` | Tag settings mutations, OCP summarization complete, periodic safety-net |
 | `sync_ros_ocp_tags_periodic` | Celery beat every 6 hours (safety-net for missed events) |
 
-**ROS endpoints:**
+When `ROS_TAGS_SOURCE=db`, these tasks are no-ops and settings/summary hooks do not queue sync.
+
+**ROS endpoints (api source):**
 
 | Method | Path | Purpose |
 |--------|------|---------|
-| `POST` | `/api/cost-management/v1/internal/tags/sync` | Full-replace sync for one org |
-| `GET` | `/api/cost-management/v1/internal/tags/status?org_id=` | Per-org sync freshness |
+| `POST` | `/api/cost-management/v1/internal/tags/sync` | Full-replace sync for one org (404 when source=db) |
+| `GET` | `/api/cost-management/v1/internal/tags/status?org_id=` | Tag key catalog (db: live from Koku tables; api: sync metadata) |
+
+### On-prem DB reads (ROS_TAGS_SOURCE=db)
+
+ROS queries the same PostgreSQL instance as Koku:
+
+| Table | Schema | Purpose |
+|-------|--------|---------|
+| `reporting_enabledtagkeys` | `org{org_id}` | Enabled OCP tag keys |
+| `reporting_ocptags_values` | `org{org_id}` | Distinct tag key/value pairs with cluster and namespace arrays |
+
+List filtering joins `org_container_keys` to `reporting_ocptags_values` via `(cluster_uuid, namespace)` — always fresh after Koku summarization, no sync lag.
+
+### Push sync (ROS_TAGS_SOURCE=api)
+
+When `ROS_TAGS_ENABLED=true` and `ROS_TAGS_SOURCE=api`, Koku pushes enabled OCP namespace tags to ROS.
 
 ### Sync Triggers
 
@@ -246,13 +269,13 @@ Container list endpoints accept bracket syntax only:
 ```
 
 Multiple tag keys AND together; comma-separated values OR within a key. Requires
-`ROS_TAGS_ENABLED=true` on ROS and prior successful sync.
+`ROS_TAGS_ENABLED=true` on ROS. With `ROS_TAGS_SOURCE=api`, a prior successful push sync
+is also required; with `ROS_TAGS_SOURCE=db` (default), tags are read live from Koku tables.
 
-### Authentication
+### Authentication (api source only)
 
-**Current:** Kubernetes ServiceAccount token validation via TokenReview API.
-Koku worker sends `Authorization: Bearer <service-account-token>`; ROS validates via
-the in-cluster TokenReview API. Zero-config in-cluster; `ROS_TAGS_DEV_TOKEN` for local dev.
+When `ROS_TAGS_SOURCE=api`, push endpoints use Kubernetes ServiceAccount token validation.
+With `ROS_TAGS_SOURCE=db`, push endpoints return 404 and no auth is needed for tag filtering.
 
 **Future: mTLS** — Planned upgrade for on-prem deployments. Mutual TLS between Koku and
 ros-ocp-backend (cert-manager or service-mesh sidecar) will provide bidirectional
@@ -261,9 +284,10 @@ authentication and eliminate token rotation concerns. See ros-ocp-backend
 
 | Koku setting | Default | Description |
 |--------------|---------|-------------|
-| `ROS_TAGS_ENABLED` | `false` | Feature gate for tag sync task |
-| `ROS_OCP_BACKEND_URL` | `http://cost-onprem-ros-api:8000` | ROS API base URL |
-| `ROS_TAGS_DEV_TOKEN` | (empty) | Dev bearer token when SA token is unavailable |
+| `ROS_TAGS_ENABLED` | `false` | Feature gate (push tasks run only when source=api) |
+| `ROS_TAGS_SOURCE` | `db` | `db` skips push; `api` enables Celery HTTP sync |
+| `ROS_OCP_BACKEND_URL` | `http://cost-onprem-ros-api:8000` | ROS API base URL (api source) |
+| `ROS_TAGS_DEV_TOKEN` | (empty) | Dev bearer token when SA token is unavailable (api source) |
 
 ---
 
