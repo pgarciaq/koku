@@ -33,7 +33,25 @@ class RosTagSyncDisabledTest(MasuTestCase):
         mock_delay.assert_not_called()
 
 
-@override_settings(ROS_TAGS_ENABLED=True, ROS_TAGS_DEV_TOKEN="test-token", ROS_OCP_BACKEND_URL="http://ros-api:8000")
+@override_settings(ROS_TAGS_ENABLED=True, ROS_TAGS_SOURCE="db")
+class RosTagSyncDBSourceTest(MasuTestCase):
+    @patch("masu.processor.ros_tag_sync.push_namespace_tags")
+    def test_sync_noops_when_db_source(self, mock_push):
+        sync_ros_ocp_tags(self.schema)
+        mock_push.assert_not_called()
+
+    @patch("masu.processor.ros_tag_sync.sync_ros_ocp_tags.delay")
+    def test_periodic_sync_noops_when_db_source(self, mock_delay):
+        sync_ros_ocp_tags_periodic()
+        mock_delay.assert_not_called()
+
+
+@override_settings(
+    ROS_TAGS_ENABLED=True,
+    ROS_TAGS_SOURCE="api",
+    ROS_TAGS_DEV_TOKEN="test-token",
+    ROS_OCP_BACKEND_URL="http://ros-api:8000",
+)
 class RosTagSyncTest(MasuTestCase):
     def setUp(self):
         super().setUp()

@@ -30,6 +30,11 @@ DEFAULT_SA_TOKEN_PATH = "/var/run/secrets/kubernetes.io/serviceaccount/token"
 TAG_SYNC_PATH = "/api/cost-management/v1/internal/tags/sync"
 
 
+def ros_tags_push_enabled() -> bool:
+    """Return True when Koku should push tags to ROS via HTTP (SaaS / api source)."""
+    return bool(settings.ROS_TAGS_ENABLED) and getattr(settings, "ROS_TAGS_SOURCE", "db") == "api"
+
+
 def org_id_from_schema(schema_name: str) -> str:
     """Return bare org_id from a tenant schema name."""
     if schema_name.startswith("org"):
@@ -38,8 +43,8 @@ def org_id_from_schema(schema_name: str) -> str:
 
 
 def schedule_ros_tag_sync(schema_name: str) -> None:
-    """Queue tag sync when the feature gate is enabled."""
-    if not settings.ROS_TAGS_ENABLED:
+    """Queue tag sync when the feature gate and api source are enabled."""
+    if not ros_tags_push_enabled():
         return
     sync_ros_ocp_tags.delay(schema_name)
 
@@ -160,8 +165,8 @@ def push_namespace_tags(schema_name: str, payload: dict | None = None) -> int:
 @celery_app.task(name="masu.processor.ros_tag_sync.sync_ros_ocp_tags", queue=PriorityQueue.DEFAULT)
 def sync_ros_ocp_tags(schema_name: str, tracing_id: str | None = None) -> None:
     """Sync enabled OCP tags to ros-ocp-backend for a tenant."""
-    if not settings.ROS_TAGS_ENABLED:
-        LOG.debug(log_json(tracing_id, msg="ROS tag sync disabled", schema=schema_name))
+    if not ros_tags_push_enabled():
+        LOG.debug(log_json(tracing_id, msg="ROS tag push sync disabled", schema=schema_name))
         return
 
     context = {"schema": schema_name, "org_id": org_id_from_schema(schema_name)}
@@ -188,9 +193,9 @@ def sync_ros_ocp_tags(schema_name: str, tracing_id: str | None = None) -> None:
 
 @celery_app.task(name="masu.processor.ros_tag_sync.sync_ros_ocp_tags_periodic", queue=PriorityQueue.DEFAULT)
 def sync_ros_ocp_tags_periodic(tracing_id: str | None = None) -> None:
-    """Safety-net sync: queue tag sync for every tenant when the feature gate is enabled."""
-    if not settings.ROS_TAGS_ENABLED:
-        LOG.debug(log_json(tracing_id, msg="ROS periodic tag sync disabled"))
+    """Safety-net sync: queue tag sync for every tenant when push sync is enabled."""
+    if not ros_tags_push_enabled():
+        LOG.debug(log_json(tracing_id, msg="ROS periodic tag push sync disabled"))
         return
 
     schema_names = [
