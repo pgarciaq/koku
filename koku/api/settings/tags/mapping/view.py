@@ -129,6 +129,9 @@ class SettingsTagMappingChildAddView(APIView):
         tag_mappings = [TagMapping(parent=parent_row, child=child_row) for child_row in children_rows]
         TagMapping.objects.bulk_create(tag_mappings)
         resummarize_current_month_by_tag_keys(serializer.data.get("children", []), request.user.customer.schema_name)
+        from masu.processor.ros_tag_sync import schedule_ros_tag_sync
+
+        schedule_ros_tag_sync(request.user.customer.schema_name)
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 
@@ -143,6 +146,9 @@ class SettingsTagMappingChildRemoveView(APIView):
             return Response({"detail": "Invalid children UUIDs."}, status=status.HTTP_400_BAD_REQUEST)
         TagMapping.objects.filter(child__in=children_uuids).delete()
         resummarize_current_month_by_tag_keys(children_uuids, request.user.customer.schema_name)
+        from masu.processor.ros_tag_sync import schedule_ros_tag_sync
+
+        schedule_ros_tag_sync(request.user.customer.schema_name)
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 
@@ -159,4 +165,7 @@ class SettingsTagMappingParentRemoveView(APIView):
         child_uuids = list(TagMapping.objects.filter(parent__in=parents_uuid).values_list("child", flat=True))
         TagMapping.objects.filter(parent__in=parents_uuid).delete()
         resummarize_current_month_by_tag_keys(child_uuids, request.user.customer.schema_name)
+        from masu.processor.ros_tag_sync import schedule_ros_tag_sync
+
+        schedule_ros_tag_sync(request.user.customer.schema_name)
         return Response(status=status.HTTP_204_NO_CONTENT)

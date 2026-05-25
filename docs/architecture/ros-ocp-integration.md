@@ -143,6 +143,31 @@ for backward compatibility.
 
 ---
 
+## Tag Sync (Koku → ROS)
+
+When `ROS_TAGS_ENABLED=true`, Koku pushes enabled OCP namespace tags to ROS after:
+
+- Tag enable/disable in Settings
+- Tag mapping changes
+- OCP report summarization completes
+
+**Task:** [`masu/processor/ros_tag_sync.py`](../../koku/masu/processor/ros_tag_sync.py) — `sync_ros_ocp_tags`
+
+**ROS endpoint:** `POST /api/cost-management/v1/internal/tags/sync`
+
+Payload applies namespace-level tags to all containers in matching `(cluster_uuid, namespace)` rows
+in `org_container_keys.resolved_tags`. Push uses full-replace semantics per org.
+
+| Koku setting | Default | Description |
+|--------------|---------|-------------|
+| `ROS_TAGS_ENABLED` | `false` | Feature gate for tag sync task |
+| `ROS_OCP_BACKEND_URL` | `http://cost-onprem-ros-api:8000` | ROS API base URL |
+| `ROS_TAGS_DEV_TOKEN` | (empty) | Dev bearer token when SA token is unavailable |
+
+Auth uses the pod ServiceAccount token (`Authorization: Bearer`) or `ROS_TAGS_DEV_TOKEN` for local dev.
+
+---
+
 ## Key Environment Variables (ROS)
 
 | Variable | Default | Description |
