@@ -241,6 +241,120 @@ staleness if pushes fail until the periodic safety-net succeeds.
 
 ---
 
+### Operating the tag sync (api source)
+
+This section covers day-two operations for SaaS tag push — who runs the sync, how to
+trigger it manually, and how to monitor health.
+
+#### Who pushes to whom
+
+| Service | Role |
+|---------|------|
+| **Koku** (`koku-worker`) | Source of truth; builds payload and POSTs to ROS |
+| **ROS API** | Receives push; stores tags in `org_container_keys.resolved_tags` |
+
+Direction is **one-way (Koku → ROS)**. ROS never sends tag data back to Koku.
+
+#### Celery tasks
+
+| Task name | Queue | Purpose |
+|-----------|-------|---------|
+| `masu.processor.ros_tag_sync.sync_ros_ocp_tags` | `PriorityQueue.DEFAULT` | Sync one tenant schema |
+| `masu.processor.ros_tag_sync.sync_ros_ocp_tags_periodic` | `PriorityQueue.DEFAULT` | Fan out sync to all tenants |
+
+Implementation: [`masu/processor/ros_tag_sync.py`](../../koku/masu/processor/ros_tag_sync.py)
+
+Entry point for event-driven sync:
+
+```python
+schedule_ros_tag_sync(schema_name)  # no-op unless ROS_TAGS_SOURCE=api
+  → sync_ros_ocp_tags.delay(schema_name)
+```
+
+#### Triggers
+
+| Trigger | Calls `schedule_ros_tag_sync` from |
+|---------|-------------------------------------|
+| Tag key enable/disable | [`api/settings/tags/view.py`](../../koku/api/settings/tags/view.py) |
+| Tag mapping create/update/delete | [`api/settings/tags/mapping/view.py`](../../koku/api/settings/tags/mapping/view.py) |
+| OCP summarization complete | [`masu/processor/tasks.py`](../../koku/masu/processor/tasks.py) |
+| Periodic safety-net (every 6h at `:15`) | [`koku/celery.py`](../../koku/koku/celery.py) beat schedule → `sync_ros_ocp_tags_periodic` |
+
+The periodic task queries all `Tenant` schemas and calls `sync_ros_ocp_tags.delay()` for
+each one.
+
+#### Frequency
+
+| Scenario | Expected latency |
+|----------|------------------|
+| Settings or mapping change | Seconds (async `.delay()`) |
+| After OCP ingestion + summarization | Minutes (after summary step completes) |
+| Missed events / transient failures | Up to **~6 hours** (periodic safety-net) |
+
+#### Manual trigger
+
+**Masu API** (when exposed):
+
+```bash
+curl -s "http://localhost:5042/api/cost-management/v1/sync_ros_tags/?schema=org1234567"
+```
+
+**Django shell:**
+
+```python
+from masu.processor.ros_tag_sync import sync_ros_ocp_tags
+sync_ros_ocp_tags.delay("org1234567")
+```
+
+**Celery CLI** (from koku-worker container):
+
+```bash
+celery -A koku call masu.processor.ros_tag_sync.sync_ros_ocp_tags --args='["org1234567"]'
+```
+
+Sync all tenants immediately:
+
+```python
+from masu.processor.ros_tag_sync import sync_ros_ocp_tags_periodic
+sync_ros_ocp_tags_periodic.delay()
+```
+
+#### Monitoring
+
+**Koku worker logs:**
+
+```
+ROS tag sync completed   # success — includes namespace_count, updated, synced_at
+ROS tag sync failed      # failure — includes schema, org_id, error
+```
+
+**ROS freshness** (requires bearer token — same auth as push):
+
+```bash
+curl -s -H "Authorization: Bearer $TOKEN" \
+  "$ROS_OCP_BACKEND_URL/api/cost-management/v1/internal/tags/status?org_id=1234567"
+```
+
+Alert if `synced_at` is **>6 hours** old.
+
+#### Failure handling
+
+| Failure | Behavior |
+|---------|----------|
+| HTTP / network error | Task logs `ROS tag sync failed` and raises; no inline auto-retry on the task |
+| ROS unavailable | Last successful sync retained in ROS; periodic task retries within 6h |
+| One org fails | Other orgs unaffected; failed org retried on next event or periodic cycle |
+| Auth failure | ROS returns 401/403 before DB write; tags unchanged |
+
+Required Koku env vars: `ROS_TAGS_ENABLED=true`, `ROS_TAGS_SOURCE=api`,
+`ROS_OCP_BACKEND_URL`. Production auth uses the worker ServiceAccount token at
+`ROS_TAGS_SA_TOKEN_PATH`; dev uses matching `ROS_TAGS_DEV_TOKEN` on both services.
+
+See ros-ocp-backend [`docs/operations/tag-sync-auth.md`](../../../../ros-ocp-backend/docs/operations/tag-sync-auth.md)
+for TokenReview details and auth troubleshooting.
+
+---
+
 ### Payload and full-replace semantics (api source)
 
 Koku sends all **enabled** OCP tag keys with **current** values from the latest billing
