@@ -228,6 +228,49 @@ class OCPUtilTests(MasuTestCase):
             result, _ = utils.detect_type("")
             self.assertEqual(result, expected_result)
 
+    def test_detect_type_vm_usage_from_columns(self):
+        """Test vm_usage detection from CSV column headers."""
+        with patch("masu.util.ocp.common.pd.read_csv") as mock_csv:
+            mock_csv.return_value.columns = copy.deepcopy(utils.VM_USAGE_COLUMNS)
+            result, enum_val = utils.detect_type("/tmp/ocp_unknown_name.csv")
+            self.assertEqual(result, "vm_usage")
+            self.assertEqual(enum_val, utils.OCPReportTypes.VM_USAGE)
+
+    def test_detect_type_vm_usage_from_operator_filename(self):
+        """Operator cm-openshift-vm-usage filenames map to vm_usage without reading columns."""
+        with patch("masu.util.ocp.common.pd.read_csv") as mock_csv:
+            result, enum_val = utils.detect_type("/tmp/cm-openshift-vm-usage-202605.csv")
+            self.assertEqual(result, "vm_usage")
+            self.assertEqual(enum_val, utils.OCPReportTypes.VM_USAGE)
+            mock_csv.assert_not_called()
+
+    def test_detect_type_vm_usage_from_nise_filename(self):
+        """Nise ocp_vm_usage filenames map to vm_usage."""
+        filename = "May-2026-02059694-68ab-4d58-8809-de1e91f1d0e5-ocp_vm_usage.csv"
+        with patch("masu.util.ocp.common.pd.read_csv") as mock_csv:
+            result, enum_val = utils.detect_type(filename)
+            self.assertEqual(result, "vm_usage")
+            self.assertEqual(enum_val, utils.OCPReportTypes.VM_USAGE)
+            mock_csv.assert_not_called()
+
+    def test_is_ros_vm_filename(self):
+        """ROS VM filenames are identified and excluded from Koku cost processing."""
+        ros_names = (
+            "ros-openshift-vm-usage-202605.csv",
+            "May-2026-uuid-ocp_ros_vm_usage.csv",
+        )
+        cost_names = (
+            "cm-openshift-vm-usage-202605.csv",
+            "May-2026-uuid-ocp_vm_usage.csv",
+            "cm-openshift-pod-usage-202605.csv",
+        )
+        for name in ros_names:
+            with self.subTest(name=name):
+                self.assertTrue(utils.is_ros_vm_filename(name))
+        for name in cost_names:
+            with self.subTest(name=name):
+                self.assertFalse(utils.is_ros_vm_filename(name))
+
 
 class DistributionConfigTest(MasuTestCase):
     """Test the DistributionConfig class (AI generated tests)."""

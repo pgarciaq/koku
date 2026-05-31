@@ -1472,10 +1472,17 @@ class KafkaMsgHandlerTest(MasuTestCase):
         self.assertIn("snapshot-inventory", ROS_EXTRA_PATTERNS)
         self.assertIn("storage-usage", ROS_EXTRA_PATTERNS)
 
+        self.assertIn("ros-openshift-vm-usage", ROS_EXTRA_PATTERNS)
+        self.assertIn("ocp_ros_vm_usage", ROS_EXTRA_PATTERNS)
+
         test_cases = [
             ("cm-openshift-snapshot-inventory-202603.0.csv", True),
             ("ros-openshift-snapshot-inventory-202603.csv", True),
             ("cm-openshift-storage-usage-202603.0.csv", True),
+            ("ros-openshift-vm-usage-202605.csv", True),
+            ("May-2026-uuid-ocp_ros_vm_usage.csv", True),
+            ("cm-openshift-vm-usage-202605.csv", False),
+            ("May-2026-uuid-ocp_vm_usage.csv", False),
             ("cm-openshift-pod-usage-202603.0.csv", False),
             ("cm-openshift-node-usage-202603.csv", False),
             ("uuid_openshift_report.0.csv", False),
