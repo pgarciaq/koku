@@ -75,7 +75,14 @@ FAILURE_CONFIRM_STATUS = "failure"
 MANIFEST_ACCESSOR = ReportManifestDBAccessor()
 _MAX_MANIFEST_BYTES = 10 * 1_024 * 1_024  # 10 MB — orders of magnitude above any real manifest
 
-ROS_EXTRA_PATTERNS = ("storage-usage", "snapshot-inventory")
+# Substrings matched against manifest file names for ROS forwarding from manifest.files.
+# VM patterns must be ROS-specific (ros-openshift-vm-usage) so cm-openshift-vm-usage stays in Koku.
+ROS_EXTRA_PATTERNS = (
+    "storage-usage",
+    "snapshot-inventory",
+    "ros-openshift-vm-usage",
+    "ocp_ros_vm_usage",
+)
 
 
 class KafkaMsgHandlerError(Exception):
@@ -515,6 +522,9 @@ def extract_payload(payload_path, request_id, b64_identity, context):  # noqa: C
         "provider_type": provider.type,
     }
     for report_file in manifest_files:
+        if utils.is_ros_vm_filename(report_file):
+            # ROS VM CSVs belong in resource_optimization_files; skip if listed under files.
+            continue
         current_meta = manifest.model_dump() | extra_meta_needed_to_process_reports
         payload_source_path = utils.resolve_path_within_base(payload_path.parent, report_file)
         payload_destination_path = utils.resolve_path_within_base(destination_dir, report_file)

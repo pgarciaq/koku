@@ -403,6 +403,10 @@ THRESHOLD_MAP = {
 }
 THRESHOLDS = {col: thresh for thresh, cols in THRESHOLD_MAP.items() for col in cols}
 
+# Operator/nise filename substrings for VM report routing (matched on basename, lowercased).
+COST_VM_FILENAME_PATTERNS = ("cm-openshift-vm-usage", "ocp_vm_usage")
+ROS_VM_FILENAME_PATTERNS = ("ros-openshift-vm-usage", "ocp_ros_vm_usage")
+
 
 ForceAwareDatetime = Annotated[
     datetime,
@@ -625,10 +629,39 @@ def get_source_and_provider_from_cluster_id(cluster_id, org_id, skip_org_id_filt
     return source
 
 
+def report_basename(report_path) -> str:
+    """Return the lowercased filename for report path detection."""
+    return os.path.basename(str(report_path)).lower()
+
+
+def is_ros_vm_filename(filename: str) -> bool:
+    """True when the file is a ROS-only VM usage report (not processed by Koku cost pipeline)."""
+    name = report_basename(filename)
+    return any(pattern in name for pattern in ROS_VM_FILENAME_PATTERNS)
+
+
+def detect_report_type_from_filename(report_path):
+    """Detect OCP report type from operator/nise filename patterns.
+
+    Returns:
+        Tuple of (report_type, enum) when a cost-management VM filename matches,
+        otherwise (None, OCPReportTypes.UNKNOWN).
+    """
+    name = report_basename(report_path)
+    for pattern in COST_VM_FILENAME_PATTERNS:
+        if pattern in name:
+            return "vm_usage", OCPReportTypes.VM_USAGE
+    return None, OCPReportTypes.UNKNOWN
+
+
 def detect_type(report_path):
     """
-    Detects the OCP report type.
+    Detects the OCP report type from filename hints, then CSV column headers.
     """
+    report_type, enum_val = detect_report_type_from_filename(report_path)
+    if report_type:
+        return report_type, enum_val
+
     columns = pd.read_csv(report_path, nrows=0).columns
     for report_type, report_def in OCP_REPORT_TYPES.items():
         report_columns = report_def.get("columns")
