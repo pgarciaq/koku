@@ -82,6 +82,8 @@ ROS_EXTRA_PATTERNS = (
     "snapshot-inventory",
     "ros-openshift-vm-usage",
     "ocp_ros_vm_usage",
+    "ros-openshift-vm-gpu-device",
+    "ocp_ros_vm_gpu_device",
 )
 
 

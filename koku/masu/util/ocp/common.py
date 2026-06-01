@@ -405,7 +405,12 @@ THRESHOLDS = {col: thresh for thresh, cols in THRESHOLD_MAP.items() for col in c
 
 # Operator/nise filename substrings for VM report routing (matched on basename, lowercased).
 COST_VM_FILENAME_PATTERNS = ("cm-openshift-vm-usage", "ocp_vm_usage")
-ROS_VM_FILENAME_PATTERNS = ("ros-openshift-vm-usage", "ocp_ros_vm_usage")
+ROS_VM_FILENAME_PATTERNS = (
+    "ros-openshift-vm-usage",
+    "ocp_ros_vm_usage",
+    "ros-openshift-vm-gpu-device",
+    "ocp_ros_vm_gpu_device",
+)
 
 
 ForceAwareDatetime = Annotated[

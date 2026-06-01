@@ -260,10 +260,13 @@ class OCPUtilTests(MasuTestCase):
         ros_names = (
             "ros-openshift-vm-usage-202605.csv",
             "May-2026-uuid-ocp_ros_vm_usage.csv",
+            "ros-openshift-vm-gpu-device-20260501.csv",
+            "May-2026-uuid-ocp_ros_vm_gpu_device.0.csv",
         )
         cost_names = (
             "cm-openshift-vm-usage-202605.csv",
             "May-2026-uuid-ocp_vm_usage.csv",
+            "May-2026-uuid-ocp_vm_gpu_device.csv",
             "cm-openshift-pod-usage-202605.csv",
         )
         for name in ros_names:

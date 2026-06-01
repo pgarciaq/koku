@@ -1594,6 +1594,8 @@ class KafkaMsgHandlerTest(MasuTestCase):
 
         self.assertIn("ros-openshift-vm-usage", ROS_EXTRA_PATTERNS)
         self.assertIn("ocp_ros_vm_usage", ROS_EXTRA_PATTERNS)
+        self.assertIn("ros-openshift-vm-gpu-device", ROS_EXTRA_PATTERNS)
+        self.assertIn("ocp_ros_vm_gpu_device", ROS_EXTRA_PATTERNS)
 
         test_cases = [
             ("cm-openshift-snapshot-inventory-202603.0.csv", True),
@@ -1601,7 +1603,10 @@ class KafkaMsgHandlerTest(MasuTestCase):
             ("cm-openshift-storage-usage-202603.0.csv", True),
             ("ros-openshift-vm-usage-202605.csv", True),
             ("May-2026-uuid-ocp_ros_vm_usage.csv", True),
+            ("ros-openshift-vm-gpu-device-20260501.csv", True),
+            ("May-2026-uuid-ocp_ros_vm_gpu_device.0.csv", True),
             ("cm-openshift-vm-usage-202605.csv", False),
+            ("May-2026-uuid-ocp_vm_gpu_device.csv", False),
             ("May-2026-uuid-ocp_vm_usage.csv", False),
             ("cm-openshift-pod-usage-202603.0.csv", False),
             ("cm-openshift-node-usage-202603.csv", False),
