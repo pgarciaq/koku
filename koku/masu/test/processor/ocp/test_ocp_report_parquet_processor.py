@@ -131,6 +131,7 @@ class OCPReportProcessorParquetTest(MasuTestCase):
         numeric_columns = processor._column_types["numeric_columns"]
         self.assertIn("gpu_memory_capacity_mib", numeric_columns)
         self.assertIn("gpu_pod_uptime", numeric_columns)
+        self.assertIn("gpu_pod_utilization", numeric_columns)
 
     def test_get_table_names_for_delete(self):
         """Test that both raw and daily table names are returned."""

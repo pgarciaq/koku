@@ -258,6 +258,7 @@ GPU_USAGE_COLUMNS = {
 # Note: mig_slice_count, mig_memory_capacity_mib, and parent_gpu_max_slices are derived
 # in post-processor from mig_profile and gpu_model_name, not from the operator
 GPU_USAGE_NEWV_COLUMNS_AND_TYPES = {
+    "gpu_pod_utilization": pd.Float64Dtype(),
     "mig_instance_id": pd.StringDtype(storage="pyarrow"),
     "mig_profile": pd.StringDtype(storage="pyarrow"),
     "mig_strategy": pd.StringDtype(storage="pyarrow"),  # "single" or "mixed" or Null
@@ -276,6 +277,7 @@ GPU_AGG = {
     "gpu_vendor_name": ["max"],
     "gpu_memory_capacity_mib": ["max"],
     "gpu_pod_uptime": ["sum"],
+    "gpu_pod_utilization": ["sum"],
     # MIG aggregations (mig_instance_id is in GROUP_BY, so not included here)
     "mig_profile": ["max"],
     "mig_slice_count": ["max"],
