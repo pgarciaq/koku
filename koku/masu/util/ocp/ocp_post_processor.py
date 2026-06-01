@@ -310,7 +310,13 @@ class OCPPostProcessor:
         If the GPU model is unknown and we cannot determine max_slices, all MIG fields are
         cleared and the GPU is treated as dedicated.
         """
-        if self.report_type != "gpu_usage" or "mig_profile" not in data_frame.columns:
+        if self.report_type != "gpu_usage":
+            return data_frame
+
+        if "mig_instance_uuid" in data_frame.columns and "mig_instance_id" not in data_frame.columns:
+            data_frame = data_frame.rename(columns={"mig_instance_uuid": "mig_instance_id"})
+
+        if "mig_profile" not in data_frame.columns:
             return data_frame
 
         has_mig_data = data_frame["mig_profile"].notna() & (data_frame["mig_profile"] != "")

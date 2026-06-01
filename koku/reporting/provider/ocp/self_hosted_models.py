@@ -346,6 +346,7 @@ class OCPGPUUsageLineItem(OCPLineItemBase):
     # GPU metrics
     gpu_memory_capacity_mib = models.FloatField(null=True)
     gpu_pod_uptime = models.FloatField(null=True)
+    gpu_pod_utilization = models.FloatField(null=True)
 
     # MIG (Multi-Instance GPU) fields
     mig_instance_id = models.CharField(max_length=256, null=True)
@@ -376,6 +377,7 @@ class OCPGPUUsageLineItemDaily(OCPLineItemBase):
     # GPU metrics
     gpu_memory_capacity_mib = models.FloatField(null=True)
     gpu_pod_uptime = models.FloatField(null=True)
+    gpu_pod_utilization = models.FloatField(null=True)
 
     # MIG (Multi-Instance GPU) fields
     mig_instance_id = models.CharField(max_length=256, null=True)

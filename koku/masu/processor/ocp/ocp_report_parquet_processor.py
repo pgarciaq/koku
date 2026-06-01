@@ -70,6 +70,7 @@ class OCPReportParquetProcessor(ReportParquetProcessorBase):
             "vm_disk_allocated_size_byte_seconds",
             "gpu_memory_capacity_mib",
             "gpu_pod_uptime",
+            "gpu_pod_utilization",
             "mig_slice_count",
             "gpu_max_slices",
             "mig_memory_capacity_mib",
@@ -269,6 +270,10 @@ class OCPReportParquetProcessor(ReportParquetProcessorBase):
 
         # Generate UUIDs for each row (required for partitioned tables)
         data_frame["id"] = [uuid4() for _ in range(len(data_frame))]
+
+        # Restrict to Django model columns so operator CSV additions do not break inserts.
+        model_columns = {field.column for field in model._meta.concrete_fields}
+        data_frame = data_frame[[column for column in data_frame.columns if column in model_columns]]
 
         # Write to the parent table - PostgreSQL routes to correct partition based on usage_start
         with get_report_db_accessor().connect() as connection:
