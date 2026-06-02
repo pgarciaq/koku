@@ -17,6 +17,7 @@ from masu.database.ocp_report_db_accessor import OCPReportDBAccessor
 from masu.processor import COST_BREAKDOWN_RTU_UNLEASH_FLAG
 from masu.processor import is_feature_flag_enabled_by_schema
 from masu.processor.ocp.ocp_cloud_updater_base import OCPCloudUpdaterBase
+from masu.processor.ros_savings_recalc import notify_ros_savings_recalculation
 from masu.util.common import filter_dictionary
 from masu.util.common import SummaryRangeConfig
 from masu.util.ocp.common import get_amortized_monthly_cost_model_rate
@@ -813,3 +814,4 @@ class OCPCostModelCostUpdater(OCPCloudUpdaterBase, PartitionHandlerMixin):
                 self._delete_tag_usage_costs(start_date, end_date, self._provider.uuid)
 
         self.distribute_costs_and_update_ui_summary(summary_range)
+        notify_ros_savings_recalculation(self._schema, provider_uuid=self._provider_uuid)
