@@ -19,7 +19,7 @@ from masu.processor.ros_tag_sync import org_id_from_schema
 LOG = logging.getLogger(__name__)
 
 SAVINGS_RECALC_PATH = "/api/cost-management/v1/internal/recalculate-savings"
-DEFAULT_RECOMMENDATION_TYPES = ("container", "node", "pvc")
+DEFAULT_RECOMMENDATION_TYPES = ("container", "node", "pvc", "quota", "cluster-quota")
 
 
 def _ros_backend_base_url() -> str | None:
