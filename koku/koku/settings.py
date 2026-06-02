@@ -703,6 +703,10 @@ DISABLE_ROS_MSG = ENVIRONMENT.bool("DISABLE_ROS_MSG", default=False)
 
 # ROS-OCP tag sync (Koku → ros-ocp-backend resolved_tags)
 ROS_OCP_BACKEND_URL = ENVIRONMENT.get_value("ROS_OCP_BACKEND_URL", default="http://cost-onprem-ros-api:8000")
+# ROS-OCP savings recalculation (Koku → ros-ocp-backend after cost model updates)
+ROS_API_HOST = ENVIRONMENT.get_value("ROS_API_HOST", default="")
+ROS_API_PORT = ENVIRONMENT.get_value("ROS_API_PORT", default="8000")
+ROS_SERVICE_TOKEN = ENVIRONMENT.get_value("ROS_SERVICE_TOKEN", default="")
 ROS_TAGS_ENABLED = ENVIRONMENT.bool("ROS_TAGS_ENABLED", default=False)
 # "db" = ROS reads Koku tag tables directly (on-prem default); "api" = HTTP push to ROS
 ROS_TAGS_SOURCE = ENVIRONMENT.get_value("ROS_TAGS_SOURCE", default="db")
