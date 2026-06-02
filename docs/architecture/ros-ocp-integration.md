@@ -109,10 +109,61 @@ ROS uses these cost model metrics from the `effective_rates` response:
 |------|-----------|
 | `cpu_core_usage_per_hour` | CPU savings estimation |
 | `memory_gb_usage_per_hour` | Memory savings estimation |
+| `storage_gb_request_per_month` | Quota/PVC storage savings (primary) |
+| `storage_gb_usage_per_month` | Quota/PVC storage savings (fallback when request rate is zero) |
 | `gpu_cost_per_month` | GPU savings (idle = full rate, MIG = fractional, time-slicing = shared) |
 | Infrastructure costs | Per-namespace overhead apportionment |
 
-### 4. Shared Source/Provider Registration
+Koku returns every metric defined in the cluster's cost model in
+`configured_rates`. ROS resolves storage savings via
+[`StorageRequestPerMonth()`](../../../../ros-ocp-backend/internal/engine/cost_rates.go):
+prefer `storage_gb_request_per_month` (infrastructure + supplementary sum), fall back
+to `storage_gb_usage_per_month` when the request rate is zero or missing.
+
+### 4. Recommendation API Proxy (Koku → ROS)
+
+Quota recommendation endpoints are implemented in ros-ocp-backend and **proxied**
+through the Koku API gateway — Koku does not implement the handlers itself.
+
+| Deployment | Proxy mechanism |
+|------------|-----------------|
+| SaaS (Clowder) | Nginx in koku-api routes `/api/cost-management/v1/recommendations/` to `ros-ocp-api` ([`deploy/clowdapp.yaml`](../../deploy/clowdapp.yaml)) |
+| On-prem (Helm) | Envoy gateway routes the same prefix to `ros-api-backend` ([cost-onprem-chart gateway ConfigMap](../../../../cost-onprem-chart/cost-onprem/templates/gateway/configmap-envoy.yaml)) |
+
+Quota and cluster-quota routes (when the corresponding ROS plugin is enabled):
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| `GET` | `/api/cost-management/v1/recommendations/openshift/quota/` | Namespace ResourceQuota recommendations |
+| `GET` | `/api/cost-management/v1/recommendations/openshift/quota/detail` | Single quota recommendation detail |
+| `GET/PUT/DELETE` | `/api/cost-management/v1/recommendations/openshift/settings/quota` | Per-org quota engine settings |
+| `GET` | `/api/cost-management/v1/recommendations/openshift/cluster-quota/` | ClusterResourceQuota recommendations |
+| `GET` | `/api/cost-management/v1/recommendations/openshift/cluster-quota/detail` | Single cluster-quota detail |
+| `GET/PUT/DELETE` | `/api/cost-management/v1/recommendations/openshift/settings/cluster-quota` | Per-org cluster-quota settings |
+
+Implementation: ros-ocp-backend [`internal/api/handlers_quota_recs.go`](../../../../ros-ocp-backend/internal/api/handlers_quota_recs.go),
+[`handlers_cluster_quota_recs.go`](../../../../ros-ocp-backend/internal/api/handlers_cluster_quota_recs.go).
+
+### 5. Savings Recalculation (Koku → ROS)
+
+When a cost model is updated, Koku notifies ros-ocp-backend to recalculate
+estimated savings across recommendation types.
+
+**Task:** [`masu/processor/ros_savings_recalc.py`](../../koku/masu/processor/ros_savings_recalc.py)
+
+**Endpoint (ROS internal):** `POST /api/cost-management/v1/internal/recalculate-savings`
+
+**Default recommendation types** (`DEFAULT_RECOMMENDATION_TYPES`):
+
+```python
+("container", "node", "pvc", "quota", "cluster-quota")
+```
+
+Including `quota` and `cluster-quota` ensures namespace and cluster ResourceQuota
+savings are refreshed when cost model rates change, alongside container, node, and
+PVC recommendations.
+
+### 6. Shared Source/Provider Registration
 
 ROS uses the same `cluster_uuid` registered as a Koku Source/Provider.
 The `clusters` table in the ROS database references the same cluster UUID.
@@ -513,6 +564,25 @@ In on-prem mode, both Koku and ROS are deployed via the
 
 The native engine is the default for on-prem deployments.
 
+### Deploy Order Dependency
+
+Quota recommendations depend on CSV data from the metrics operator and processing
+in ros-ocp-backend before Koku can proxy API responses. Deploy or upgrade in this
+order:
+
+```
+1. koku-metrics-operator  →  collects ocp_ros_namespace_usage + cluster-quota CSVs
+2. ros-ocp-backend        →  ingests quota CSVs, runs quota/cluster-quota engines
+3. koku                   →  proxies /recommendations/openshift/* to ROS API
+```
+
+If Koku is upgraded before ros-ocp-backend, quota routes may 404 or return stale
+data until ROS catches up. If ros-ocp-backend is upgraded before the operator,
+quota ingestion will have no per-quota (`quota_name`) or cluster-quota columns until
+the operator version that emits them is installed.
+
+Operator CSV fields: [`koku-metrics-operator/docs/report-fields-description.md`](../../../../koku-metrics-operator/docs/report-fields-description.md).
+
 ---
 
 ## Related Koku Files
@@ -520,6 +590,7 @@ The native engine is the default for on-prem deployments.
 | File | Role |
 |------|------|
 | [`masu/api/effective_rates.py`](../../koku/masu/api/effective_rates.py) | Cost rates endpoint consumed by ROS |
+| [`masu/processor/ros_savings_recalc.py`](../../koku/masu/processor/ros_savings_recalc.py) | Triggers ROS savings recalc after cost model changes |
 | [`csv-processing-ocp.md`](csv-processing-ocp.md) | OCP CSV pipeline (shared with ROS ingress) |
 | [`cost-models.md`](cost-models.md) | Cost model system (provides rates to ROS) |
 | [`mig-gpu-support.md`](mig-gpu-support.md) | GPU cost metering in Koku (complementary to ROS GPU recommendations) |
