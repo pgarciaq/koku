@@ -18,6 +18,7 @@ from masu.database.ocp_report_db_accessor import OCPReportDBAccessor
 from masu.processor import COST_BREAKDOWN_RTU_UNLEASH_FLAG
 from masu.processor import is_feature_flag_enabled_by_schema
 from masu.processor.ocp.ocp_cloud_updater_base import OCPCloudUpdaterBase
+from masu.processor.ros_savings_recalc import notify_ros_savings_recalculation
 from masu.prometheus_stats import RTU_AGGREGATE_DURATION
 from masu.prometheus_stats import RTU_MARKUP_DURATION
 from masu.prometheus_stats import RTU_POPULATE_DURATION
@@ -908,3 +909,4 @@ class OCPCostModelCostUpdater(OCPCloudUpdaterBase, PartitionHandlerMixin):
             self._update_markup_cost(start_date, end_date, use_rtu=rtu_enabled)
 
         self.distribute_costs_and_update_ui_summary(summary_range)
+        notify_ros_savings_recalculation(self._schema, provider_uuid=self._provider_uuid)
