@@ -59,6 +59,7 @@ STORAGE_COLUMNS = {
     "interval_end",
     "namespace",
     "pod",
+    "vm_name",
     "persistentvolumeclaim",
     "persistentvolume",
     "storageclass",
