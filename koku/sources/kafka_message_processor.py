@@ -8,6 +8,7 @@ import logging
 from django.conf import settings
 from rest_framework.exceptions import ValidationError
 
+from api.iam.serializers import normalize_org_id
 from api.provider.models import Provider
 from kafka_utils.utils import extract_from_header
 from kafka_utils.utils import SOURCES_TOPIC
@@ -92,7 +93,8 @@ class KafkaMessageProcessor:
         self.account_number = extract_from_header(msg.headers(), KAFKA_HDR_ACCOUNT_NUMBER) or identity.get(
             "account_number"
         )
-        self.org_id = extract_from_header(msg.headers(), KAFKA_HDR_ORG_ID) or identity.get("org_id")
+        raw_org_id = extract_from_header(msg.headers(), KAFKA_HDR_ORG_ID) or identity.get("org_id")
+        self.org_id = normalize_org_id(raw_org_id) if raw_org_id else raw_org_id
         if None in (self.org_id, self.auth_header):
             msg = f"[KafkaMessageProcessor] missing `{KAFKA_HDR_RH_IDENTITY}` or  org_id: {msg.headers()}"
             LOG.warning(msg)

@@ -34,6 +34,7 @@ from api.iam.models import Tenant
 from api.iam.models import User
 from api.iam.serializers import create_schema_name
 from api.iam.serializers import extract_header
+from api.iam.serializers import normalize_org_id
 from api.utils import DateHelper
 from koku.cache import CacheEnum
 from koku.metrics import DB_CONNECTION_ERRORS_COUNTER
@@ -305,7 +306,7 @@ class IdentityHeaderMiddleware(MiddlewareMixin):
             raise PermissionDenied()
 
         account = json_rh_auth.get("identity", {}).get("account_number")
-        org_id = json_rh_auth.get("identity", {}).get("org_id")
+        org_id = normalize_org_id(json_rh_auth.get("identity", {}).get("org_id"))
         token_type = str(json_rh_auth.get("identity", {}).get("type", "user")).lower()
         user = None
         email = None
