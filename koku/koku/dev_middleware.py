@@ -14,6 +14,8 @@ from django.utils.deprecation import MiddlewareMixin
 
 from api.common import RH_IDENTITY_HEADER
 from api.iam.models import User
+from api.iam.serializers import create_schema_name
+from api.iam.serializers import normalize_org_id
 
 LOG = logging.getLogger(__name__)
 
@@ -60,7 +62,7 @@ class DevelopmentIdentityHeaderMiddleware(MiddlewareMixin):
                 identity_header = settings.DEVELOPMENT_IDENTITY
 
             user_dict = identity_header.get("identity", {}).get("user")
-            org_id = identity_header.get("org_id") or "1234567"
+            org_id = normalize_org_id(identity_header.get("org_id") or "1234567")
             if not org_id.endswith(settings.SCHEMA_SUFFIX):
                 org_id = f"{org_id}{settings.SCHEMA_SUFFIX}"
             user = Mock(
@@ -72,7 +74,7 @@ class DevelopmentIdentityHeaderMiddleware(MiddlewareMixin):
                 customer=Mock(
                     account_id=identity_header.get("account_number", "10001"),
                     org_id=org_id,
-                    schema_name=f"org{org_id}",
+                    schema_name=create_schema_name(org_id),
                 ),
                 req_id="DEVELOPMENT",
             )

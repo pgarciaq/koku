@@ -11,7 +11,29 @@ from .iam_test_case import IamTestCase
 from api.iam.serializers import AdminCustomerSerializer
 from api.iam.serializers import create_schema_name
 from api.iam.serializers import CustomerSerializer
+from api.iam.serializers import normalize_org_id
 from api.iam.serializers import UserSerializer
+
+
+class NormalizeOrgIdTest(IamTestCase):
+    """Tests for org_id normalization."""
+
+    def test_bare_org_id_unchanged(self):
+        """Bare numeric org_id must not be modified."""
+        self.assertEqual("1234567", normalize_org_id("1234567"))
+
+    def test_strips_org_prefix(self):
+        """org-prefixed org_id must be stripped."""
+        self.assertEqual("1234567", normalize_org_id("org1234567"))
+
+    def test_org_prefix_non_numeric_suffix_unchanged(self):
+        """org_id starting with org but not followed by digits must be left alone."""
+        self.assertEqual("organization", normalize_org_id("organization"))
+
+    def test_create_schema_name_idempotent(self):
+        """create_schema_name must produce the same schema for bare and prefixed org_id."""
+        self.assertEqual("org1234567", create_schema_name("1234567"))
+        self.assertEqual("org1234567", create_schema_name("org1234567"))
 
 
 class CustomerSerializerTest(IamTestCase):

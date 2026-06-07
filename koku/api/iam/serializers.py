@@ -4,6 +4,7 @@
 #
 """Identity and Access Serializers."""
 import locale
+import logging
 from base64 import b64decode
 from json import loads as json_loads
 
@@ -14,6 +15,8 @@ from ..common import error_obj
 from ..common import RH_IDENTITY_HEADER
 from .models import Customer
 from .models import User
+
+LOG = logging.getLogger(__name__)
 
 
 def _create_user(username, email, customer):
@@ -58,9 +61,25 @@ def extract_header(request, header):
     return (rh_auth_header, json_rh_auth)
 
 
+def normalize_org_id(org_id: str) -> str:
+    """Return bare org_id for tenant schema construction.
+
+    Koku prepends ``org`` to the JWT ``org_id`` claim to form the tenant schema
+    (e.g. ``1234567`` → ``org1234567``). Values like ``org1234567`` would create
+    ``orgorg1234567`` and break source/manifest matching.
+    """
+    if not org_id:
+        return org_id
+    org_id = str(org_id)
+    if org_id.startswith("org") and org_id[3:].isdigit():
+        LOG.warning("org_id already has 'org' prefix, stripping: %s", org_id)
+        return org_id[3:]
+    return org_id
+
+
 def create_schema_name(org_id):
     """Create a database schema name."""
-    return f"org{org_id}"
+    return f"org{normalize_org_id(org_id)}"
 
 
 class UserSerializer(serializers.ModelSerializer):

@@ -11,6 +11,7 @@ from django.db import transaction
 from rest_framework import serializers
 
 from api.common import error_obj
+from api.iam.serializers import normalize_org_id
 from api.provider.models import Provider
 from api.provider.models import Sources
 from api.provider.provider_builder import ProviderBuilder
@@ -139,7 +140,7 @@ class AdminSourcesSerializer(SourcesSerializer):
         return get_param_from_header(self.context.get("request"), "account_number")
 
     def _validate_org_id(self, account_id):
-        org_id = get_param_from_header(self.context.get("request"), "org_id")
+        org_id = normalize_org_id(get_param_from_header(self.context.get("request"), "org_id"))
         if not org_id.endswith(settings.SCHEMA_SUFFIX):
             org_id = f"{org_id}{settings.SCHEMA_SUFFIX}"
         return org_id
