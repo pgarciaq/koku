@@ -163,7 +163,57 @@ Including `quota` and `cluster-quota` ensures namespace and cluster ResourceQuot
 savings are refreshed when cost model rates change, alongside container, node, and
 PVC recommendations.
 
-### 6. Shared Source/Provider Registration
+### 6. Business Hours Reship (ROS → Koku)
+
+When an administrator changes a business-hours schedule in ROS, the service must
+re-ingest historical ROS CSVs with dual `schedule_type` digests (`all_hours` +
+`business_hours`). ROS triggers Koku Masu to **re-publish** objects already stored
+in the ROS S3 bucket — no new upload from the cluster.
+
+**Endpoint:** `POST /api/cost-management/v1/reship_ros/`
+
+**Source:** [`masu/api/reship_ros.py`](../../koku/masu/api/reship_ros.py)
+
+**ROS client:** [`internal/reship/client.go`](../../../../ros-ocp-backend/internal/reship/client.go)
+
+#### Query parameters
+
+| Parameter | Required | Description |
+|-----------|----------|-------------|
+| `schema` | Yes | Tenant schema (e.g. `org1234567`) |
+| `provider_uuid` | Yes | Koku provider UUID for the cluster |
+| `start_date` | Yes | Inclusive start date (`YYYY-MM-DD`) |
+| `end_date` | Yes | Inclusive end date (`YYYY-MM-DD`) |
+
+ROS supplies a lookback window (container plugin max window, default 90 days).
+Masu lists S3 keys under `{schema}/source={provider_uuid}/date={day}/` for each day
+in range, presigns URLs (48h TTL), and publishes one Kafka message per object to the
+ROS topic (same shape as [`ROSReportShipper.build_ros_msg`](../../koku/masu/external/ros_report_shipper.py)).
+
+#### Response (`200 OK`)
+
+```json
+{
+  "request_id": "abc123...",
+  "files_processed": 42,
+  "files_total": 42
+}
+```
+
+| Status | Cause |
+|--------|-------|
+| `400` | Missing/invalid parameters or `end_date` before `start_date` |
+| `503` | ROS S3 credentials not configured (`S3_ROS_*`) |
+| `500` | S3 list or Kafka publish failure |
+
+**Authentication:** Internal Masu API — no `x-rh-identity` (service-to-service).
+
+**Tests:** [`masu/test/api/test_reship_ros.py`](../../koku/masu/test/api/test_reship_ros.py)
+
+ROS-side orchestration (poller, retries, metrics): ros-ocp-backend
+[`docs/architecture/cost-integration.md`](../../../../ros-ocp-backend/docs/architecture/cost-integration.md#business-hours-reship-reship_ros).
+
+### 7. Shared Source/Provider Registration
 
 ROS uses the same `cluster_uuid` registered as a Koku Source/Provider.
 The `clusters` table in the ROS database references the same cluster UUID.
@@ -590,7 +640,10 @@ Operator CSV fields: [`koku-metrics-operator/docs/report-fields-description.md`]
 | File | Role |
 |------|------|
 | [`masu/api/effective_rates.py`](../../koku/masu/api/effective_rates.py) | Cost rates endpoint consumed by ROS |
+| [`masu/api/reship_ros.py`](../../koku/masu/api/reship_ros.py) | Re-publishes stored ROS CSVs to Kafka for business-hours backfill |
 | [`masu/processor/ros_savings_recalc.py`](../../koku/masu/processor/ros_savings_recalc.py) | Triggers ROS savings recalc after cost model changes |
+| [`masu/processor/ros_tag_sync.py`](../../koku/masu/processor/ros_tag_sync.py) | Pushes enabled OCP tags to ROS (SaaS `ROS_TAGS_SOURCE=api` only) |
+| [`masu/external/ros_report_shipper.py`](../../koku/masu/external/ros_report_shipper.py) | Ships ROS CSVs to S3 and publishes Kafka announces |
 | [`csv-processing-ocp.md`](csv-processing-ocp.md) | OCP CSV pipeline (shared with ROS ingress) |
 | [`cost-models.md`](cost-models.md) | Cost model system (provides rates to ROS) |
 | [`mig-gpu-support.md`](mig-gpu-support.md) | GPU cost metering in Koku (complementary to ROS GPU recommendations) |
