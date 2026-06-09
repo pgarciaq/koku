@@ -479,8 +479,9 @@ def extract_payload(url, request_id, b64_identity, context):  # noqa: C901
         if any(pat in f for pat in ROS_EXTRA_PATTERNS) and f in payload_files
     )
     ros_processor = ROSReportShipper(payload, b64_identity, context)
+    expected_ros_files = [filename for filename, _ in ros_reports]
     try:
-        ros_processor.process_manifest_reports(ros_reports)
+        ros_processor.process_manifest_reports(ros_reports, expected_files=expected_ros_files)
     except Exception as e:
         # If a ROS report fails to process, this should not prevent Koku processing from continuing.
         msg = f"ROS reports not processed for payload. Reason: {e}"

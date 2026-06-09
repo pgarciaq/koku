@@ -127,10 +127,12 @@ class TestROSReportShipper(TestCase):
                 "cluster_uuid": self.cluster_id,
                 "operator_version": self.manifest.operator_version,
                 "cluster_alias": self.cluster_alias,
+                "manifest_id": str(self.manifest.uuid),
+                "expected_files": ["report1"],
             },
             "files": ["report1_url"],
             "object_keys": ["path1"],
         }
         expected_msg = bytes(json.dumps(expected_json), "utf-8")
-        actual = self.ros_shipper.build_ros_msg(["report1_url"], ["path1"])
+        actual = self.ros_shipper.build_ros_msg(["report1_url"], ["path1"], ["report1"])
         self.assertEqual(actual, expected_msg)

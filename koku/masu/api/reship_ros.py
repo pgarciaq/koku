@@ -6,6 +6,7 @@
 import json
 import logging
 from http import HTTPStatus
+from pathlib import PurePosixPath
 from uuid import UUID
 from uuid import uuid4
 
@@ -31,6 +32,7 @@ from masu.external.ros_report_shipper import generate_s3_object_url
 from masu.external.ros_report_shipper import get_ros_s3_client
 from masu.prometheus_stats import KAFKA_CONNECTION_ERRORS_COUNTER
 from masu.util.ocp import common as ocp_utils
+from reporting_common.models import CostUsageReportManifest
 
 LOG = logging.getLogger(__name__)
 
@@ -86,12 +88,18 @@ def build_ros_kafka_message(
     metadata: dict,
     presigned_url: str,
     upload_key: str,
+    *,
+    expected_files: list[str] | None = None,
 ) -> bytes:
     """Build a ROS Kafka message matching ROSReportShipper.build_ros_msg format."""
+    filename = PurePosixPath(upload_key).name
+    kafka_metadata = metadata | {
+        "expected_files": expected_files or [filename],
+    }
     ros_json = {
         "request_id": request_id,
         "b64_identity": b64_identity,
-        "metadata": metadata,
+        "metadata": kafka_metadata,
         "files": [presigned_url],
         "object_keys": [upload_key],
     }
@@ -128,41 +136,120 @@ def publish_ros_kafka_message(msg: bytes) -> None:
     producer.poll(0)
 
 
-def _parse_reship_params(params) -> tuple[dict | None, Response | None]:
-    """Validate query params; return parsed values or an error Response."""
-    schema = params.get("schema")
-    provider_uuid = params.get("provider_uuid")
-    start_date_raw = params.get("start_date")
-    end_date_raw = params.get("end_date")
+def _lookup_manifest(provider_uuid: str, manifest_id: str) -> CostUsageReportManifest | None:
+    """Resolve a manifest record by assembly UUID and provider."""
+    return CostUsageReportManifest.objects.filter(
+        provider_id=provider_uuid,
+        assembly_id=manifest_id,
+    ).first()
 
-    if not schema:
-        return None, Response({"error": "schema is required"}, status=HTTPStatus.BAD_REQUEST)
-    if not provider_uuid:
-        return None, Response({"error": "provider_uuid is required"}, status=HTTPStatus.BAD_REQUEST)
+
+def _filter_keys_by_manifest_metadata(s3_client, object_keys: list[str], manifest_db_id: int) -> list[str]:
+    """Keep only S3 objects uploaded for the given manifest DB id."""
+    manifest_id_str = str(manifest_db_id)
+    matched: list[str] = []
+    for upload_key in object_keys:
+        try:
+            head = s3_client.head_object(Bucket=settings.S3_ROS_BUCKET_NAME, Key=upload_key)
+        except (BotoCoreError, ClientError):
+            continue
+        metadata = head.get("Metadata") or {}
+        if metadata.get("ManifestId") == manifest_id_str:
+            matched.append(upload_key)
+    return matched
+
+
+def list_ros_s3_keys_for_manifest(
+    s3_client,
+    schema: str,
+    provider_uuid: str,
+    manifest_id: str,
+    start_date=None,
+    end_date=None,
+) -> list[str]:
+    """List ROS S3 keys for a specific manifest, optionally constrained by date range."""
+    manifest = _lookup_manifest(provider_uuid, manifest_id)
+    if not manifest:
+        return []
+
+    dh = DateHelper()
+    if start_date is None:
+        start_date = manifest.billing_period_start_datetime.date()
+    if end_date is None:
+        end_date = dh.today
+
+    object_keys = list_ros_s3_keys(s3_client, schema, provider_uuid, start_date, end_date)
+    return _filter_keys_by_manifest_metadata(s3_client, object_keys, manifest.id)
+
+
+def _parse_date_range(start_date_raw, end_date_raw) -> tuple[tuple | None, Response | None]:
+    """Parse and validate optional date range; return (start, end) or error Response."""
+    if not start_date_raw and not end_date_raw:
+        return (None, None), None
     if not start_date_raw or not end_date_raw:
-        return None, Response({"error": "start_date and end_date are required"}, status=HTTPStatus.BAD_REQUEST)
-
-    try:
-        UUID(provider_uuid)
-    except ValueError:
-        return None, Response({"error": "provider_uuid is invalid"}, status=HTTPStatus.BAD_REQUEST)
-
+        return None, Response(
+            {"error": "start_date and end_date must both be provided when using a date range"},
+            status=HTTPStatus.BAD_REQUEST,
+        )
     dh = DateHelper()
     try:
         start_date = dh.parse_to_date(start_date_raw)
         end_date = dh.parse_to_date(end_date_raw)
     except (TypeError, ValueError):
         return None, Response({"error": "start_date and end_date must be YYYY-MM-DD"}, status=HTTPStatus.BAD_REQUEST)
-
     if end_date < start_date:
         return None, Response({"error": "end_date must be on or after start_date"}, status=HTTPStatus.BAD_REQUEST)
+    return (start_date, end_date), None
+
+
+def _parse_reship_params(params) -> tuple[dict | None, Response | None]:
+    """Validate query params; return parsed values or an error Response."""
+    schema = params.get("schema")
+    provider_uuid = params.get("provider_uuid")
+    manifest_id = params.get("manifest_id")
+
+    if not schema:
+        return None, Response({"error": "schema is required"}, status=HTTPStatus.BAD_REQUEST)
+    if not provider_uuid:
+        return None, Response({"error": "provider_uuid is required"}, status=HTTPStatus.BAD_REQUEST)
+    if not manifest_id and (not params.get("start_date") or not params.get("end_date")):
+        return None, Response(
+            {"error": "start_date and end_date are required when manifest_id is not provided"},
+            status=HTTPStatus.BAD_REQUEST,
+        )
+    try:
+        UUID(provider_uuid)
+    except ValueError:
+        return None, Response({"error": "provider_uuid is invalid"}, status=HTTPStatus.BAD_REQUEST)
+
+    dates, date_error = _parse_date_range(params.get("start_date"), params.get("end_date"))
+    if date_error:
+        return None, date_error
 
     return {
         "schema": schema,
         "provider_uuid": provider_uuid,
-        "start_date": start_date,
-        "end_date": end_date,
+        "manifest_id": manifest_id,
+        "start_date": dates[0],
+        "end_date": dates[1],
     }, None
+
+
+def _list_reship_keys(request_id, schema, provider_uuid, manifest_id, start_date, end_date):
+    """List S3 keys for reship, returning (keys, s3_client, error_response)."""
+    try:
+        s3_client = get_ros_s3_client()
+        if manifest_id:
+            object_keys = list_ros_s3_keys_for_manifest(
+                s3_client, schema, provider_uuid, manifest_id, start_date, end_date
+            )
+        else:
+            object_keys = list_ros_s3_keys(s3_client, schema, provider_uuid, start_date, end_date)
+    except (BotoCoreError, ClientError) as err:
+        msg = f"Unable to list ROS objects in bucket {settings.S3_ROS_BUCKET_NAME}: {err}"
+        LOG.error(log_json(request_id, msg=msg, schema=schema, provider_uuid=provider_uuid))
+        return None, None, Response({"error": msg}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
+    return object_keys, s3_client, None
 
 
 def _reship_response(request_id: str, files_processed: int, files_total: int) -> Response:
@@ -182,12 +269,21 @@ def _publish_reship_messages(
     object_keys: list[str],
     b64_identity: str,
     kafka_metadata: dict,
+    *,
+    expected_files: list[str] | None = None,
 ) -> int:
     """Presign each key and publish one Kafka message per object."""
     files_processed = 0
     for upload_key in object_keys:
         presigned_url = generate_s3_object_url(s3_client, upload_key)
-        kafka_msg = build_ros_kafka_message(request_id, b64_identity, kafka_metadata, presigned_url, upload_key)
+        kafka_msg = build_ros_kafka_message(
+            request_id,
+            b64_identity,
+            kafka_metadata,
+            presigned_url,
+            upload_key,
+            expected_files=expected_files,
+        )
         publish_ros_kafka_message(kafka_msg)
         files_processed += 1
     return files_processed
@@ -204,8 +300,9 @@ def reship_ros(request):
     Query parameters:
         schema: Tenant schema (e.g. org1234567)
         provider_uuid: Provider UUID for the cluster
-        start_date: Inclusive start date (YYYY-MM-DD)
-        end_date: Inclusive end date (YYYY-MM-DD)
+        manifest_id: Optional manifest assembly UUID for targeted re-ship
+        start_date: Optional inclusive start date (YYYY-MM-DD); required without manifest_id
+        end_date: Optional inclusive end date (YYYY-MM-DD); required without manifest_id
     """
     request_id = uuid4().hex
     parsed, error_response = _parse_reship_params(request.query_params)
@@ -214,6 +311,7 @@ def reship_ros(request):
 
     schema = parsed["schema"]
     provider_uuid = parsed["provider_uuid"]
+    manifest_id = parsed["manifest_id"]
     start_date = parsed["start_date"]
     end_date = parsed["end_date"]
 
@@ -229,14 +327,14 @@ def reship_ros(request):
 
     b64_identity = provider_metadata.pop("b64_identity")
     kafka_metadata = provider_metadata
+    if manifest_id:
+        kafka_metadata = kafka_metadata | {"manifest_id": manifest_id}
 
-    try:
-        s3_client = get_ros_s3_client()
-        object_keys = list_ros_s3_keys(s3_client, schema, provider_uuid, start_date, end_date)
-    except (BotoCoreError, ClientError) as err:
-        msg = f"Unable to list ROS objects in bucket {settings.S3_ROS_BUCKET_NAME}: {err}"
-        LOG.error(log_json(request_id, msg=msg, schema=schema, provider_uuid=provider_uuid))
-        return Response({"error": msg}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
+    object_keys, s3_client, s3_error = _list_reship_keys(
+        request_id, schema, provider_uuid, manifest_id, start_date, end_date
+    )
+    if s3_error:
+        return s3_error
 
     files_total = len(object_keys)
     if not object_keys:
@@ -246,8 +344,16 @@ def reship_ros(request):
         LOG.info(log_json(request_id, msg="ROS kafka publishing disabled", schema=schema))
         return _reship_response(request_id, 0, files_total)
 
+    expected_files = [PurePosixPath(key).name for key in object_keys] if manifest_id else None
     try:
-        files_processed = _publish_reship_messages(request_id, s3_client, object_keys, b64_identity, kafka_metadata)
+        files_processed = _publish_reship_messages(
+            request_id,
+            s3_client,
+            object_keys,
+            b64_identity,
+            kafka_metadata,
+            expected_files=expected_files,
+        )
     except Exception as err:
         msg = f"Failed to publish ROS Kafka messages: {err}"
         LOG.error(log_json(request_id, msg=msg, schema=schema, provider_uuid=provider_uuid))

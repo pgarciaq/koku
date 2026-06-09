@@ -55,7 +55,8 @@ class ROSReportShipper:
     ):
         self.b64_identity = b64_identity
         self.manifest_id = payload_info.manifest.manifest_id
-        self.context = context | {"manifest_id": self.manifest_id}
+        self.manifest_uuid = str(payload_info.manifest.uuid)
+        self.context = context | {"manifest_id": self.manifest_id, "manifest_uuid": self.manifest_uuid}
         self.source_id = str(payload_info.source_id)
         self.provider_uuid = str(payload_info.provider_uuid)
         self.cluster_alias = payload_info.cluster_alias
@@ -78,7 +79,7 @@ class ROSReportShipper:
         """The S3 path to be used for a ROS report upload."""
         return f"{self.schema_name}/source={self.provider_uuid}/date={self.dh.today.date()}"
 
-    def process_manifest_reports(self, reports_to_upload):
+    def process_manifest_reports(self, reports_to_upload, expected_files=None):
         """
         Uploads the ROS reports for a manifest to S3 and sends a kafka message containing
         the uploaded reports and relevant information to the hccm.ros.events topic.
@@ -105,7 +106,9 @@ class ROSReportShipper:
             LOG.info(log_json(self.request_id, msg=msg, context=self.context))
             return
 
-        kafka_msg = self.build_ros_msg(report_urls, upload_keys)
+        if expected_files is None:
+            expected_files = [filename for filename, _ in reports_to_upload]
+        kafka_msg = self.build_ros_msg(report_urls, upload_keys, expected_files)
         msg = f"{len(report_urls)} reports uploaded to S3 for ROS, sending kafka message."
         LOG.info(log_json(self.request_id, msg=msg, context=self.context))
         self.send_kafka_message(kafka_msg)
@@ -136,12 +139,17 @@ class ROSReportShipper:
         producer.produce(ROS_TOPIC, value=msg, callback=delivery_callback)
         producer.poll(0)
 
-    def build_ros_msg(self, presigned_urls, upload_keys):
+    def build_ros_msg(self, presigned_urls, upload_keys, expected_files=None):
         """Gathers the relevant information for the kafka message and returns the message to be delivered."""
+        metadata = self.metadata | {
+            "cluster_alias": self.cluster_alias,
+            "manifest_id": self.manifest_uuid,
+            "expected_files": expected_files or [],
+        }
         ros_json = {
             "request_id": self.request_id,
             "b64_identity": self.b64_identity,
-            "metadata": self.metadata | {"cluster_alias": self.cluster_alias},
+            "metadata": metadata,
             "files": presigned_urls,
             "object_keys": upload_keys,
         }
