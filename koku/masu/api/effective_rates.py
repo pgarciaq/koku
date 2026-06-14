@@ -2,7 +2,12 @@
 # Copyright 2026 Red Hat Inc.
 # SPDX-License-Identifier: Apache-2.0
 #
-"""View for effective_rates masu admin endpoint."""
+"""View for effective_rates masu admin endpoint.
+
+SECURITY: This endpoint uses AllowAny and is intentionally internal-only.
+In production on-prem deployments, access must be restricted by Kubernetes
+NetworkPolicy (cost-onprem masu-access policy) to ros-processor and Koku workers.
+"""
 import logging
 from datetime import date
 from decimal import Decimal

@@ -2,7 +2,12 @@
 # Copyright 2026 Red Hat Inc.
 # SPDX-License-Identifier: Apache-2.0
 #
-"""Masu API to re-publish existing ROS reports from S3 to Kafka for re-ingestion."""
+"""Masu API to re-publish existing ROS reports from S3 to Kafka for re-ingestion.
+
+SECURITY: This endpoint uses AllowAny and is intentionally internal-only.
+In production on-prem deployments, access must be restricted by Kubernetes
+NetworkPolicy (cost-onprem masu-access policy) to ros-processor and Koku workers.
+"""
 import json
 import logging
 from http import HTTPStatus
