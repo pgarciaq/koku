@@ -17,6 +17,8 @@ from api.report.ocp.serializers import OCPGpuOrderBySerializer
 from api.report.ocp.serializers import OCPGpuQueryParamSerializer
 from api.report.ocp.serializers import OCPGroupBySerializer
 from api.report.ocp.serializers import OCPInventoryQueryParamSerializer
+from api.report.ocp.serializers import OCPMigProfilesGroupBySerializer
+from api.report.ocp.serializers import OCPMigProfilesQueryParamSerializer
 from api.report.ocp.serializers import OCPOrderBySerializer
 from api.report.ocp.serializers import OCPQueryParamSerializer
 
@@ -660,11 +662,20 @@ class OCPGpuGroupBySerializerTest(TestCase):
         group_by_params = {
             "cluster": ["cluster1"],
             "project": ["project1"],
+            "node": ["node1"],
             "gpu_vendor": ["nvidia"],
             "gpu_model": ["Tesla T4"],
+            "gpu_mode": ["MIG"],
+            "mig_profile": ["1g.5gb"],
         }
         serializer = OCPGpuGroupBySerializer(data=group_by_params)
         self.assertTrue(serializer.is_valid())
+
+    def test_gpu_group_by_node_field(self):
+        """Test that node is a declared group_by field (not only and:/or:/exact: variants)."""
+        serializer = OCPGpuGroupBySerializer(data={"node": ["*"]})
+        self.assertTrue(serializer.is_valid(), serializer.errors)
+        self.assertIn("node", OCPGpuGroupBySerializer().fields)
 
     def test_gpu_group_by_params_invalid_fields(self):
         """Test parse of GPU group_by params with invalid fields."""
@@ -804,3 +815,47 @@ class OCPGpuQueryParamSerializerTest(IamTestCase):
         self.assertTrue(serializer.is_valid(), serializer.errors)
         self.assertNotIn("tag:application", serializer.validated_data.get("filter", {}))
         self.assertIn("gpu_vendor", serializer.validated_data.get("filter", {}))
+
+    def test_gpu_query_params_group_by_node(self):
+        """Test GPU query params accept group_by[node]."""
+        query_params = {
+            "filter": {"gpu_vendor": ["nvidia"]},
+            "group_by": {"node": ["*"], "project": ["*"]},
+        }
+        self.request_path = "/api/cost-management/v1/reports/openshift/gpu/"
+        serializer = OCPGpuQueryParamSerializer(data=query_params, context=self.ctx_w_path)
+        self.assertTrue(serializer.is_valid(), serializer.errors)
+
+
+class OCPMigProfilesGroupBySerializerTest(TestCase):
+    """Tests for the MIG profiles group_by serializer."""
+
+    def test_mig_profiles_group_by_mig_profile_field(self):
+        """Test that mig_profile is a declared group_by field."""
+        serializer = OCPMigProfilesGroupBySerializer(data={"mig_profile": ["*"]})
+        self.assertTrue(serializer.is_valid(), serializer.errors)
+        self.assertIn("mig_profile", OCPMigProfilesGroupBySerializer().fields)
+
+    def test_mig_profiles_group_by_invalid_field(self):
+        """Test parse of MIG profiles group_by params with invalid fields."""
+        serializer = OCPMigProfilesGroupBySerializer(data={"invalid_field": ["value"]})
+        with self.assertRaises(serializers.ValidationError):
+            serializer.is_valid(raise_exception=True)
+
+
+class OCPMigProfilesQueryParamSerializerTest(IamTestCase):
+    """Tests for the MIG profiles query parameter serializer."""
+
+    def test_mig_profiles_query_params_group_by_mig_profile(self):
+        """Test MIG profiles query params accept group_by[mig_profile]."""
+        query_params = {
+            "filter": {
+                "gpu_vendor": ["nvidia"],
+                "gpu_model": ["A100"],
+                "node": ["gpu_node_0"],
+            },
+            "group_by": {"mig_profile": ["*"]},
+        }
+        self.request_path = "/api/cost-management/v1/reports/openshift/gpu/mig_profiles/"
+        serializer = OCPMigProfilesQueryParamSerializer(data=query_params, context=self.ctx_w_path)
+        self.assertTrue(serializer.is_valid(), serializer.errors)

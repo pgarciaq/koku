@@ -1124,7 +1124,7 @@ class OCPProviderMap(ProviderMap):
                                 output_field=TextField(),
                             ),
                         },
-                        "group_by_options": ["cluster", "node", "namespace"],
+                        "group_by_options": ["cluster", "node", "namespace", "mig_profile"],
                         "tag_column": "all_labels",
                         "aggregates": {},
                         "default_ordering": {"mig_profile": "asc"},

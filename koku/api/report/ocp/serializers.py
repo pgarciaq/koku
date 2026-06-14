@@ -359,6 +359,7 @@ class OCPGpuGroupBySerializer(GroupSerializer):
 
     cluster = StringOrListField(child=serializers.CharField(), required=False)
     project = StringOrListField(child=serializers.CharField(), required=False)
+    node = StringOrListField(child=serializers.CharField(), required=False)
     gpu_vendor = StringOrListField(child=serializers.CharField(), required=False)
     gpu_model = StringOrListField(child=serializers.CharField(), required=False)
     gpu_name = StringOrListField(child=serializers.CharField(), required=False)
@@ -466,6 +467,14 @@ class OCPGpuQueryParamSerializer(OCPQueryParamSerializer):
         super().__init__(*args, **kwargs)
 
 
+class OCPMigProfilesGroupBySerializer(GroupSerializer):
+    """Serializer for handling MIG profiles query parameter group_by."""
+
+    _opfields = ("mig_profile",)
+
+    mig_profile = StringOrListField(child=serializers.CharField(), required=False)
+
+
 class OCPMigProfilesFilterSerializer(BaseFilterSerializer):
     """Serializer for handling MIG profiles filter parameters.
 
@@ -484,6 +493,7 @@ class OCPMigProfilesFilterSerializer(BaseFilterSerializer):
 class OCPMigProfilesQueryParamSerializer(OCPQueryParamSerializer):
     """Serializer for handling MIG profiles query parameters."""
 
+    GROUP_BY_SERIALIZER = OCPMigProfilesGroupBySerializer
     FILTER_SERIALIZER = OCPMigProfilesFilterSerializer
 
     def __init__(self, *args, **kwargs):
