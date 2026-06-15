@@ -3,6 +3,9 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 """Tests for ROS OCP tag sync."""
+import os
+import tempfile
+from unittest import TestCase
 from unittest.mock import patch
 
 from django.test import override_settings
@@ -11,6 +14,7 @@ from django_tenants.utils import schema_context
 from api.iam.models import Tenant
 from api.provider.models import Provider
 from api.utils import DateHelper
+from masu.processor.ros_tag_sync import _read_bearer_token
 from masu.processor.ros_tag_sync import build_namespace_tags_payload
 from masu.processor.ros_tag_sync import org_id_from_schema
 from masu.processor.ros_tag_sync import sync_ros_ocp_tags
@@ -133,3 +137,17 @@ class RosTagSyncTest(MasuTestCase):
         tenant_count = Tenant.objects.exclude(schema_name="public").count()
         sync_ros_ocp_tags_periodic(tracing_id="trace-periodic")
         self.assertEqual(tenant_count, mock_delay.call_count)
+
+
+@override_settings(ROS_TAGS_DEV_TOKEN="")
+class RosBearerTokenPathTest(TestCase):
+    def test_read_bearer_token_prefers_ros_sa_token_path_env(self):
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", delete=False) as token_file:
+            token_file.write("projected-token-content\n")
+            token_path = token_file.name
+
+        try:
+            with patch.dict(os.environ, {"ROS_SA_TOKEN_PATH": token_path}, clear=False):
+                self.assertEqual("projected-token-content", _read_bearer_token())
+        finally:
+            os.unlink(token_path)
