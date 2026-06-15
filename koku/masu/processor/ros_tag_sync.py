@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from collections import defaultdict
 from datetime import datetime
 from datetime import timezone
@@ -54,7 +55,11 @@ def _read_bearer_token() -> str | None:
     if dev_token:
         return dev_token
 
-    token_path = getattr(settings, "ROS_TAGS_SA_TOKEN_PATH", DEFAULT_SA_TOKEN_PATH)
+    token_path = (
+        os.environ.get("ROS_SA_TOKEN_PATH")
+        or getattr(settings, "ROS_TAGS_SA_TOKEN_PATH", None)
+        or DEFAULT_SA_TOKEN_PATH
+    )
     try:
         with open(token_path, encoding="utf-8") as token_file:
             token = token_file.read().strip()
