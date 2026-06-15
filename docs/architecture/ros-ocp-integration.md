@@ -252,30 +252,61 @@ on ros-ocp-backend. **Koku's role depends on deployment topology** — controlle
 
 ```mermaid
 flowchart TB
-    subgraph onprem["On-prem: ROS_TAGS_SOURCE=db (default)"]
+    subgraph onprem_api["On-prem: ROS_TAGS_SOURCE=api (default)"]
         direction LR
-        K1[Koku summarization] --> PG[(Shared PostgreSQL)]
-        PG --> R1[ROS list query JOIN]
+        K1[Koku summarization] --> CEL1[Celery push]
+        CEL1 -->|POST /internal/tags/sync| R1[ROS resolved_tags]
         R1 --> U1[User filter tag:key]
+    end
+    subgraph onprem_db["On-prem advanced: ROS_TAGS_SOURCE=db"]
+        direction LR
+        K2[Koku summarization] --> PG[(Shared PostgreSQL)]
+        PG --> R2[ROS list query JOIN]
+        R2 --> U2[User filter tag:key]
     end
     subgraph saas["SaaS: ROS_TAGS_SOURCE=api"]
         direction LR
-        K2[Koku summarization] --> CEL[Celery push]
-        CEL -->|POST /internal/tags/sync| R2[ROS resolved_tags]
-        R2 --> U2[User filter tag:key]
+        K3[Koku summarization] --> CEL2[Celery push]
+        CEL2 -->|POST /internal/tags/sync| R3[ROS resolved_tags]
+        R3 --> U3[User filter tag:key]
     end
 ```
 
 | Mode | When | Koku action | ROS tag source |
 |------|------|-------------|----------------|
-| **On-prem shared DB** | cost-onprem, single PostgreSQL | **None** — no push tasks run | Live SQL JOIN to `org{org_id}.reporting_ocptags_values` |
+| **On-prem push API (default)** | [cost-onprem chart](../../../../cost-onprem-chart/cost-onprem/values.yaml) `ros.api.tagsSource: api` | Celery HTTP push after summarization & settings | `org_container_keys.resolved_tags` |
+| **On-prem shared DB (advanced)** | Single PostgreSQL, `tagsSource: db` | **None** — no push tasks run | Live SQL JOIN to `org{org_id}.reporting_ocptags_values` |
 | **SaaS push API** | Separate Koku/ROS databases | Celery HTTP push after summarization & settings | `org_container_keys.resolved_tags` |
 
 ---
 
-### On-prem: ROS reads directly from Koku's database
+### On-prem default: Koku pushes tags via Celery
 
-**No action required from Koku for tag sync.** When `ROS_TAGS_SOURCE=db` (default):
+The [cost-onprem Helm chart](../../../../cost-onprem-chart/cost-onprem/values.yaml) defaults
+`ros.api.tagsSource: api`. Koku Celery workers push enabled OCP namespace tags to ROS over HTTP
+(see [SaaS push API](#saas-koku-pushes-tags-via-celery) below for task and auth details).
+
+**Operator steps:**
+
+1. Enable tag keys via Cost Management Settings API (same as for cost reports).
+2. Chart sets `ROS_TAGS_ENABLED=true`, `ROS_TAGS_SOURCE=api` on both Koku workers and ROS.
+3. Workers mount a projected service-account token at `/var/run/secrets/ros/token`
+   (`ROS_SA_TOKEN_PATH`) because `automountServiceAccountToken: false`.
+
+**Koku configuration (set by chart when `tagsSource: api`):**
+
+| Variable | Value |
+|----------|-------|
+| `ROS_TAGS_ENABLED` | `true` |
+| `ROS_TAGS_SOURCE` | `api` |
+| `ROS_OCP_BACKEND_URL` | `http://{release}-ros-api:8000` |
+| `ROS_SA_TOKEN_PATH` | `/var/run/secrets/ros/token` |
+
+---
+
+### On-prem advanced: ROS reads directly from Koku's database
+
+**No action required from Koku for tag sync.** When `ROS_TAGS_SOURCE=db` (advanced shared-PostgreSQL mode):
 
 - Koku Celery tasks `sync_ros_ocp_tags` and `sync_ros_ocp_tags_periodic` are **no-ops**.
 - Calls to `schedule_ros_tag_sync()` from the Settings API and post-summarization hooks return immediately.
@@ -293,9 +324,11 @@ There is no sync lag, no HTTP auth, and no ROS push endpoints (they return 404).
 **Operator steps:**
 
 1. Enable tag keys via Cost Management Settings API (same as for cost reports).
-2. Set on ROS only: `ROS_TAGS_ENABLED=true`, `ROS_TAGS_SOURCE=db`.
+2. Set `ros.api.tagsSource: db` in Helm values; ROS reads Koku tag tables directly.
+3. Set on ROS only: `ROS_TAGS_ENABLED=true`, `ROS_TAGS_SOURCE=db`.
+4. Run the `koku-schema-grants` hook job so `ros_user` can SELECT from Koku tenant schemas.
 
-**Koku configuration:** none for tag sync.
+**Koku configuration:** none for tag sync (push tasks are no-ops).
 
 Implementation: ros-ocp-backend [`internal/tags/db_provider.go`](../../../../ros-ocp-backend/internal/tags/db_provider.go),
 [`internal/model/tag_filters.go`](../../../../ros-ocp-backend/internal/model/tag_filters.go).
@@ -490,22 +523,23 @@ successful sync remains visible (**eventual consistency**).
 
 #### ROS (ros-ocp-backend)
 
-| Variable | Default | On-Prem | SaaS | Description |
-|----------|---------|---------|------|-------------|
+| Variable | Default | On-Prem (chart) | SaaS | Description |
+|----------|---------|-----------------|------|-------------|
 | `ROS_TAGS_ENABLED` | `false` | `true` | `true` | Enables list filters; push API when source=`api` |
-| `ROS_TAGS_SOURCE` | `db` | `db` | `api` | Data path selector |
-| `ROS_TAGS_ALLOWED_SERVICE_ACCOUNTS` | (empty) | — | Optional | SA allowlist for push |
+| `ROS_TAGS_SOURCE` | `db` | `api` ([values.yaml](../../../../cost-onprem-chart/cost-onprem/values.yaml)) | `api` | Data path selector |
+| `ROS_TAGS_ALLOWED_SERVICE_ACCOUNTS` | (empty) | Koku SA | Optional | SA allowlist for push |
 | `ROS_TAGS_DEV_TOKEN` | (empty) | — | Dev | Static bearer when SA token unavailable |
 
 #### Koku
 
-| Variable | Default | On-Prem (`db`) | SaaS (`api`) | Description |
-|----------|---------|----------------|--------------|-------------|
-| `ROS_TAGS_ENABLED` | `false` | Ignored | `true` | Enables Celery push tasks |
-| `ROS_TAGS_SOURCE` | `db` | `db` | `api` | `db` = no push |
-| `ROS_OCP_BACKEND_URL` | `http://cost-onprem-ros-api:8000` | Unused | Required | ROS API base URL |
-| `ROS_TAGS_DEV_TOKEN` | (empty) | Unused | Dev | Must match ROS when SA mount missing |
-| `ROS_TAGS_SA_TOKEN_PATH` | `/var/run/secrets/.../token` | Unused | Production | Worker SA token path |
+| Variable | Default | On-Prem (`api`, chart default) | On-Prem (`db`, advanced) | SaaS (`api`) | Description |
+|----------|---------|-------------------------------|--------------------------|--------------|-------------|
+| `ROS_TAGS_ENABLED` | `false` | `true` (chart) | Ignored | `true` | Enables Celery push tasks |
+| `ROS_TAGS_SOURCE` | `db` | `api` (chart) | `db` | `api` | `db` = no push |
+| `ROS_OCP_BACKEND_URL` | — | Set by chart | Unused | Required | ROS API base URL |
+| `ROS_SA_TOKEN_PATH` | — | `/var/run/secrets/ros/token` | Unused | — | Projected SA token on workers |
+| `ROS_TAGS_DEV_TOKEN` | (empty) | — | Unused | Dev | Must match ROS when SA mount missing |
+| `ROS_TAGS_SA_TOKEN_PATH` | `/var/run/secrets/.../token` | Alias of `ROS_SA_TOKEN_PATH` | Unused | Production | Worker SA token path |
 
 Settings API hooks that call `schedule_ros_tag_sync`:
 
@@ -518,13 +552,13 @@ Post-summarization hook: [`masu/processor/tasks.py`](../../koku/masu/processor/t
 
 ### Tag lifecycle (summary)
 
-| Scenario | On-prem (`db`) | SaaS (`api`) |
-|----------|----------------|--------------|
-| Tag key enabled | Available after values in Koku tables | Immediate push + catalog update |
-| Tag key disabled | Excluded from JOIN immediately | Full-replace removes from `resolved_tags` |
-| New values on cluster | Next summarization | Next summarization + push |
-| Push/network failure | N/A | Previous tags retained; 6h retry |
-| ROS restart | N/A (stateless reads) | Tags persisted in PostgreSQL |
+| Scenario | On-prem (`api`, default) | On-prem (`db`, advanced) | SaaS (`api`) |
+|----------|--------------------------|--------------------------|--------------|
+| Tag key enabled | Immediate push + catalog update | Available after values in Koku tables | Immediate push + catalog update |
+| Tag key disabled | Full-replace removes from `resolved_tags` | Excluded from JOIN immediately | Full-replace removes from `resolved_tags` |
+| New values on cluster | Next summarization + push | Next summarization | Next summarization + push |
+| Push/network failure | Previous tags retained; 6h retry | N/A | Previous tags retained; 6h retry |
+| ROS restart | Tags persisted in PostgreSQL | N/A (stateless reads) | Tags persisted in PostgreSQL |
 
 Full scenario matrix: ros-ocp-backend [`docs/features/tag-filtering.md`](../../../../ros-ocp-backend/docs/features/tag-filtering.md).
 
@@ -550,7 +584,8 @@ Multiple tag keys AND together; comma-separated values OR within a key. Requires
 
 | Mode | Inter-service auth |
 |------|-------------------|
-| On-prem (`db`) | **None** — direct PostgreSQL access |
+| On-prem (`api`, default) | Kubernetes ServiceAccount TokenReview; projected token on workers |
+| On-prem (`db`, advanced) | **None** — direct PostgreSQL access |
 | SaaS (`api`) | Kubernetes ServiceAccount TokenReview; dev token fallback |
 
 **Future: mTLS** for SaaS push hardening — see ros-ocp-backend
@@ -560,12 +595,12 @@ Multiple tag keys AND together; comma-separated values OR within a key. Requires
 
 ### Comparison
 
-| Dimension | On-prem (`db`) | SaaS (`api`) |
-|-----------|----------------|--------------|
-| Koku Celery tasks | No-ops | Active |
-| Sync latency | 0 (live query) | Event-driven + up to 6h worst case |
-| Koku env vars for tags | None | `ROS_TAGS_*`, `ROS_OCP_BACKEND_URL` |
-| Monitoring | Summarization completion | `/internal/tags/status` `synced_at` |
+| Dimension | On-prem (`api`, default) | On-prem (`db`, advanced) | SaaS (`api`) |
+|-----------|--------------------------|--------------------------|--------------|
+| Koku Celery tasks | Active | No-ops | Active |
+| Sync latency | Event-driven + up to 6h worst case | 0 (live query) | Event-driven + up to 6h worst case |
+| Koku env vars for tags | `ROS_TAGS_*`, `ROS_OCP_BACKEND_URL`, `ROS_SA_TOKEN_PATH` | None | `ROS_TAGS_*`, `ROS_OCP_BACKEND_URL` |
+| Monitoring | `/internal/tags/status` `synced_at` | Summarization completion | `/internal/tags/status` `synced_at` |
 
 ---
 
