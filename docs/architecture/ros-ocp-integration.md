@@ -238,9 +238,11 @@ Key subsystems:
 
 ### Kruize (legacy)
 
-When `ROS_USE_NATIVE_ENGINE=false`, the ROS processor delegates to Kruize
+When `ROS_ENABLED_PLUGINS=kruize`, the ROS processor delegates to Kruize
 Autotune via HTTP for recommendation computation. This path is maintained
-for backward compatibility.
+for backward compatibility. (Note: the former `ROS_USE_NATIVE_ENGINE` flag
+has been removed; the native engine is now unconditionally active unless
+Kruize is explicitly selected via `ROS_ENABLED_PLUGINS`.)
 
 ---
 
@@ -608,7 +610,7 @@ Multiple tag keys AND together; comma-separated values OR within a key. Requires
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `ROS_USE_NATIVE_ENGINE` | `true` | Toggle native vs Kruize engine |
+| `ROS_ENABLED_PLUGINS` | `""` (all) | Allowlist of active plugins; set to `kruize` for legacy engine |
 | `KOKU_MASU_URL` | — | Koku Masu service URL for `effective_rates` |
 | `ROS_GPU_IDLE_THRESHOLD` | `0.05` | SM activity below = idle |
 | `ROS_GPU_UNDERUTIL_THRESHOLD` | `0.30` | SM activity below = underutilized |
