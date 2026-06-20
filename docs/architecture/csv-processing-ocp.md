@@ -179,17 +179,22 @@ report_period_start,report_period_end,interval_start,interval_end,namespace,pod,
 - `gpu_memory_capacity_mib` - GPU memory in MiB
 - `gpu_pod_uptime` - Time pod used the GPU (seconds)
 
+**Additional Columns** (newer operator versions):
+- `gpu_pod_utilization` - GPU utilization percentage (0-100)
+- `gpu_max_slices` - Maximum MIG slices for the GPU model
+
 **MIG (Multi-Instance GPU) Columns** (when MIG enabled):
-- `mig_instance_uuid` - Unique identifier for the MIG instance
+- `mig_instance_id` - Unique identifier for the MIG instance
 - `mig_profile` - MIG profile (e.g., "1g.5gb", "3g.20gb")
-- `mig_compute_slices` - Number of compute slices allocated
-- `parent_gpu_uuid` - Reference to physical GPU UUID
-- `parent_gpu_max_slices` - Max slices for the GPU model
+- `mig_strategy` - MIG strategy ("single" or "mixed")
+
+Note: `mig_slice_count`, `mig_memory_capacity_mib`, and `gpu_max_slices` are derived
+in Koku's post-processor from `mig_profile` and `gpu_model_name`, not directly from operator CSV.
 
 **Example Row:**
 ```csv
-report_period_start,report_period_end,interval_start,interval_end,namespace,node,pod,gpu_uuid,gpu_model_name,gpu_vendor_name,gpu_memory_capacity_mib,gpu_pod_uptime,mig_instance_uuid,mig_profile,mig_compute_slices,parent_gpu_uuid,parent_gpu_max_slices
-2026-01-01,2026-02-01,2026-01-15T00:00:00Z,2026-01-15T01:00:00Z,ml-training,gpu-node-1,train-pod,MIG-abc123,NVIDIA A100-SXM4-40GB,nvidia,5120,3600,MIG-abc123,1g.5gb,1,GPU-xyz789,7
+report_period_start,report_period_end,interval_start,interval_end,node,namespace,pod,gpu_uuid,gpu_model_name,gpu_vendor_name,gpu_memory_capacity_mib,gpu_pod_uptime,gpu_pod_utilization,gpu_max_slices,mig_instance_id,mig_profile,mig_strategy
+2026-01-01,2026-02-01,2026-01-15T00:00:00Z,2026-01-15T01:00:00Z,gpu-node-1,ml-training,train-pod,GPU-xyz789,NVIDIA A100-SXM4-40GB,nvidia,40960,3600,85.2,7,MIG-abc123,1g.5gb,single
 ```
 
 **See:** [MIG GPU Support Architecture](./mig-gpu-support.md) for detailed MIG cost calculation.
@@ -250,8 +255,10 @@ JSON message containing:
 JSON file containing:
 - `uuid` - Manifest unique identifier
 - `cluster_id` - OpenShift cluster UUID
-- `date`, `start` - Report date and start time
-- `files` - Array of CSV filenames (pod_usage, storage_usage, node_labels, namespace_labels, vm_usage)
+- `date` - Report generation date
+- `start`, `end` - Report date range (**required** for summary table population; missing values silently skip summarization)
+- `files` - Array of cost management CSV filenames (pod_usage, storage_usage, node_labels, namespace_labels, vm_usage, gpu_usage)
+- `resource_optimization_files` - Array of ROS CSV filenames (ros_usage, ros_namespace_usage, ros_cluster_quota, snapshot_inventory, storage_usage). These are routed to `ROSReportShipper` for forwarding to ros-ocp-backend via S3 + Kafka
 - `certified` - Whether cluster is certified OpenShift
 - `operator_version` - cost-mgmt-metrics-operator version (e.g., "4.1.0")
 - `daily_reports` - Boolean indicating if operator sends daily or cumulative reports
@@ -685,10 +692,10 @@ This pattern is repeated for different aggregation levels:
 
 ### **2. Multiple Report Types**
 
-**Challenge:** 5 different report types (pod, storage, node labels, namespace labels, VM) must be combined.
+**Challenge:** 6 different report types (pod, storage, node labels, namespace labels, VM, GPU) must be combined.
 
 **Solution:**
-- **Trino SQL:** Complex JOIN across all 5 Parquet tables
+- **Trino SQL:** Complex JOIN across all 6 Parquet tables
 - **Label Merging:** `map_concat` to merge pod_labels + node_labels + namespace_labels
 - **Data Source Field:** 'Pod' or 'Storage' to distinguish aggregation types
 
