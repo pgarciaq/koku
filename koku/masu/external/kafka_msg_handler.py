@@ -76,7 +76,9 @@ MANIFEST_ACCESSOR = ReportManifestDBAccessor()
 # VM patterns must be ROS-specific (ros-openshift-vm-usage) so cm-openshift-vm-usage stays in Koku.
 ROS_EXTRA_PATTERNS = (
     "storage-usage",
+    "ocp_storage_usage",
     "snapshot-inventory",
+    "ocp_snapshot_inventory",
     "ros-openshift-vm-usage",
     "ocp_ros_vm_usage",
     "ros-openshift-vm-gpu-device",
