@@ -6,7 +6,7 @@ from django.db import models
 class Migration(migrations.Migration):
 
     dependencies = [
-        ("reporting", "0350_widen_ratestousage_label_hash"),
+        ("reporting", "0351_create_ocp_cost_breakdown_p"),
     ]
 
     operations = [
