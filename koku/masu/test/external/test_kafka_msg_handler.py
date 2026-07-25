@@ -1419,7 +1419,6 @@ class KafkaMsgHandlerTest(MasuTestCase):
 
                         self.assertIn("0099999999999", csv[1])
 
-<<<<<<< HEAD
     def test_read_manifest_from_tarball_rejects_unsafe_manifest_paths(self):
         """Test manifest fields with path separators are rejected before extraction."""
         manifest_dict = json.loads(Path("koku/masu/test/data/ocp/payload2/manifest.json").read_text())
@@ -1596,6 +1595,8 @@ class KafkaMsgHandlerTest(MasuTestCase):
         self.assertIn("ocp_ros_vm_usage", ROS_EXTRA_PATTERNS)
         self.assertIn("ros-openshift-vm-gpu-device", ROS_EXTRA_PATTERNS)
         self.assertIn("ocp_ros_vm_gpu_device", ROS_EXTRA_PATTERNS)
+        self.assertIn("ros-openshift-vm-pvc", ROS_EXTRA_PATTERNS)
+        self.assertIn("ocp_ros_vm_pvc", ROS_EXTRA_PATTERNS)
 
         test_cases = [
             ("cm-openshift-snapshot-inventory-202603.0.csv", True),
@@ -1605,6 +1606,8 @@ class KafkaMsgHandlerTest(MasuTestCase):
             ("May-2026-uuid-ocp_ros_vm_usage.csv", True),
             ("ros-openshift-vm-gpu-device-20260501.csv", True),
             ("May-2026-uuid-ocp_ros_vm_gpu_device.0.csv", True),
+            ("ros-openshift-vm-pvc-202605.csv", True),
+            ("May-2026-uuid-ocp_ros_vm_pvc.csv", True),
             ("cm-openshift-vm-usage-202605.csv", False),
             ("May-2026-uuid-ocp_vm_gpu_device.csv", False),
             ("May-2026-uuid-ocp_vm_usage.csv", False),

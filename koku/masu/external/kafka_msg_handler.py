@@ -86,6 +86,8 @@ ROS_EXTRA_PATTERNS = (
     "ocp_ros_vm_usage",
     "ros-openshift-vm-gpu-device",
     "ocp_ros_vm_gpu_device",
+    "ros-openshift-vm-pvc",
+    "ocp_ros_vm_pvc",
 )
 
 
