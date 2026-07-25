@@ -17,6 +17,7 @@ from masu.api.db_performance.dbp_views import stat_statements
 from masu.api.download import download_report
 from masu.api.effective_rates import effective_rates
 from masu.api.enabled_tags import EnabledTagView
+from masu.api.exchange_rate import exchange_rate
 from masu.api.expired_data import expired_data
 from masu.api.expired_data import expired_trino_partitions
 from masu.api.hcs_report_data import hcs_report_data
@@ -43,4 +44,5 @@ from masu.api.trino import trino_ui
 from masu.api.update_cost_model_costs import update_cost_model_costs
 from masu.api.update_rates import update_azure_storage_capacity
 from masu.api.update_rates import update_exchange_rates
+from masu.api.user_currency import user_currency
 from masu.api.validate_data import validate_cost_data

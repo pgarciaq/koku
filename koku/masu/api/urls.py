@@ -21,6 +21,7 @@ from masu.api.views import dbsettings
 from masu.api.views import download_report
 from masu.api.views import effective_rates
 from masu.api.views import EnabledTagView
+from masu.api.views import exchange_rate
 from masu.api.views import expired_data
 from masu.api.views import expired_trino_partitions
 from masu.api.views import explain_query
@@ -47,6 +48,7 @@ from masu.api.views import trino_query
 from masu.api.views import update_azure_storage_capacity
 from masu.api.views import update_cost_model_costs
 from masu.api.views import update_exchange_rates
+from masu.api.views import user_currency
 from masu.api.views import validate_cost_data
 
 ROUTER = DefaultRouter()
@@ -91,6 +93,8 @@ urlpatterns = [
     path("db-performance/schema-sizes/", schema_sizes, name="schema_sizes"),
     path("invalidate_cache/", invalidate_cache, name="invalidate_cache"),
     path("monthly_exchange_rates/", monthly_exchange_rates, name="monthly_exchange_rates"),
+    path("user_currency/", user_currency, name="user_currency"),
+    path("exchange_rate/", exchange_rate, name="exchange_rate"),
 ]
 
 if settings.DEBUG:
