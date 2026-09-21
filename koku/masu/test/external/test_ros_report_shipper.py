@@ -136,3 +136,38 @@ class TestROSReportShipper(TestCase):
         expected_msg = bytes(json.dumps(expected_json), "utf-8")
         actual = self.ros_shipper.build_ros_msg(["report1_url"], ["path1"], ["report1"])
         self.assertEqual(actual, expected_msg)
+
+    def test_build_ros_msg_with_topology(self):
+        """Manifest cr_status topology facts ride the message; absent stays absent."""
+        manifest = ManifestFactory.build(manifest_id=301, cluster_id=self.cluster_id)
+        manifest.cr_status = {
+            "topology": {
+                "controlPlaneTopology": "HighlyAvailable",
+                "hostedClusterCount": 1,
+                "hostedControlPlaneNamespaces": ["hc01-infra-hc01"],
+            }
+        }
+        payload = utils.PayloadInfo(
+            request_id=self.request_id,
+            manifest=manifest,
+            source_id=self.source_id,
+            provider_uuid=self.provider_uuid,
+            provider_type="OCP",
+            cluster_alias=self.cluster_alias,
+            account_id=self.account_id,
+            org_id=self.org_id,
+            schema_name=self.schema_name,
+            trino_schema=self.schema_name,
+        )
+        with patch("masu.external.ros_report_shipper.get_ros_s3_client"):
+            shipper = ROSReportShipper(payload, self.b64_identity, {"account": self.account_id, "org_id": self.org_id})
+        raw = shipper.build_ros_msg(["report1_url"], ["path1"], ["report1"])
+        msg = json.loads(raw)
+        self.assertEqual(
+            {
+                "controlPlaneTopology": "HighlyAvailable",
+                "hostedClusterCount": 1,
+                "hostedControlPlaneNamespaces": ["hc01-infra-hc01"],
+            },
+            msg["metadata"]["topology"],
+        )

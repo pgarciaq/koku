@@ -71,6 +71,10 @@ class ROSReportShipper:
             "cluster_uuid": payload_info.manifest.cluster_id,
             "operator_version": payload_info.manifest.operator_version,
         }
+        # Manifest topology facts for downstream W0 classification. Absent or
+        # empty on pre-#406 manifests: the key stays out of the message.
+        manifest_status = getattr(payload_info.manifest, "cr_status", None) or {}
+        self.topology_facts = manifest_status.get("topology") or None
         self.s3_client = get_ros_s3_client()
         self.dh = DateHelper()
 
@@ -146,6 +150,8 @@ class ROSReportShipper:
             "manifest_id": self.manifest_uuid,
             "expected_files": expected_files or [],
         }
+        if self.topology_facts:
+            metadata["topology"] = self.topology_facts
         ros_json = {
             "request_id": self.request_id,
             "b64_identity": self.b64_identity,
