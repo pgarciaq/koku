@@ -243,6 +243,12 @@ app.conf.beat_schedule["sync_ros_ocp_tags_periodic"] = {
     "schedule": crontab(minute="15", hour="*/6"),
 }
 
+# Safety-net ROS cost-groups sync (every 6 hours, #675)
+app.conf.beat_schedule["sync_ros_ocp_costgroups_periodic"] = {
+    "task": "masu.processor.ros_costgroups_sync.sync_ros_ocp_costgroups_periodic",
+    "schedule": crontab(minute="15", hour="*/6"),
+}
+
 
 # Celery timeout if broker is unavailable to avoid blocking indefinitely
 app.conf.broker_transport_options = {"max_retries": 4, "interval_start": 0, "interval_step": 0.5, "interval_max": 3}

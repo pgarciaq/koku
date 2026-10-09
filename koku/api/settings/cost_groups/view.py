@@ -95,6 +95,9 @@ class CostGroupsAddView(CostGroupsView):
 
         projects = put_openshift_namespaces(serializer.validated_data)
         self._summarize_current_month(request.user.customer.schema_name, projects)
+        from masu.processor.ros_costgroups_sync import schedule_ros_ocp_costgroups
+
+        schedule_ros_ocp_costgroups(request.user.customer.schema_name)
 
         return Response(status=status.HTTP_204_NO_CONTENT)
 
@@ -106,5 +109,8 @@ class CostGroupsRemoveView(CostGroupsView):
 
         projects = delete_openshift_namespaces(serializer.validated_data)
         self._summarize_current_month(request.user.customer.schema_name, projects)
+        from masu.processor.ros_costgroups_sync import schedule_ros_ocp_costgroups
+
+        schedule_ros_ocp_costgroups(request.user.customer.schema_name)
 
         return Response(status=status.HTTP_204_NO_CONTENT)

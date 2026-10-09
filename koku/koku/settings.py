@@ -710,6 +710,10 @@ ROS_SERVICE_TOKEN = ENVIRONMENT.get_value("ROS_SERVICE_TOKEN", default="")
 ROS_TAGS_ENABLED = ENVIRONMENT.bool("ROS_TAGS_ENABLED", default=False)
 # "db" = ROS reads Koku tag tables directly (advanced shared-DB); "api" = HTTP push to ROS (on-prem chart default)
 ROS_TAGS_SOURCE = ENVIRONMENT.get_value("ROS_TAGS_SOURCE", default="db")
+# ROS-OCP cost-groups sync (Koku → ros-ocp-backend Platform namespaces, #675)
+ROS_COSTGROUPS_ENABLED = ENVIRONMENT.bool("ROS_COSTGROUPS_ENABLED", default=False)
+# "db" = ROS reads Koku cost category tables directly (advanced shared-DB); "api" = HTTP push to ROS
+ROS_COSTGROUPS_SOURCE = ENVIRONMENT.get_value("ROS_COSTGROUPS_SOURCE", default="db")
 ROS_TAGS_DEV_TOKEN = ENVIRONMENT.get_value("ROS_TAGS_DEV_TOKEN", default="")
 ROS_TAGS_SA_TOKEN_PATH = ENVIRONMENT.get_value(
     "ROS_SA_TOKEN_PATH",
