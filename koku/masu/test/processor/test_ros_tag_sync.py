@@ -5,10 +5,10 @@
 """Tests for ROS OCP tag sync."""
 import os
 import tempfile
-from unittest import TestCase
 from unittest.mock import patch
 
 from django.test import override_settings
+from django.test import SimpleTestCase
 from django_tenants.utils import schema_context
 
 from api.iam.models import Tenant
@@ -140,7 +140,7 @@ class RosTagSyncTest(MasuTestCase):
 
 
 @override_settings(ROS_TAGS_DEV_TOKEN="")
-class RosBearerTokenPathTest(TestCase):
+class RosBearerTokenPathTest(SimpleTestCase):
     def test_read_bearer_token_prefers_ros_sa_token_path_env(self):
         with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", delete=False) as token_file:
             token_file.write("projected-token-content\n")

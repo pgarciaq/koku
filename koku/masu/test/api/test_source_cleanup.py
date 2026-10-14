@@ -40,8 +40,8 @@ class SourceCleanupTests(IamTestCase):
                 "name": provider.name,
                 "source_type": provider.type,
                 "auth_header": Config.SOURCES_FAKE_HEADER,
-                "account_id": "org1234567",
-                "org_id": "org1234567",
+                "account_id": self.customer_data["account_id"],
+                "org_id": self.customer_data["org_id"],
                 "offset": source_id + 1,
             }
             source = Sources(**source_def)

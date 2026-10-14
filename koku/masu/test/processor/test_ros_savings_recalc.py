@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 """Tests for ROS savings recalculation notification."""
+import os
 from unittest.mock import patch
 
 from django.test import override_settings
@@ -37,5 +38,8 @@ class RosSavingsRecalcTest(MasuTestCase):
 
     @patch("masu.processor.ros_savings_recalc.requests.post")
     def test_notify_noops_when_ros_not_configured(self, mock_post):
-        notify_ros_savings_recalculation(self.schema)
+        with override_settings(ROS_OCP_BACKEND_URL="", ROS_API_HOST=""), patch.dict(
+            os.environ, {"ROS_OCP_BACKEND_URL": "", "ROS_API_HOST": ""}
+        ):
+            notify_ros_savings_recalculation(self.schema)
         mock_post.assert_not_called()

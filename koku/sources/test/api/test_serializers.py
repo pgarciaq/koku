@@ -152,8 +152,8 @@ class AdminSourcesSerializerTests(IamTestCase):
             "authentication": {"credentials": {"role_arn": "arn:aws:iam::111111111111:role/CostManagement"}},
             "billing_source": {"data_source": {"bucket": "first-bucket"}},
             "auth_header": Config.SOURCES_FAKE_HEADER,
-            "account_id": "org1234567",
-            "org_id": "org1234567",
+            "account_id": self.Customer.account_id,
+            "org_id": self.Customer.org_id,
             "offset": 10,
         }
         with patch.object(ProviderAccessor, "cost_usage_source_ready", returns=True):

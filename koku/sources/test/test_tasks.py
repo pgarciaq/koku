@@ -43,8 +43,8 @@ class SourcesTasksTest(TestCase):
             "authentication": {"credentials": {"role_arn": "arn:aws:iam::111111111111:role/CostManagement"}},
             "billing_source": {"data_source": {"bucket": "fake-bucket"}},
             "auth_header": Config.SOURCES_FAKE_HEADER,
-            "account_id": "org1234567",
-            "org_id": "org1234567",
+            "account_id": "12345",
+            "org_id": "3333333",
             "offset": 10,
             "pending_delete": True,
         }
@@ -57,8 +57,8 @@ class SourcesTasksTest(TestCase):
             "authentication": {"credentials": {"role_arn": "arn:aws:iam::111111111111:role/CostManagement"}},
             "billing_source": {"data_source": {"bucket": "fake-local-bucket"}},
             "auth_header": Config.SOURCES_FAKE_HEADER,
-            "account_id": "org1234567",
-            "org_id": "org1234567",
+            "account_id": "12345",
+            "org_id": "3333333",
             "offset": 11,
         }
 
