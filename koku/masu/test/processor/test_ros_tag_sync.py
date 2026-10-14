@@ -60,6 +60,9 @@ class RosTagSyncTest(MasuTestCase):
     def setUp(self):
         super().setUp()
         with schema_context(self.schema):
+            # KokuTestRunner seeds this tenant with many OCP namespaces; these
+            # payload tests need to observe only the rows each test creates.
+            OCPUsageLineItemDailySummary.objects.all().delete()
             EnabledTagKeys.objects.filter(provider_type=Provider.PROVIDER_OCP).delete()
             EnabledTagKeys.objects.create(key="environment", provider_type=Provider.PROVIDER_OCP, enabled=True)
             EnabledTagKeys.objects.create(key="team", provider_type=Provider.PROVIDER_OCP, enabled=False)
