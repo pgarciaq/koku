@@ -27,6 +27,11 @@ LOG = logging.getLogger(__name__)
 DEFAULT_SA_TOKEN_PATH = "/var/run/secrets/kubernetes.io/serviceaccount/token"
 COSTGROUPS_SYNC_PATH = "/api/cost-management/v1/internal/cost-groups/sync"
 PLATFORM_GROUP_NAME = "Platform"
+# Migration-0315 seeds this cost-attribution bucket into every tenant's
+# Platform group. It is not a k8s namespace, and the ROS validator rejects
+# exact entries containing whitespace — shipping it would 400 the whole
+# push (#712).
+PLATFORM_UNALLOCATED_NAMESPACE = "Platform unallocated"
 
 
 def ros_costgroups_push_enabled() -> bool:
@@ -68,9 +73,14 @@ def _read_bearer_token() -> str | None:
 def build_costgroups_payload(schema_name: str) -> dict:
     """Build ros-ocp-backend cost-groups sync payload for a tenant schema.
 
-    The whole Platform group ships — shipped defaults and admin-added rows
-    alike (system_default is provenance metadata only). Koku `%`-wildcard
-    rows pass through verbatim with is_prefix set; ROS strips the suffix.
+    All real namespaces in the Platform group ship — shipped defaults and
+    admin-added rows alike (system_default is provenance metadata only).
+    Koku `%`-wildcard rows pass through verbatim with is_prefix set; ROS
+    strips the suffix. The migration-seeded "Platform unallocated"
+    attribution bucket is skipped (it is not a namespace, and ROS validation
+    rejects it), and admin-added exact rows that could not be namespaces
+    (whitespace) are skipped with a warning so one bad row cannot 400 the
+    whole push (#712).
     """
     org_id = org_id_from_schema(schema_name)
     synced_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
@@ -81,14 +91,28 @@ def build_costgroups_payload(schema_name: str) -> dict:
             .values("namespace", "system_default")
             .order_by("namespace")
         )
-        entries = [
-            {
-                "namespace": row["namespace"],
-                "is_prefix": row["namespace"].endswith("%"),
-                "system_default": bool(row["system_default"]),
-            }
-            for row in rows
-        ]
+        entries = []
+        for row in rows:
+            namespace = row["namespace"]
+            if namespace == PLATFORM_UNALLOCATED_NAMESPACE:
+                continue
+            is_prefix = namespace.endswith("%")
+            if not is_prefix and any(char.isspace() for char in namespace):
+                LOG.warning(
+                    log_json(
+                        msg="skipping invalid exact namespace in ROS cost-groups payload",
+                        schema=schema_name,
+                        namespace=namespace,
+                    )
+                )
+                continue
+            entries.append(
+                {
+                    "namespace": namespace,
+                    "is_prefix": is_prefix,
+                    "system_default": bool(row["system_default"]),
+                }
+            )
 
     return {
         "org_id": org_id,

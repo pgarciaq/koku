@@ -122,6 +122,13 @@ app = LoggingCelery(
 )
 app.config_from_object("django.conf:settings", namespace="CELERY")
 
+# Modules whose tasks workers must register at startup. Workers import only
+# what their startup chains pull in; masu.processor.ros_costgroups_sync has no
+# such chain (its only importers are function-level in the API views), so its
+# beat- and API-triggered dispatches were silently discarded by every worker
+# (#712). import_default_modules() — what a fresh worker runs — loads these.
+app.conf.imports = ("masu.processor.ros_costgroups_sync",)
+
 print("celery autodiscover tasks")
 
 # Specify the number of celery tasks to run before recycling the celery worker.
