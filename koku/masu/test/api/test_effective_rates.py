@@ -12,6 +12,11 @@ from django.test.utils import override_settings
 from django.urls import reverse
 from django_tenants.utils import schema_context
 
+from api.iam.test.iam_test_case import Customer
+from api.provider.models import Provider
+from api.provider.models import ProviderAuthentication
+from cost_models.models import CostModel
+from cost_models.models import CostModelMap
 from masu.api import effective_rates as er
 from masu.test import MasuTestCase
 from reporting.provider.ocp.models import OCPUsageLineItemDailySummary
@@ -251,3 +256,237 @@ class EffectiveRatesGPUDistributedTest(MasuTestCase):
             )
         finally:
             self._cleanup_rows(seeded)
+
+
+@override_settings(ROOT_URLCONF="masu.urls")
+class EffectiveRatesTenantScopingTest(MasuTestCase):
+    """#771 (V15-21): the provider resolution must be customer-qualified.
+
+    Koku explicitly supports the same cluster_id across customers (shared
+    authentication objects — pinned by
+    api/provider/test/test_serializers.py::test_ocp_cluster_id_isolation_between_customers).
+    The baseline resolved the provider by a global authentication scan with
+    no customer predicate, so org B's request could return org A's provider
+    and the tenant's cost-model lookup received a foreign provider ID —
+    which ROS reship then trusts.
+    """
+
+    SHARED_CLUSTER_ID = "tenant-scoping-cluster-771"
+    SCOPING_NS_B = "scoping-ns-b"
+
+    def setUp(self):
+        super().setUp()
+        # ONE shared authentication row — koku's creation logic reuses
+        # matching authentication objects across customers.
+        self.shared_auth = ProviderAuthentication.objects.create(credentials={"cluster_id": self.SHARED_CLUSTER_ID})
+        self.customer_b = Customer.objects.get(org_id="2222222")
+        self.provider_a = Provider.objects.create(
+            name="scoping-provider-a",
+            type=Provider.PROVIDER_OCP,
+            customer=self.customer,
+            authentication=self.shared_auth,
+        )
+        self.provider_b = Provider.objects.create(
+            name="scoping-provider-b",
+            type=Provider.PROVIDER_OCP,
+            customer=self.customer_b,
+            authentication=self.shared_auth,
+        )
+        # Distinct rates per tenant so the response identifies the resolved
+        # provider unambiguously (same-value collisions would mask a swap).
+        self.tenant_cost_models = []
+        for schema, provider, value, suffix in (
+            ("org1234567", self.provider_a, 2.0, "a"),
+            ("org2222222", self.provider_b, 1.0, "b"),
+        ):
+            with schema_context(schema):
+                cm = CostModel.objects.create(
+                    name=f"scoping-cm-{suffix}",
+                    source_type=Provider.PROVIDER_OCP,
+                    rates=[
+                        {
+                            "metric": {"name": "cpu_core_usage_per_hour"},
+                            "tiered_rates": [{"unit": "USD", "value": value}],
+                            "cost_type": "Supplementary",
+                            "name": "CPU usage",
+                        }
+                    ],
+                )
+                CostModelMap.objects.create(cost_model_id=cm.uuid, provider_uuid=provider.uuid)
+                self.tenant_cost_models.append((schema, cm.uuid))
+
+    def tearDown(self):
+        """Remove tenant-schema rows explicitly (schema_context writes may
+        outlive the public-schema transaction rollback under KEEPDB)."""
+        for schema, cm_uuid in self.tenant_cost_models:
+            with schema_context(schema):
+                CostModelMap.objects.filter(cost_model_id=cm_uuid).delete()
+                CostModel.objects.filter(uuid=cm_uuid).delete()
+        super().tearDown()
+
+    @patch("koku.middleware.MASU", return_value=True)
+    def test_org_b_resolves_own_provider(self, _):
+        """RED on baseline: org B must get ITS provider and rates, not the
+        first globally-matching provider's."""
+        response = self.client.get(
+            reverse("effective_rates"),
+            {"cluster_id": self.SHARED_CLUSTER_ID, "org_id": "2222222"},
+        )
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(
+            body["provider_uuid"],
+            str(self.provider_b.uuid),
+            "org B must resolve its own provider — a global auth scan returns the first "
+            "match and hands org B org A's provider (#771)",
+        )
+        self.assertEqual(
+            body["configured_rates"]["cpu_core_usage_per_hour"]["supplementary"],
+            1.0,
+            "org B must see ITS cost model's rates, not the foreign provider's or empty "
+            "(the (orgB, providerA) lookup queries the wrong combination, #771)",
+        )
+
+    @patch("koku.middleware.MASU", return_value=True)
+    def test_org_a_resolves_own_provider(self, _):
+        """Order-reversal control: org A gets its own provider and rates."""
+        response = self.client.get(
+            reverse("effective_rates"),
+            {"cluster_id": self.SHARED_CLUSTER_ID, "org_id": self.org_id},
+        )
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["provider_uuid"], str(self.provider_a.uuid))
+        self.assertEqual(body["configured_rates"]["cpu_core_usage_per_hour"]["supplementary"], 2.0)
+
+    @patch("koku.middleware.MASU", return_value=True)
+    def test_org_without_provider_gets_404(self, _):
+        """A customer with no provider for the cluster gets 404 — no foreign
+        provider, no foreign data."""
+        response = self.client.get(
+            reverse("effective_rates"),
+            {"cluster_id": self.SHARED_CLUSTER_ID, "org_id": "3333333"},
+        )
+        self.assertEqual(response.status_code, 404)
+        self.assertNotIn("provider_uuid", response.json())
+
+    @patch("koku.middleware.MASU", return_value=True)
+    def test_namespace_aggregates_stay_tenant_scoped(self, _):
+        """The namespace aggregates remain keyed to the requesting tenant's
+        schema: a row seeded in org B's schema appears for B and not for A."""
+        today = self.dh.today.date() if hasattr(self.dh.today, "date") else self.dh.today
+        row_uuid = uuid.uuid4()
+        with schema_context("org2222222"):
+            OCPUsageLineItemDailySummary.objects.create(
+                uuid=row_uuid,
+                cluster_id=self.SHARED_CLUSTER_ID,
+                usage_start=today,
+                usage_end=today,
+                namespace=self.SCOPING_NS_B,
+                data_source="Pod",
+            )
+        try:
+            resp_b = self.client.get(
+                reverse("effective_rates"),
+                {"cluster_id": self.SHARED_CLUSTER_ID, "org_id": "2222222"},
+            )
+            self.assertEqual(resp_b.status_code, 200)
+            self.assertIn(
+                self.SCOPING_NS_B,
+                resp_b.json()["namespace_aggregates"],
+                "org B's aggregates must reflect org B's schema rows",
+            )
+
+            resp_a = self.client.get(
+                reverse("effective_rates"),
+                {"cluster_id": self.SHARED_CLUSTER_ID, "org_id": self.org_id},
+            )
+            self.assertEqual(resp_a.status_code, 200)
+            self.assertNotIn(
+                self.SCOPING_NS_B,
+                resp_a.json()["namespace_aggregates"],
+                "org A must never see org B's namespace rows (tenant-scoped aggregates, #771)",
+            )
+        finally:
+            with schema_context("org2222222"):
+                OCPUsageLineItemDailySummary.objects.filter(uuid=row_uuid).delete()
+
+    @patch("koku.middleware.MASU", return_value=True)
+    def test_multiple_auth_rows_resolve_own_tenant(self, _):
+        """Separate (identical-credentials) authentication rows per provider:
+        the resolver must not stop at the first matching auth row when the
+        customer filter misses — it continues to the requesting tenant's row
+        (#771 review finding)."""
+        auth_a = ProviderAuthentication.objects.create(credentials={"cluster_id": self.SHARED_CLUSTER_ID})
+        Provider.objects.create(
+            name="multi-auth-provider-a",
+            type=Provider.PROVIDER_OCP,
+            customer=self.customer,
+            authentication=auth_a,
+        )
+        auth_b = ProviderAuthentication.objects.create(credentials={"cluster_id": self.SHARED_CLUSTER_ID})
+        provider_b2 = Provider.objects.create(
+            name="multi-auth-provider-b",
+            type=Provider.PROVIDER_OCP,
+            customer=self.customer_b,
+            authentication=auth_b,
+        )
+        response = self.client.get(
+            reverse("effective_rates"),
+            {"cluster_id": self.SHARED_CLUSTER_ID, "org_id": "2222222"},
+        )
+        self.assertEqual(response.status_code, 200)
+        # Whichever of B's providers wins (both are B's), it must be B's —
+        # never the first auth row's A provider.
+        returned = response.json()["provider_uuid"]
+        self.assertIn(
+            returned,
+            {str(self.provider_b.uuid), str(provider_b2.uuid)},
+            "org B must resolve one of ITS providers across multiple auth rows (#771)",
+        )
+
+    @patch("koku.middleware.MASU", return_value=True)
+    def test_name_ordering_does_not_decide_and_unowned_excluded(self, _):
+        """The customer predicate decides, not provider-name ordering: with
+        the foreign provider named to sort FIRST, org B still gets its own;
+        and an unowned (customer=null) provider is never resolved (#771
+        review finding)."""
+        auth_u = ProviderAuthentication.objects.create(credentials={"cluster_id": self.SHARED_CLUSTER_ID})
+        # A's provider named to sort before B's setUp providers.
+        Provider.objects.create(
+            name="aaa-scoping-provider-a2",
+            type=Provider.PROVIDER_OCP,
+            customer=self.customer,
+            authentication=auth_u,
+        )
+        # An unowned provider on the same auth row.
+        Provider.objects.create(
+            name="aaa-unowned-provider",
+            type=Provider.PROVIDER_OCP,
+            customer=None,
+            authentication=auth_u,
+        )
+        response = self.client.get(
+            reverse("effective_rates"),
+            {"cluster_id": self.SHARED_CLUSTER_ID, "org_id": "2222222"},
+        )
+        self.assertEqual(response.status_code, 200)
+        returned = response.json()["provider_uuid"]
+        self.assertEqual(
+            returned,
+            str(self.provider_b.uuid),
+            "the customer predicate must decide the resolution, not name ordering — and the "
+            "unowned provider (customer=null, sorts first) must never be resolved for any org (#771)",
+        )
+
+        # And the unowned provider is not resolvable by org A either.
+        response_a = self.client.get(
+            reverse("effective_rates"),
+            {"cluster_id": self.SHARED_CLUSTER_ID, "org_id": self.org_id},
+        )
+        self.assertEqual(response_a.status_code, 200)
+        self.assertNotEqual(
+            response_a.json()["provider_uuid"],
+            Provider.objects.get(name="aaa-unowned-provider").uuid,
+            "an unowned provider must never be resolved (#771)",
+        )

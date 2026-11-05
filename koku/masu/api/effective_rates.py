@@ -33,11 +33,19 @@ from cost_models.models import CostModelMap
 LOG = logging.getLogger(__name__)
 
 
-def _resolve_provider_uuid(cluster_id: str) -> str | None:
-    """Resolve an OCP cluster_id to a Provider UUID via ProviderAuthentication credentials."""
+def _resolve_provider_uuid(cluster_id: str, org_id: str) -> str | None:
+    """Resolve an OCP cluster_id to the REQUESTING CUSTOMER's Provider UUID.
+
+    #771 (V15-21): koku explicitly supports the same cluster_id across
+    customers (shared authentication objects), so the resolution must be
+    customer-qualified — a global scan returning the first matching provider
+    hands the requesting tenant a foreign provider, and the tenant's
+    cost-model lookup then receives the wrong provider ID (which ROS reship
+    trusts).
+    """
     for auth in ProviderAuthentication.objects.all():
         if auth.credentials.get("cluster_id") == cluster_id:
-            provider = Provider.objects.filter(authentication=auth).first()
+            provider = Provider.objects.filter(authentication=auth, customer__org_id=org_id).first()
             if provider:
                 return str(provider.uuid)
     return None
@@ -180,7 +188,7 @@ def effective_rates(request):
             status=status.HTTP_404_NOT_FOUND,
         )
 
-    provider_uuid = _resolve_provider_uuid(cluster_id)
+    provider_uuid = _resolve_provider_uuid(cluster_id, org_id)
     if not provider_uuid:
         return Response(
             {"Error": f"No provider found for cluster_id={cluster_id}."},
