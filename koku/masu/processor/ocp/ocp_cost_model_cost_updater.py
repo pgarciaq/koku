@@ -909,4 +909,7 @@ class OCPCostModelCostUpdater(OCPCloudUpdaterBase, PartitionHandlerMixin):
             self._update_markup_cost(start_date, end_date, use_rtu=rtu_enabled)
 
         self.distribute_costs_and_update_ui_summary(summary_range)
-        notify_ros_savings_recalculation(self._schema, provider_uuid=self._provider_uuid)
+        # #769 (V15-19): the callback must carry the provider's ACTUAL cluster
+        # ID (resolved at construction) — the baseline sent the provider UUID,
+        # which ROS uses verbatim, leaving the real cluster's savings stale.
+        notify_ros_savings_recalculation(self._schema, provider_uuid=self._provider_uuid, cluster_id=self._cluster_id)

@@ -45,10 +45,19 @@ def _bearer_token_for_ros() -> str | None:
     return _read_bearer_token()
 
 
-def notify_ros_savings_recalculation(schema_name: str, provider_uuid: str | None = None) -> None:
+def notify_ros_savings_recalculation(
+    schema_name: str, provider_uuid: str | None = None, cluster_id: str | None = None
+) -> None:
     """Notify ros-ocp-backend to recalculate savings after a cost model change.
 
-    No-op when ROS is not configured. Failures are logged and do not propagate.
+    cluster_id is the provider's actual OpenShift cluster ID: ROS uses the
+    payload's cluster_uuid VERBATIM for rate-cache invalidation and
+    recommendation selection (#769, V15-19) — sending the provider UUID
+    leaves the real cluster's savings stale behind a 202. When cluster_id
+    cannot be resolved the field is omitted and ROS recalculates the whole
+    org, which covers the target cluster. provider_uuid is logging context
+    only. No-op when ROS is not configured. Failures are logged and do not
+    propagate.
     """
     base_url = _ros_backend_base_url()
     if not base_url:
@@ -66,8 +75,10 @@ def notify_ros_savings_recalculation(schema_name: str, provider_uuid: str | None
         "org_id": org_id,
         "recommendation_types": list(DEFAULT_RECOMMENDATION_TYPES),
     }
-    if provider_uuid:
-        payload["cluster_uuid"] = str(provider_uuid)
+    if cluster_id:
+        # #769: the payload field is ROS's cluster_uuid contract — the value
+        # is the OpenShift cluster ID, never the provider UUID.
+        payload["cluster_uuid"] = str(cluster_id)
 
     headers = {"Content-Type": "application/json"}
     bearer_token = _bearer_token_for_ros()

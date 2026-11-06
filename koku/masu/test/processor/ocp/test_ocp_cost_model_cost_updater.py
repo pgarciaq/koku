@@ -678,3 +678,60 @@ class OCPCostModelCostUpdaterTest(MasuTestCase):
         self.assertEqual(mock_load_rates.call_count, len(months))
         for month_range, call_args in zip(months, mock_load_rates.call_args_list):
             self.assertEqual(call_args[0][0], month_range.start_date)
+
+    @patch("masu.processor.ocp.ocp_cost_model_cost_updater.notify_ros_savings_recalculation")
+    def test_update_summary_costs_notifies_real_cluster_id(self, mock_notify):
+        """#769 (V15-19): the savings callback must carry the provider's
+        ACTUAL OpenShift cluster ID — the updater resolves it at construction
+        (get_cluster_id_from_provider); the baseline sent the provider UUID,
+        which ROS uses verbatim for rate-cache invalidation and recommendation
+        selection, leaving the real cluster's savings stale behind a 202.
+
+        The heavy update steps are instance-patched (the full flow is the
+        known-flaky @skip'd suite above) — the REAL method's control flow,
+        including the notify at its tail, executes."""
+        summary_range = SummaryRangeConfig(start_date=self.dh.this_month_start, end_date=self.dh.this_month_end)
+        # Pin the RTU feature flag OFF — the flag's Unleash state must not
+        # decide which update branches run in this pin (#769 review finding).
+        rtu_patcher = patch(
+            "masu.processor.ocp.ocp_cost_model_cost_updater.is_feature_flag_enabled_by_schema",
+            return_value=False,
+        )
+        rtu_patcher.start()
+        self.addCleanup(rtu_patcher.stop)
+        heavy_steps = (
+            "_load_rates",
+            "_update_usage_costs",
+            "_update_monthly_cost",
+            "_delete_tag_usage_costs",
+            "_update_tag_usage_costs",
+            "_update_tag_usage_default_costs",
+            "_update_monthly_tag_based_cost",
+            "_update_node_hour_tag_based_cost",
+            "_update_vm_usage_costs",
+            "_aggregate_rates_to_daily_summary",
+            "_update_markup_cost",
+            "distribute_costs_and_update_ui_summary",
+        )
+        patchers = [patch.object(self.updater, step) for step in heavy_steps]
+        for p_ in patchers:
+            p_.start()
+            self.addCleanup(p_.stop)
+        # No tag rates → the tag branches are skipped by the method's own logic.
+        self.updater._tag_infra_rates = {}
+        self.updater._tag_supplementary_rates = {}
+
+        self.updater.update_summary_cost_model_costs(summary_range)
+
+        mock_notify.assert_called_once()
+        kwargs = mock_notify.call_args.kwargs
+        self.assertEqual(
+            self.cluster_id,
+            kwargs.get("cluster_id"),
+            "the callback must carry the real cluster ID, not the provider UUID (#769)",
+        )
+        self.assertNotEqual(
+            str(self.provider_uuid),
+            kwargs.get("cluster_id"),
+            "the provider UUID must never masquerade as the cluster ID (#769)",
+        )
