@@ -14,16 +14,17 @@ from datetime import timezone
 
 import requests
 from django.conf import settings
-from django.db.models import Max
 from django_tenants.utils import schema_context
 
 from api.common import log_json
 from api.iam.models import Tenant
 from api.provider.models import Provider
+from api.utils import DateHelper
 from common.queues import PriorityQueue
 from koku import celery_app
 from reporting.provider.all.models import EnabledTagKeys
-from reporting.provider.ocp.models import OCPUsageLineItemDailySummary
+from reporting.provider.ocp.models import OCPStorageVolumeLabelSummary
+from reporting.provider.ocp.models import OCPUsagePodLabelSummary
 
 LOG = logging.getLogger(__name__)
 
@@ -69,20 +70,39 @@ def _read_bearer_token() -> str | None:
         return None
 
 
-def _extract_enabled_tags(labels: dict | None, enabled_keys: set[str]) -> dict[str, str]:
-    if not labels or not enabled_keys:
-        return {}
-    resolved: dict[str, str] = {}
-    for key in enabled_keys:
-        if key in labels and labels[key] is not None:
-            resolved[key] = str(labels[key])
-    return resolved
+def _tag_window(dh: DateHelper) -> tuple:
+    """Return the report-period window Koku's tags API uses for its default request.
+
+    ``TagQueryHandler._set_start_and_end_dates`` selects the previous month start
+    for the default ``time_scope=-30`` and ``_get_time_based_filters`` snaps both
+    ends to whole months, so the window is last month through the end of this
+    month.
+    """
+    return dh.last_month_start, dh.this_month_end
 
 
-def _latest_usage_period_start(schema_name: str):
-    """Return the latest usage_start date with OCP pod line items, if any."""
+def _iter_label_rows(schema_name: str, enabled_keys: list[str]):
+    """Yield (cluster_id, namespace, key, values) from Koku's label summary tables.
+
+    These are the tables behind Koku's tags API: one row per
+    (key, report period, namespace, node). Pod and storage labels are separate
+    sources there and are merged here the same way. Because rows accumulate
+    within a report period, a cluster whose last report is older than another
+    cluster's keeps its tags until its period leaves the window.
+    """
+    start, end = _tag_window(DateHelper())
     with schema_context(schema_name):
-        return OCPUsageLineItemDailySummary.objects.aggregate(latest=Max("usage_start"))["latest"]
+        for model in (OCPUsagePodLabelSummary, OCPStorageVolumeLabelSummary):
+            rows = (
+                model.objects.filter(
+                    key__in=enabled_keys,
+                    report_period__report_period_start__gte=start,
+                    report_period__report_period_start__lte=end,
+                )
+                .values_list("report_period__cluster_id", "namespace", "key", "values")
+                .iterator()
+            )
+            yield from rows
 
 
 def build_namespace_tags_payload(schema_name: str) -> dict:
@@ -96,47 +116,37 @@ def build_namespace_tags_payload(schema_name: str) -> dict:
                 "key", flat=True
             )
         )
-        if not enabled_keys:
-            return {
-                "org_id": org_id,
-                "synced_at": synced_at,
-                "tag_keys": [],
-                "namespace_tags": [],
-            }
+    if not enabled_keys:
+        return {
+            "org_id": org_id,
+            "synced_at": synced_at,
+            "tag_keys": [],
+            "namespace_tags": [],
+        }
 
-        enabled_key_set = set(enabled_keys)
-        latest_period = _latest_usage_period_start(schema_name)
+    namespace_values: dict[tuple[str, str], dict[str, set[str]]] = defaultdict(lambda: defaultdict(set))
+    key_values: dict[str, set[str]] = defaultdict(set)
 
-        rows = OCPUsageLineItemDailySummary.objects.filter(usage_start=latest_period) if latest_period else []
-        rows = (
-            rows.exclude(namespace__isnull=True)
-            .exclude(namespace="")
-            .exclude(cluster_id__isnull=True)
-            .exclude(cluster_id="")
-            .values("cluster_id", "namespace", "all_labels")
-            .distinct()
-        )
-
-        namespace_tags: dict[tuple[str, str], dict[str, str]] = defaultdict(dict)
-        key_values: dict[str, set[str]] = defaultdict(set)
-
-        for row in rows:
-            tags = _extract_enabled_tags(row.get("all_labels"), enabled_key_set)
-            cluster_namespace = (row["cluster_id"], row["namespace"])
-            namespace_tags[cluster_namespace].update(tags)
-            for key, value in tags.items():
-                key_values[key].add(value)
-
-        tag_keys = [{"key": key, "values": sorted(key_values.get(key, set()))} for key in enabled_keys]
+    for cluster_id, namespace, key, values in _iter_label_rows(schema_name, enabled_keys):
+        if not cluster_id or not namespace:
+            continue
+        for value in values:
+            if value is None:
+                continue
+            namespace_values[(cluster_id, namespace)][key].add(value)
+            key_values[key].add(value)
 
     payload_tags = [
         {
             "cluster_uuid": cluster_id,
             "namespace": namespace,
-            "tags": tags,
+            # Koku keeps a list of values per key; resolved_tags holds one, so
+            # take the lowest deterministically rather than last-row-wins.
+            "tags": {key: sorted(values)[0] for key, values in sorted(tags.items()) if values},
         }
-        for (cluster_id, namespace), tags in sorted(namespace_tags.items())
+        for (cluster_id, namespace), tags in sorted(namespace_values.items())
     ]
+    tag_keys = [{"key": key, "values": sorted(key_values.get(key, set()))} for key in enabled_keys]
     return {
         "org_id": org_id,
         "synced_at": synced_at,
