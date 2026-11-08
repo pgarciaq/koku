@@ -158,8 +158,12 @@ def _filter_keys_by_manifest_metadata(s3_client, object_keys: list[str], manifes
             head = s3_client.head_object(Bucket=settings.S3_ROS_BUCKET_NAME, Key=upload_key)
         except (BotoCoreError, ClientError):
             continue
-        metadata = head.get("Metadata") or {}
-        if metadata.get("ManifestId") == manifest_id_str:
+        # #776 (V15-26): S3 stores user metadata keys lowercase (the writer
+        # sends "ManifestId"; head_object returns "manifestid"). Normalize
+        # the map so the lookup matches the stored form — and still matches
+        # a hypothetical case-preserving store.
+        metadata = {key.lower(): value for key, value in (head.get("Metadata") or {}).items()}
+        if metadata.get("manifestid") == manifest_id_str:
             matched.append(upload_key)
     return matched
 

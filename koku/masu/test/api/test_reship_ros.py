@@ -5,16 +5,20 @@
 """Tests for masu reship_ros endpoint (business hours re-ingestion)."""
 import json
 from datetime import date
+from datetime import datetime
+from datetime import timezone
 from http import HTTPStatus
 from unittest.mock import MagicMock
 from unittest.mock import patch
 from uuid import uuid4
 
+from botocore.exceptions import ClientError
 from django.test import TestCase
 from django.test.utils import override_settings
 from model_bakery import baker
 from rest_framework.test import APIRequestFactory
 
+from masu.api.reship_ros import _filter_keys_by_manifest_metadata
 from masu.api.reship_ros import reship_ros
 from masu.config import Config as masu_config
 
@@ -285,3 +289,94 @@ class ReshipRosTests(TestCase):
         prefixes = [call.kwargs["Prefix"] for call in mock_client.list_objects_v2.call_args_list]
         for day in expected_days:
             self.assertIn(f"{self.schema}/source={self.provider_uuid}/date={day}", prefixes)
+
+    # ------------------------------------------------------------------
+    # #776 (V15-26): manifest-targeted reship and S3 metadata key case.
+    # S3 stores user metadata keys lowercase; the filter must match the
+    # stored form (or normalize). These are the manifest-targeted path's
+    # first tests — the bug survived because the path was untested.
+
+    def _mock_s3_head(self, behavior_by_key: dict):
+        """head_object mock: key -> Metadata dict, or an exception to raise."""
+
+        def head_object(**kwargs):
+            behavior = behavior_by_key.get(kwargs["Key"])
+            if isinstance(behavior, Exception):
+                raise behavior
+            return {"Metadata": behavior}
+
+        mock_client = MagicMock()
+        mock_client.head_object.side_effect = head_object
+        return mock_client
+
+    def test_filter_keys_standard_lowercase_metadata(self):
+        """#776: S3's standard lowercase metadata keys must match."""
+        client = self._mock_s3_head(
+            {
+                "match.csv": {"manifestid": "42"},
+                "other-id.csv": {"manifestid": "43"},
+                "no-meta.csv": {},
+            }
+        )
+        matched = _filter_keys_by_manifest_metadata(client, ["match.csv", "other-id.csv", "no-meta.csv"], 42)
+        self.assertEqual(matched, ["match.csv"])
+
+    def test_filter_keys_mixed_case_control(self):
+        """A case-preserving store's shape — the baseline's only matching
+        form, pinned as a control for the normalization."""
+        client = self._mock_s3_head({"a.csv": {"ManifestId": "42"}})
+        self.assertEqual(_filter_keys_by_manifest_metadata(client, ["a.csv"], 42), ["a.csv"])
+
+    def test_filter_keys_head_object_error_skipped(self):
+        """head-object failures skip the key without crashing."""
+        client = self._mock_s3_head(
+            {
+                "bad.csv": ClientError({"Error": {"Code": "404"}}, "HeadObject"),
+                # Mixed-case so this test isolates the error path from the
+                # lowercase fix (passes on both the baseline and the fix).
+                "good.csv": {"ManifestId": "42"},
+            }
+        )
+        matched = _filter_keys_by_manifest_metadata(client, ["bad.csv", "good.csv"], 42)
+        self.assertEqual(matched, ["good.csv"])
+
+    def test_filter_keys_empty_input(self):
+        """No keys in, no keys out; empty metadata never matches."""
+        client = self._mock_s3_head({"a.csv": {}})
+        self.assertEqual(_filter_keys_by_manifest_metadata(client, [], 42), [])
+        self.assertEqual(_filter_keys_by_manifest_metadata(client, ["a.csv"], 42), [])
+
+    @override_settings(DISABLE_ROS_MSG=False)
+    @patch("masu.api.reship_ros.publish_ros_kafka_message")
+    @patch("masu.api.reship_ros.generate_s3_object_url", return_value="https://s3/presigned")
+    @patch("masu.api.reship_ros.get_ros_s3_client")
+    def test_reship_ros_manifest_targeted_lowercase_metadata(self, mock_s3_client, _mock_presign, mock_kafka):
+        """#776: a manifest-targeted request recovers the manifest's objects
+        when S3 returns standard lowercase metadata keys."""
+        manifest = baker.make(
+            "CostUsageReportManifest",
+            provider_id=self.provider_uuid,
+            assembly_id="assembly-776",
+            billing_period_start_datetime=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        )
+        prefix = f"{self.schema}/source={self.provider_uuid}/date=2026-01-01"
+        client = self._mock_s3_list({prefix: ["file1.csv", "file2.csv"]})
+
+        def head_object(**kwargs):
+            if kwargs["Key"] == "file1.csv":
+                return {"Metadata": {"manifestid": str(manifest.id)}}
+            return {"Metadata": {"manifestid": str(manifest.id + 1)}}
+
+        client.head_object.side_effect = head_object
+        mock_s3_client.return_value = client
+
+        response = self._post(f"?schema={self.schema}&provider_uuid={self.provider_uuid}&manifest_id=assembly-776")
+
+        self.assertEqual(response.status_code, HTTPStatus.OK)
+        self.assertEqual(response.data["files_processed"], 1)
+        self.assertEqual(response.data["files_total"], 1)
+        self.assertEqual(mock_kafka.call_count, 1)
+        # Pin WHICH object was published — a filter selecting file2.csv
+        # would pass the count assertions above (review finding).
+        published = json.loads(mock_kafka.call_args.args[0].decode("utf-8"))
+        self.assertEqual(published["object_keys"], ["file1.csv"])
