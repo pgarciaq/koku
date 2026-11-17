@@ -277,7 +277,7 @@ flowchart TB
 | Mode | When | Koku action | ROS tag source |
 |------|------|-------------|----------------|
 | **On-prem push API (default)** | [cost-onprem chart](../../../../cost-onprem-chart/cost-onprem/values.yaml) `ros.api.tagsSource: api` | Celery HTTP push after summarization & settings | `org_container_keys.resolved_tags` |
-| **On-prem shared DB (advanced)** | Single PostgreSQL, `tagsSource: db` | **None** — no push tasks run | Live SQL JOIN to `org{org_id}.reporting_ocptags_values` |
+| **On-prem shared DB (advanced)** | Single PostgreSQL, `tagsSource: db` | **None** — no push tasks run | Live SQL over `org{org_id}.reporting_ocpusagepodlabel_summary` + `reporting_ocpstoragevolumelabel_summary` |
 | **SaaS push API** | Separate Koku/ROS databases | Celery HTTP push after summarization & settings | `org_container_keys.resolved_tags` |
 
 ---
@@ -316,12 +316,22 @@ The [cost-onprem Helm chart](../../../../cost-onprem-chart/cost-onprem/values.ya
 
 | Table | Purpose |
 |-------|---------|
-| `reporting_enabledtagkeys` | Enabled OCP tag keys (`enabled=true`, `provider_type='OCP'`) |
-| `reporting_ocptags_values` | Distinct `(key, value)` with `cluster_ids[]` and `namespaces[]` arrays |
+| `reporting_enabledtagkeys` | Enabled OCP tag keys (`enabled=true`, `provider_type='OCP'`), checked at query time, so disabling a key stops matching immediately |
+| `reporting_ocpusagepodlabel_summary` | Per-period pod label values per `(key, namespace, node)` |
+| `reporting_ocpstoragevolumelabel_summary` | Per-period volume label values per `(key, namespace, node)` |
+| `reporting_ocpusagereportperiod` | Report period start per cluster — the join that turns a label summary row into a cluster |
+| `reporting_ocptags_values` | Distinct `(key, value)` with `cluster_ids[]`, `cluster_aliases[]`, `namespaces[]`, `nodes[]` — used by the tag-value picker |
 
-List filtering JOINs `org_container_keys` to `reporting_ocptags_values` on
-`(cluster_uuid, namespace)` — tags are **always fresh** after Koku summarization completes.
-There is no sync lag, no HTTP auth, and no ROS push endpoints (they return 404).
+List filtering matches a container's `(cluster_uuid, namespace)` against the union of both
+label summaries, joined through `reporting_ocpusagereportperiod` for the cluster and scoped to
+the report periods inside the month-snapped window `[last_month_start, this_month_end]` — the
+same source and window as the push sync (ROS ADR-0353), so `db` and `api` mode select the same
+clusters. There is no sync lag, no HTTP auth, and no ROS push endpoints (they return 404).
+
+The `reporting_ocptags_values` arrays are rebuilt from both label summaries over that same
+window ([#867](https://github.com/pgarciaq/ros-ocp-backend/issues/867)), so they name every
+cluster that saw the pair instead of only the cluster that summarized last. A pair whose
+clusters have all left the window is removed from the table.
 
 **Operator steps:**
 
@@ -577,7 +587,7 @@ Multiple tag keys AND together; comma-separated values OR within a key. Requires
 
 | Source | Additional requirement |
 |--------|------------------------|
-| `db` | Koku summarization populated `reporting_ocptags_values` |
+| `db` | Koku summarization populated the OCP label summaries for a report period inside the tag window `[last_month_start, this_month_end]` |
 | `api` | At least one successful push populated `resolved_tags` |
 
 ---
