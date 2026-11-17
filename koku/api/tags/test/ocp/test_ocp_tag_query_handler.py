@@ -3,11 +3,11 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 """Test the Report Queries."""
+from django.db.models import Q
 from django_tenants.utils import tenant_context
 
 from api.functions import JSONBObjectKeys
 from api.iam.test.iam_test_case import IamTestCase
-from api.iam.test.iam_test_case import RbacPermissions
 from api.provider.models import Provider
 from api.query_filter import QueryFilter
 from api.query_filter import QueryFilterCollection
@@ -334,42 +334,58 @@ class OCPTagQueryHandlerTest(IamTestCase):
         self.assertEqual(result[0].get("key"), expected.get("key"))
         self.assertEqual(sorted(result[0].get("values")), sorted(expected.get("values")))
 
-    @RbacPermissions({"openshift.node": {"read": ["aws_compute1"]}})
     def test_get_tag_values_for_value_filter_RBAC_node(self):
-        """Test that the execute query runs properly with value query and an RBAC restriction on node."""
+        """Test that the execute query runs properly with value query and an RBAC restriction on node.
+
+        The access must go through ``mocked_query_params``: its mocked request
+        skips the identity middleware, so a ``RbacPermissions`` decorator alone
+        leaves ``QueryParameters.access`` empty and the assertion would silently
+        be about the unfiltered result.
+        """
         key = "app"
         value = "c"
         url = f"/app/?filter[value]={value}"
-        query_params = self.mocked_query_params(url, OCPTagView)
+        query_params = self.mocked_query_params(url, OCPTagView, access={"openshift.node": {"read": ["node_0"]}})
         # the mocked query parameters dont include the key from the url so it needs to be added
         query_params.kwargs = {"key": key}
         handler = OCPTagQueryHandler(query_params)
         with tenant_context(self.tenant):
             tags = (
-                OCPTagsValues.objects.filter(key__exact=key, value__icontains=value).values("value").distinct().all()
+                OCPTagsValues.objects.filter(key__exact=key, value__icontains=value, nodes__overlap=["node_0"])
+                .values("value")
+                .distinct()
+                .all()
             )
             tag_values = [tag.get("value") for tag in tags]
+        # the fixture must exercise the filter, not an empty-vs-empty comparison
+        self.assertTrue(tag_values)
 
         expected = {"key": key, "values": tag_values}
         result = handler.get_tag_values()
         self.assertEqual(result[0].get("key"), expected.get("key"))
         self.assertEqual(sorted(result[0].get("values")), sorted(expected.get("values")))
 
-    @RbacPermissions({"openshift.cluster": {"read": ["my-ocp-cluster-2"]}})
     def test_get_tag_values_for_value_filter_RBAC_cluster(self):
         """Test that the execute query runs properly with value query and an RBAC restriction on cluster."""
         key = "app"
         value = "b"
+        access = ["OCP-on-Prem"]
         url = f"/app/?filter[value]={value}"
-        query_params = self.mocked_query_params(url, OCPTagView)
+        query_params = self.mocked_query_params(url, OCPTagView, access={"openshift.cluster": {"read": access}})
         # the mocked query parameters dont include the key from the url so it needs to be added
         query_params.kwargs = {"key": key}
         handler = OCPTagQueryHandler(query_params)
         with tenant_context(self.tenant):
             tags = (
-                OCPTagsValues.objects.filter(key__exact=key, value__icontains=value).values("value").distinct().all()
+                OCPTagsValues.objects.filter(key__exact=key, value__icontains=value)
+                .filter(Q(cluster_ids__overlap=access) | Q(cluster_aliases__overlap=access))
+                .values("value")
+                .distinct()
+                .all()
             )
             tag_values = [tag.get("value") for tag in tags]
+        # the fixture must exercise the filter, not an empty-vs-empty comparison
+        self.assertTrue(tag_values)
 
         expected = {"key": key, "values": tag_values}
         result = handler.get_tag_values()
@@ -437,3 +453,106 @@ class OCPTagQueryHandlerTest(IamTestCase):
                         self.assertNotEqual(result_value, categories[category])
                     else:
                         self.assertEqual(result_value, categories[category])
+
+
+class OCPTagValuesArrayFilterTest(IamTestCase):
+    """Value filtering over catalog rows whose arrays span several clusters (#867).
+
+    Once ``reporting_ocptags_values`` names every cluster that saw a key/value
+    pair, "the value is used by cluster X" means "X is *a member* of
+    ``cluster_ids``", not "``cluster_ids`` is contained by {X}". These tests pin
+    the member semantics on the value endpoint for each user filter, for RBAC,
+    and for the wildcard forms that used to bind a string to an array.
+    """
+
+    KEY = "app867"
+    SHARED = "zq867-shared"
+    ONLY_B = "zq867-only-b"
+    QUERY = "zq867"
+
+    def setUp(self):
+        """Seed one shared value and one value only the second cluster saw."""
+        super().setUp()
+        with tenant_context(self.tenant):
+            OCPTagsValues.objects.create(
+                key=self.KEY,
+                value=self.SHARED,
+                cluster_ids=["c867-a", "c867-b"],
+                cluster_aliases=["a867-alias", "b867-alias"],
+                namespaces=["ns-867-a", "ns-867-b"],
+                nodes=["node-867-a", "node-867-b"],
+            )
+            OCPTagsValues.objects.create(
+                key=self.KEY,
+                value=self.ONLY_B,
+                cluster_ids=["c867-b"],
+                cluster_aliases=["b867-alias"],
+                namespaces=["ns-867-b"],
+                nodes=["node-867-b"],
+            )
+
+    def tearDown(self):
+        """Remove the seeded catalog rows."""
+        with tenant_context(self.tenant):
+            OCPTagsValues.objects.filter(key=self.KEY).delete()
+        super().tearDown()
+
+    def _values(self, extra_filter="", access=None):
+        """Return the value endpoint's values for the test key and query token.
+
+        ``access`` goes through ``mocked_query_params`` because the mocked
+        request bypasses the identity middleware: the ``RbacPermissions``
+        decorator alone leaves ``QueryParameters.access`` empty, so a decorated
+        test would assert the unfiltered result.
+        """
+        url = f"/{self.KEY}/?filter[value]={self.QUERY}{extra_filter}"
+        query_params = self.mocked_query_params(url, OCPTagView, access=access)
+        query_params.kwargs = {"key": self.KEY}
+        handler = OCPTagQueryHandler(query_params)
+        data = handler.get_tag_values()
+        if not data:
+            return []
+        return data[0].get("values", [])
+
+    def test_value_matches_when_only_one_of_its_clusters_is_requested(self):
+        """A value shared by two clusters must match a filter naming either one."""
+        self.assertEqual([self.SHARED], self._values("&filter[cluster]=c867-a"))
+        self.assertEqual(sorted([self.SHARED, self.ONLY_B]), sorted(self._values("&filter[cluster]=c867-b")))
+
+    def test_value_matches_on_cluster_alias(self):
+        """The alias half of the cluster filter uses the same member semantics."""
+        self.assertEqual(sorted([self.SHARED, self.ONLY_B]), sorted(self._values("&filter[cluster]=b867-alias")))
+
+    def test_value_matches_on_project(self):
+        """A value is listed for a namespace any of its clusters used it in."""
+        self.assertEqual([self.SHARED], self._values("&filter[project]=ns-867-a"))
+        self.assertEqual(sorted([self.SHARED, self.ONLY_B]), sorted(self._values("&filter[project]=ns-867-b")))
+
+    def test_rbac_node_keeps_a_value_shared_with_an_ungranted_node(self):
+        """``filter[node]`` is RBAC-only, and it uses the same member semantics."""
+        access = {"openshift.node": {"read": ["node-867-a"]}}
+        self.assertEqual([self.SHARED], self._values(access=access))
+
+    def test_value_not_seen_in_the_requested_cluster_is_excluded(self):
+        """Member semantics must not degrade into match-everything."""
+        self.assertEqual([], self._values("&filter[cluster]=c867-unknown"))
+
+    def test_rbac_cluster_keeps_a_value_shared_with_an_ungranted_cluster(self):
+        """A grant on one cluster must not hide a value another cluster also saw."""
+        access = {"openshift.cluster": {"read": ["c867-b"]}}
+        self.assertEqual(sorted([self.SHARED, self.ONLY_B]), sorted(self._values(access=access)))
+
+    def test_rbac_cluster_excludes_values_of_ungranted_clusters(self):
+        """RBAC must still hide a value no granted cluster saw."""
+        access = {"openshift.cluster": {"read": ["c867-unknown"]}}
+        self.assertEqual([], self._values(access=access))
+
+    def test_wildcard_cluster_and_project_return_without_error(self):
+        """``*`` on an array filter adds no predicate instead of binding a string."""
+        expected = sorted([self.SHARED, self.ONLY_B])
+        self.assertEqual(expected, sorted(self._values("&filter[cluster]=*")))
+        self.assertEqual(expected, sorted(self._values("&filter[project]=*")))
+
+    def test_and_operator_cluster_filter_binds_a_list(self):
+        """The ``and:`` operator path must bind an array for the same fields."""
+        self.assertEqual([self.SHARED], self._values("&filter[and:cluster]=c867-a"))

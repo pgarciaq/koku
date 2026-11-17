@@ -196,6 +196,20 @@ class TagQueryHandler(QueryHandler):
             category_filters.add(namespace_filter)
         return category_filters.compose(logical_operator="or")
 
+    @staticmethod
+    def _array_parameter(filter_obj, item):
+        """Return the right-hand side for one filter-map entry.
+
+        PostgreSQL array lookups serialize their right-hand side as an array
+        literal, so a bare string raises ``DataError: malformed array literal``.
+        ``filter[cluster]=X`` / ``filter[project]=X`` / ``filter[node]=X`` on the
+        value endpoint therefore bind a one-element list. ``overlap`` is only
+        valid on array columns, so it doubles as the array marker.
+        """
+        if filter_obj.get("operation") == "overlap":
+            return [item]
+        return item
+
     def _get_filter(self, delta=False):  # noqa: C901
         """Create dictionary for filter parameters.
 
@@ -222,8 +236,18 @@ class TagQueryHandler(QueryHandler):
             if self.parameters.get_filter("value") and TagQueryHandler.has_wildcard(filter_value):
                 # Adds filter to the query response, however this filter will remove no values.
                 filter_obj = self.filter_map.get(filter_key)
-                q_filter = QueryFilter(parameter="", **filter_obj)
-                filters.add(q_filter)
+                # Array columns have no "match everything" right-hand side: an
+                # empty array is contained by every array but overlaps none, and
+                # NULL satisfies neither. A wildcard on an array field therefore
+                # adds no predicate instead of binding a string to an array.
+                operations = (
+                    [filt.get("operation") for filt in filter_obj]
+                    if isinstance(filter_obj, list)
+                    else [filter_obj.get("operation")]
+                )
+                if "overlap" not in operations:
+                    q_filter = QueryFilter(parameter="", **filter_obj)
+                    filters.add(q_filter)
             if filter_value is not None and not TagQueryHandler.has_wildcard(filter_value):
                 filter_obj = self.filter_map.get(filter_key)
                 if isinstance(filter_value, bool):
@@ -231,11 +255,13 @@ class TagQueryHandler(QueryHandler):
                 elif isinstance(filter_obj, list):
                     for _filt in filter_obj:
                         for item in filter_value:
-                            q_filter = QueryFilter(parameter=item, **_filt)
+                            parameter = self._array_parameter(_filt, item)
+                            q_filter = QueryFilter(parameter=parameter, **_filt)
                             filters.add(q_filter)
                 else:
                     for item in filter_value:
-                        q_filter = QueryFilter(parameter=item, **filter_obj)
+                        parameter = self._array_parameter(filter_obj, item)
+                        q_filter = QueryFilter(parameter=parameter, **filter_obj)
                         filters.add(q_filter)
                         if filter_key == "key":
                             if child_keys := self.find_child_keys(item):
@@ -288,12 +314,14 @@ class TagQueryHandler(QueryHandler):
                     for _filt in filter_obj:
                         filt_filters = QueryFilterCollection()
                         for item in filter_value:
-                            q_filter = QueryFilter(parameter=item, logical_operator=logical_operator, **_filt)
+                            parameter = self._array_parameter(_filt, item)
+                            q_filter = QueryFilter(parameter=parameter, logical_operator=logical_operator, **_filt)
                             filt_filters.add(q_filter)
                         composed_filter = composed_filter | filt_filters.compose()
                 else:
                     for item in filter_value:
-                        q_filter = QueryFilter(parameter=item, logical_operator=logical_operator, **filter_obj)
+                        parameter = self._array_parameter(filter_obj, item)
+                        q_filter = QueryFilter(parameter=parameter, logical_operator=logical_operator, **filter_obj)
                         filters.add(q_filter)
         if filters:
             composed_filter = composed_filter & filters.compose()

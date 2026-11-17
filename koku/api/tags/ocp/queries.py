@@ -85,13 +85,19 @@ class OCPTagQueryHandler(TagQueryHandler):
         if self._parameters.get_filter("value"):
             filter_map.update(
                 {
-                    "project": {"field": "namespaces", "operation": "contained_by"},
+                    # The value rows carry every cluster/namespace/node that saw
+                    # the key/value pair (#867), so a value must match when the
+                    # requested entity is *any* member of the array. The old
+                    # contained_by (array <@ requested) answered "is the whole
+                    # catalog row inside the request", which dropped every shared
+                    # value as soon as the arrays spanned more than one cluster.
+                    "project": {"field": "namespaces", "operation": "overlap"},
                     "enabled": {"field": "enabled", "operation": "exact", "parameter": enabled_parameter},
                     "cluster": [
-                        {"field": "cluster_ids", "operation": "contained_by", "composition_key": "cluster_filter"},
-                        {"field": "cluster_aliases", "operation": "contained_by", "composition_key": "cluster_filter"},
+                        {"field": "cluster_ids", "operation": "overlap", "composition_key": "cluster_filter"},
+                        {"field": "cluster_aliases", "operation": "overlap", "composition_key": "cluster_filter"},
                     ],
-                    "node": {"field": "nodes", "operation": "contained_by"},
+                    "node": {"field": "nodes", "operation": "overlap"},
                 }
             )
         else:
