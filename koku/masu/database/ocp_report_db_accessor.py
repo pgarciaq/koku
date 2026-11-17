@@ -593,9 +593,21 @@ AND (month = {{month_no_zero}} OR month = {{month}})
             else:
                 raise
 
-    def populate_pod_label_summary_table(self, report_period_ids, start_date, end_date):
+    def _label_summary_window(self, window_start, window_end):
+        """Return the reporting window the tag catalog arrays are rebuilt over."""
+        dh = DateHelper()
+        if window_start is None:
+            window_start = dh.last_month_start
+        if window_end is None:
+            window_end = dh.this_month_end
+        return dh.parse_to_date(window_start), dh.parse_to_date(window_end)
+
+    def populate_pod_label_summary_table(
+        self, report_period_ids, start_date, end_date, window_start=None, window_end=None
+    ):
         """Populate the line item aggregated totals data table."""
         table_name = self._table_map["pod_label_summary"]
+        window_start, window_end = self._label_summary_window(window_start, window_end)
 
         sql_params = {
             "uuid": str(uuid.uuid4()).replace("-", "_"),
@@ -603,6 +615,8 @@ AND (month = {{month_no_zero}} OR month = {{month}})
             "report_period_ids": report_period_ids,
             "start_date": start_date,
             "end_date": end_date,
+            "window_start": window_start,
+            "window_end": window_end,
         }
         ctx = self.extract_context_from_sql_params(sql_params)
         LOG.info(log_json(msg=f"updating {table_name}", context=ctx))
@@ -613,9 +627,12 @@ AND (month = {{month_no_zero}} OR month = {{month}})
         )
         LOG.info(log_json(msg=f"finished updating {table_name}", context=ctx))
 
-    def populate_volume_label_summary_table(self, report_period_ids, start_date, end_date):
+    def populate_volume_label_summary_table(
+        self, report_period_ids, start_date, end_date, window_start=None, window_end=None
+    ):
         """Populate the OCP volume label summary table."""
         table_name = self._table_map["volume_label_summary"]
+        window_start, window_end = self._label_summary_window(window_start, window_end)
 
         sql_params = {
             "uuid": str(uuid.uuid4()).replace("-", "_"),
@@ -623,6 +640,8 @@ AND (month = {{month_no_zero}} OR month = {{month}})
             "report_period_ids": report_period_ids,
             "start_date": start_date,
             "end_date": end_date,
+            "window_start": window_start,
+            "window_end": window_end,
         }
         ctx = self.extract_context_from_sql_params(sql_params)
         LOG.info(log_json(msg=f"updating {table_name}", context=ctx))

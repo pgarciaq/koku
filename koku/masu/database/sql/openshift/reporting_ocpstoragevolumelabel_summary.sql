@@ -129,21 +129,71 @@ WHERE NOT EXISTS (
 ;
 
 
-UPDATE {{schema | sqlsafe}}.reporting_ocptags_values as ov
+-- Rebuild the catalog columns for the key/value pairs this run touched, from
+-- every label summary row whose report period is inside the reporting window
+-- (ADR-0353: [last_month_start, this_month_end], selected on
+-- report_period_start).
+--
+-- The previous form set the arrays from cte_kv_cluster_agg, which only holds
+-- the single report period of this run. That made the arrays a per-run
+-- snapshot: the last cluster to summarize owned any shared key/value, and the
+-- pod and volume runs each replaced the other's namespaces/nodes. Reading both
+-- label summaries here keeps the two sources additive and lets a cluster age
+-- out of the arrays when its report period leaves the window.
+create table {{schema | sqlsafe}}.cte_kv_catalog_{{uuid | sqlsafe}} as
+SELECT pairs.key,
+    pairs.value,
+    array_agg(DISTINCT win.cluster_id ORDER BY win.cluster_id)::text[] AS cluster_ids,
+    array_agg(DISTINCT win.cluster_alias ORDER BY win.cluster_alias)::text[] AS cluster_aliases,
+    array_agg(DISTINCT win.namespace ORDER BY win.namespace)::text[] AS namespaces,
+    array_agg(DISTINCT win.node ORDER BY win.node)::text[] AS nodes
+FROM {{schema | sqlsafe}}.cte_kv_cluster_agg_{{uuid | sqlsafe}} AS pairs
+JOIN (
+    SELECT pls.key, label_values.value, pls.namespace, pls.node, rp.cluster_id, rp.cluster_alias
+    FROM {{schema | sqlsafe}}.reporting_ocpusagepodlabel_summary AS pls
+    CROSS JOIN LATERAL unnest(pls."values") AS label_values(value)
+    JOIN {{schema | sqlsafe}}.reporting_ocpusagereportperiod AS rp
+        ON pls.report_period_id = rp.id
+    WHERE pls.key IN (SELECT key FROM {{schema | sqlsafe}}.cte_kv_cluster_agg_{{uuid | sqlsafe}})
+        AND rp.report_period_start >= {{window_start}}
+        AND rp.report_period_start <= {{window_end}}
+    UNION ALL
+    SELECT vls.key, label_values.value, vls.namespace, vls.node, rp.cluster_id, rp.cluster_alias
+    FROM {{schema | sqlsafe}}.reporting_ocpstoragevolumelabel_summary AS vls
+    CROSS JOIN LATERAL unnest(vls."values") AS label_values(value)
+    JOIN {{schema | sqlsafe}}.reporting_ocpusagereportperiod AS rp
+        ON vls.report_period_id = rp.id
+    WHERE vls.key IN (SELECT key FROM {{schema | sqlsafe}}.cte_kv_cluster_agg_{{uuid | sqlsafe}})
+        AND rp.report_period_start >= {{window_start}}
+        AND rp.report_period_start <= {{window_end}}
+) AS win
+    ON win.key = pairs.key
+    AND win.value = pairs.value
+GROUP BY pairs.key, pairs.value
+;
+
+create unique index ix_cte_kv_catalog_{{uuid | sqlsafe}}
+    on {{schema | sqlsafe}}.cte_kv_catalog_{{uuid | sqlsafe}}
+       (key, value)
+;
+
+
+UPDATE {{schema | sqlsafe}}.reporting_ocptags_values AS ov
    SET cluster_ids = upd.cluster_ids,
        cluster_aliases = upd.cluster_aliases,
        namespaces = upd.namespaces,
        nodes = upd.nodes
 FROM (
-    SELECT ov.uuid, ca.cluster_ids, ca.cluster_aliases, ca.namespaces, ca.nodes
-    FROM {{schema | sqlsafe}}.reporting_ocptags_values AS ov, {{schema | sqlsafe}}.cte_kv_cluster_agg_{{uuid | sqlsafe}} AS ca
-    WHERE ca.key = ov.key
-    AND ca.value = ov.value
-    AND (
-        ca.cluster_ids != ov.cluster_ids OR
-        ca.cluster_aliases != ov.cluster_aliases OR
-        ca.namespaces != ov.namespaces OR
-        ca.nodes != ov.nodes
+    SELECT ov.uuid, cat.cluster_ids, cat.cluster_aliases, cat.namespaces, cat.nodes
+    FROM {{schema | sqlsafe}}.reporting_ocptags_values AS ov
+    JOIN {{schema | sqlsafe}}.cte_kv_catalog_{{uuid | sqlsafe}} AS cat
+        ON cat.key = ov.key
+        AND cat.value = ov.value
+    WHERE (
+        cat.cluster_ids IS DISTINCT FROM ov.cluster_ids OR
+        cat.cluster_aliases IS DISTINCT FROM ov.cluster_aliases OR
+        cat.namespaces IS DISTINCT FROM ov.namespaces OR
+        cat.nodes IS DISTINCT FROM ov.nodes
     )
     ORDER BY ov.uuid
     FOR UPDATE OF ov
@@ -154,20 +204,42 @@ WHERE ov.uuid = upd.uuid
 
 INSERT INTO {{schema | sqlsafe}}.reporting_ocptags_values (uuid, key, value, cluster_ids, cluster_aliases, namespaces, nodes)
 SELECT uuid_generate_v4() as uuid,
-    tv.key,
-    tv.value,
-    tv.cluster_ids,
-    tv.cluster_aliases,
-    tv.namespaces,
-    tv.nodes
-FROM {{schema | sqlsafe}}.cte_kv_cluster_agg_{{uuid | sqlsafe}} AS tv
+    cat.key,
+    cat.value,
+    cat.cluster_ids,
+    cat.cluster_aliases,
+    cat.namespaces,
+    cat.nodes
+FROM {{schema | sqlsafe}}.cte_kv_catalog_{{uuid | sqlsafe}} AS cat
 WHERE not exists (
-          SELECT 1
-            FROM {{schema | sqlsafe}}.reporting_ocptags_values AS rp
-           WHERE rp.key = tv.key
-             AND rp.value = tv.value
-      )
+    SELECT 1
+    FROM {{schema | sqlsafe}}.reporting_ocptags_values AS rp
+    WHERE rp.key = cat.key
+        AND rp.value = cat.value
+)
 ON CONFLICT DO NOTHING
+;
+
+
+-- A touched pair with no cluster left inside the window is no longer part of
+-- the catalog. Dropping it also keeps it out of every contained_by filter, which
+-- an empty array would otherwise satisfy.
+DELETE FROM {{schema | sqlsafe}}.reporting_ocptags_values AS ov
+WHERE ov.uuid IN (
+    SELECT ov.uuid
+    FROM {{schema | sqlsafe}}.reporting_ocptags_values AS ov
+    JOIN {{schema | sqlsafe}}.cte_kv_cluster_agg_{{uuid | sqlsafe}} AS pairs
+        ON pairs.key = ov.key
+        AND pairs.value = ov.value
+    WHERE NOT EXISTS (
+        SELECT 1
+        FROM {{schema | sqlsafe}}.cte_kv_catalog_{{uuid | sqlsafe}} AS cat
+        WHERE cat.key = ov.key
+            AND cat.value = ov.value
+    )
+    ORDER BY ov.uuid
+    FOR UPDATE
+)
 ;
 
 
@@ -225,5 +297,7 @@ TRUNCATE TABLE {{schema | sqlsafe}}.cte_values_agg_{{uuid | sqlsafe}};
 DROP TABLE {{schema | sqlsafe}}.cte_values_agg_{{uuid | sqlsafe}};
 TRUNCATE TABLE {{schema | sqlsafe}}.cte_distinct_values_agg_{{uuid | sqlsafe}};
 DROP TABLE {{schema | sqlsafe}}.cte_distinct_values_agg_{{uuid | sqlsafe}};
+TRUNCATE TABLE {{schema | sqlsafe}}.cte_kv_catalog_{{uuid | sqlsafe}};
+DROP TABLE {{schema | sqlsafe}}.cte_kv_catalog_{{uuid | sqlsafe}};
 TRUNCATE TABLE {{schema | sqlsafe}}.cte_kv_cluster_agg_{{uuid | sqlsafe}};
 DROP TABLE {{schema | sqlsafe}}.cte_kv_cluster_agg_{{uuid | sqlsafe}};
