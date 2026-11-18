@@ -539,6 +539,12 @@ class TagQueryHandler(QueryHandler):
                         )
                     )
                 tag_values_query = source.get("db_table").objects
+                annotations = source.get("annotations")
+                if annotations:
+                    # One composed filter is applied to every catalog, so a
+                    # source whose column has another name exposes it under the
+                    # name the filter map uses, the same way get_tag_keys does.
+                    tag_values_query = tag_values_query.annotate(**annotations)
                 filt = self.query_filter & vals_filter.compose()
                 tag_keys = list(tag_values_query.filter(filt))
                 tag_tup = self._value_filter_dict(tag_keys)

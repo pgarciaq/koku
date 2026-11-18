@@ -23,10 +23,10 @@ semantics on the cloud maps and on the paths that consume the mapped operation:
   exact lookup that compares whole arrays (#886).
 
 They are table-driven rather than per-provider so the matrix is visible in one
-place: every entry listed below is exercised on every axis. A provider whose
-schema cannot support an entry is listed in ``wildcard_only`` instead, with the
-reason.
+place: every entry listed below is exercised on every axis.
 """
+from collections import defaultdict
+
 from django.contrib.postgres.fields import ArrayField
 from django_tenants.utils import tenant_context
 
@@ -69,11 +69,10 @@ def _member(filter_key, suffix):
     return f"{KEY}-{filter_key}-{suffix}"
 
 
-# ``filters`` entries are asserted on the user-filter, RBAC and wildcard paths.
-# ``wildcard_only`` entries are asserted on the wildcard path only: on
-# tags/openshift/infrastructures/all/ the account map names columns that exist
-# only on the AWS catalog table, so a value filter raises before it can match
-# (tracked separately).
+# ``filters`` entries are asserted on the user-filter, RBAC, wildcard and
+# ``exact:`` paths. Every entry is exercisable on every handler since #888: the
+# OCP-on-all account filter used to name columns that exist only on the AWS
+# catalog table, so it raised before it could match.
 PROVIDERS = (
     {
         "label": "aws",
@@ -87,7 +86,6 @@ PROVIDERS = (
                 "access": "aws.account",
             },
         ),
-        "wildcard_only": (),
     },
     {
         "label": "azure",
@@ -101,7 +99,6 @@ PROVIDERS = (
                 "access": "azure.subscription_guid",
             },
         ),
-        "wildcard_only": (),
     },
     {
         "label": "gcp",
@@ -116,7 +113,6 @@ PROVIDERS = (
                 "access": "gcp.project",
             },
         ),
-        "wildcard_only": (),
     },
     {
         "label": "aws/openshift",
@@ -136,7 +132,6 @@ PROVIDERS = (
                 "access": "openshift.cluster",
             },
         ),
-        "wildcard_only": (),
     },
     {
         "label": "azure/openshift",
@@ -156,7 +151,6 @@ PROVIDERS = (
                 "access": "openshift.cluster",
             },
         ),
-        "wildcard_only": (),
     },
     {
         "label": "gcp/openshift",
@@ -172,7 +166,6 @@ PROVIDERS = (
                 "access": "openshift.cluster",
             },
         ),
-        "wildcard_only": (),
     },
     {
         "label": "openshift",
@@ -187,7 +180,6 @@ PROVIDERS = (
                 "access": "openshift.cluster",
             },
         ),
-        "wildcard_only": (),
     },
     {
         "label": "all/openshift",
@@ -197,15 +189,18 @@ PROVIDERS = (
         "sources": (OCPAzureTagsValues, OCPAWSTagsValues),
         "filters": (
             {
+                "key": "account",
+                # The Azure catalog keeps the cloud-account identifier in
+                # `subscription_guids`; the handler aliases it to both account
+                # columns (#888).
+                "fields": ("account_aliases", "usage_account_ids", "subscription_guids"),
+                "access": "aws.account",
+            },
+            {"key": "project", "fields": ("namespaces",), "access": "openshift.project"},
+            {
                 "key": "cluster",
                 "fields": ("cluster_ids", "cluster_aliases"),
                 "access": "openshift.cluster",
-            },
-        ),
-        "wildcard_only": (
-            {
-                "key": "account",
-                "fields": ("account_aliases", "usage_account_ids"),
             },
         ),
     },
@@ -241,9 +236,8 @@ class TagValueArrayFilterTest(IamTestCase):
         """
         by_model = {}
         for cfg in PROVIDERS:
-            entries = cfg["filters"] + cfg["wildcard_only"]
             for model in cfg["sources"]:
-                by_model.setdefault(model, []).extend(entries)
+                by_model.setdefault(model, []).extend(cfg["filters"])
         return by_model
 
     def _seed(self, model, entries):
@@ -253,25 +247,35 @@ class TagValueArrayFilterTest(IamTestCase):
         non-null even when a handler does not map them (``project_ids`` on the
         OCP-on-GCP catalog is the example). Mapped fields get this module's
         tokens; unmapped ones get an empty array.
+
+        A column can be addressed by more than one filter key: the OCP-on-all
+        handler filters ``account`` on the same Azure column that the OCP-on-Azure
+        handler filters as ``subscription_guid`` (#888). The row then has to hold
+        a token for each of them, so the values are collected per key, not per
+        column.
         """
         field_names = {field.name for field in model._meta.fields}
-        mapped = {}
+        mapped = defaultdict(set)
         for entry in entries:
             for field in entry["fields"]:
                 if field in field_names:
-                    mapped[field] = entry["key"]
+                    mapped[field].add(entry["key"])
 
         blanks = {field.name: [] for field in model._meta.fields if isinstance(field, ArrayField)}
         shared = dict(blanks)
-        for name, filter_key in mapped.items():
-            shared[name] = [_member(filter_key, "a"), _member(filter_key, "b")]
+        for name, filter_keys in mapped.items():
+            shared[name] = [
+                token
+                for filter_key in sorted(filter_keys)
+                for token in (_member(filter_key, "a"), _member(filter_key, "b"))
+            ]
         shared.update(key=KEY, value=SHARED)
 
         lookalike = dict(blanks)
-        for name, filter_key in mapped.items():
-            # A superstring of the "a" member: a substring match on the array's
+        for name, filter_keys in mapped.items():
+            # A superstring of each "a" member: a substring match on the array's
             # text form returns it, element membership must not.
-            lookalike[name] = [_member(filter_key, "ab")]
+            lookalike[name] = [_member(filter_key, "ab") for filter_key in sorted(filter_keys)]
         lookalike.update(key=KEY, value=LOOKALIKE)
 
         model.objects.filter(key=KEY).delete()
@@ -340,6 +344,76 @@ class TagValueArrayFilterTest(IamTestCase):
                     token = _member(entry["key"], "unknown")
                     self.assertEqual([], self._values(cfg, f"&filter[{entry['key']}]={token}"))
 
+    @staticmethod
+    def _provider(label):
+        """Return one provider configuration by label."""
+        for cfg in PROVIDERS:
+            if cfg["label"] == label:
+                return cfg
+        raise AssertionError(f"no provider named {label}")
+
+    def test_ocp_all_reads_both_catalogs(self):
+        """The OCP-on-all value endpoint queries both catalog tables (#888).
+
+        A value that exists only in the Azure catalog must be returned, and the
+        account filter must reach it: on that catalog the cloud-account
+        identifier is the subscription guid, aliased to the account columns by
+        the handler. Without the alias the account filter raises before the
+        query runs, which is how the Azure catalog stayed unreachable.
+        """
+        cfg = self._provider("all/openshift")
+        azure_only = f"{QUERY}-azure-only"
+        token = _member("account", "a")
+        with tenant_context(self.tenant):
+            OCPAzureTagsValues.objects.create(
+                key=KEY,
+                value=azure_only,
+                subscription_guids=[token],
+                cluster_ids=[],
+                cluster_aliases=[],
+                namespaces=[_member("project", "a")],
+                nodes=[],
+            )
+
+        self.assertIn(azure_only, self._values(cfg), msg="the Azure catalog must be queried")
+        self.assertIn(
+            azure_only,
+            self._values(cfg, f"&filter[account]={token}"),
+            msg="an account filter must match the Azure row through the subscription guid",
+        )
+        self.assertIn(
+            azure_only,
+            self._values(cfg, access={"aws.account": {"read": [token]}}),
+            msg="the RBAC access list binds the same filter map entry",
+        )
+
+    def test_ocp_all_project_filters_the_key_endpoint(self):
+        """``project`` must filter the key endpoint too, not be accepted and dropped (#888).
+
+        The serializer on this handler registers ``project``, so a request for it
+        answers 200. The key endpoint reads the tags summary tables, which need
+        bill and period fixtures; what "ignored" looked like was a composed
+        filter with no predicate for the namespace, so that is what is asserted
+        here, for the user filter and for the RBAC grant.
+        """
+        cfg = self._provider("all/openshift")
+        token = _member("project", "a")
+        cases = (
+            ("user filter", {"filter": {"project": [token]}}, None),
+            ("rbac grant", {}, {"openshift.project": {"read": [token]}}),
+        )
+        for label, parameters, access in cases:
+            with self.subTest(path=label):
+                query_params = self.mocked_query_params(f"/?filter[key]={KEY}", cfg["view"], access=access)
+                for key, value in parameters.get("filter", {}).items():
+                    query_params.set_filter(**{key: value})
+                handler = cfg["handler"](query_params)
+                self.assertIn(
+                    "namespace__",
+                    str(handler.query_filter),
+                    msg="without it the request is accepted and returns every namespace",
+                )
+
     def test_rbac_access_list_uses_membership(self):
         """RBAC binds a list through the same map entry, so it must use the elements.
 
@@ -365,7 +439,7 @@ class TagValueArrayFilterTest(IamTestCase):
         """``*`` has no array form: it must return every value, not raise (#887)."""
         expected = sorted([SHARED, LOOKALIKE])
         for cfg in PROVIDERS:
-            for entry in cfg["filters"] + cfg["wildcard_only"]:
+            for entry in cfg["filters"]:
                 with self.subTest(provider=cfg["label"], filter=entry["key"]):
                     self.assertEqual(
                         expected,
@@ -375,7 +449,7 @@ class TagValueArrayFilterTest(IamTestCase):
     def test_wildcard_response_matches_the_unfiltered_response(self):
         """A wildcard filter removes no values, so the body must not change."""
         for cfg in PROVIDERS:
-            for entry in cfg["filters"] + cfg["wildcard_only"]:
+            for entry in cfg["filters"]:
                 with self.subTest(provider=cfg["label"], filter=entry["key"]):
                     self.assertEqual(
                         sorted(self._values(cfg)),
@@ -424,7 +498,7 @@ class TagValueArrayFilterTest(IamTestCase):
         """
         expected = sorted([SHARED, LOOKALIKE])
         for cfg in PROVIDERS:
-            for entry in cfg["filters"] + cfg["wildcard_only"]:
+            for entry in cfg["filters"]:
                 with self.subTest(provider=cfg["label"], filter=entry["key"]):
                     self.assertEqual(
                         expected,

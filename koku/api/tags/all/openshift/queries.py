@@ -7,7 +7,6 @@ from copy import deepcopy
 
 from django.db.models import DecimalField
 from django.db.models import F
-from django.db.models import TextField
 from django.db.models import Value
 
 from api.models import Provider
@@ -35,17 +34,21 @@ class OCPAllTagQueryHandler(TagQueryHandler):
         },
     ]
     TAGS_VALUES_SOURCE = [
-        {"db_table": OCPAzureTagsValues, "fields": ["key"]},
         {
-            "db_table": OCPAWSTagsValues,
+            "db_table": OCPAzureTagsValues,
             "fields": ["key"],
+            # `account` is this handler's union namespace for cloud accounts
+            # (#888). The Azure catalog's identifier is the subscription guid,
+            # so both account columns the value filter map names are aliased to
+            # it; get_tag_values applies these to the query.
             "annotations": {
+                "account_aliases": F("subscription_guids"),
                 "usage_account_ids": F("subscription_guids"),
-                "account_aliases": Value("", output_field=TextField()),
             },
         },
+        {"db_table": OCPAWSTagsValues, "fields": ["key"]},
     ]
-    SUPPORTED_FILTERS = TagQueryHandler.SUPPORTED_FILTERS + ["account", "cluster"]
+    SUPPORTED_FILTERS = TagQueryHandler.SUPPORTED_FILTERS + ["account", "cluster", "project"]
 
     def __init__(self, parameters):
         """Establish OCP on All infrastructure tag query handler.
@@ -72,7 +75,7 @@ class OCPAllTagQueryHandler(TagQueryHandler):
                         {"field": "account_aliases", "operation": "overlap", "composition_key": "account_filter"},
                         {"field": "usage_account_ids", "operation": "overlap", "composition_key": "account_filter"},
                     ],
-                    "project": {"field": "namespaces", "operation": "icontains"},
+                    "project": {"field": "namespaces", "operation": "overlap"},
                     "cluster": [
                         {"field": "cluster_ids", "operation": "overlap", "composition_key": "cluster_filter"},
                         {"field": "cluster_aliases", "operation": "overlap", "composition_key": "cluster_filter"},
