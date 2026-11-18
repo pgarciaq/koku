@@ -75,10 +75,9 @@ OPERATORS = ("and", "or", "exact")
 # question from this module and is not asserted here.
 #
 # `binds_enabled_value` marks the handlers whose map entry derives the value
-# from the request. The three OCP-on-cloud maps hard-code `"parameter": True`
-# in both branches, so `filter[enabled]=false` is accepted and ignored there;
-# that is a plain-key defect of its own, not the operator-prefix defect this
-# module covers, so those three only assert that a predicate is composed.
+# from the request. Before #895 the three OCP-on-cloud maps hard-coded
+# `"parameter": True` in both branches; they now bind the requested value like
+# the rest of the family, so the assertion applies to every entry listed here.
 PROVIDERS = (
     {
         "label": "aws",
@@ -106,21 +105,21 @@ PROVIDERS = (
         "view": OCPAWSTagView,
         "handler": OCPAWSTagQueryHandler,
         "supports_enabled": True,
-        "binds_enabled_value": False,
+        "binds_enabled_value": True,
     },
     {
         "label": "azure/openshift",
         "view": OCPAzureTagView,
         "handler": OCPAzureTagQueryHandler,
         "supports_enabled": True,
-        "binds_enabled_value": False,
+        "binds_enabled_value": True,
     },
     {
         "label": "gcp/openshift",
         "view": OCPGCPTagView,
         "handler": OCPGCPTagQueryHandler,
         "supports_enabled": True,
-        "binds_enabled_value": False,
+        "binds_enabled_value": True,
     },
     {
         "label": "openshift",
