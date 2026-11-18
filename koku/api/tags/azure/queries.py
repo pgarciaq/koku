@@ -56,7 +56,7 @@ class AzureTagQueryHandler(TagQueryHandler):
         if self._parameters.get_filter("value"):
             filter_map.update(
                 {
-                    "subscription_guid": {"field": "subscription_guids", "operation": "icontains"},
+                    "subscription_guid": {"field": "subscription_guids", "operation": "overlap"},
                     "enabled": {"field": "enabled", "operation": "exact", "parameter": enabled_parameter},
                 }
             )

@@ -62,8 +62,8 @@ class AWSTagQueryHandler(TagQueryHandler):
             filter_map.update(
                 {
                     "account": [
-                        {"field": "account_aliases", "operation": "icontains", "composition_key": "account_filter"},
-                        {"field": "usage_account_ids", "operation": "icontains", "composition_key": "account_filter"},
+                        {"field": "account_aliases", "operation": "overlap", "composition_key": "account_filter"},
+                        {"field": "usage_account_ids", "operation": "overlap", "composition_key": "account_filter"},
                     ],
                     "enabled": {"field": "enabled", "operation": "exact", "parameter": enabled_parameter},
                 }

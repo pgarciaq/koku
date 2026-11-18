@@ -1,0 +1,346 @@
+#
+# Copyright 2026 Red Hat Inc.
+# SPDX-License-Identifier: Apache-2.0
+#
+"""Value-endpoint array filters, across every handler that maps one (#871).
+
+``reporting_*tags_values`` rows aggregate: one row for a key/value pair carries
+every cluster, namespace, node or account that reported it. "The value is used
+by entity X" therefore means "X is an element of the row's array", not
+"the array's text rendering contains X" (``icontains``) and not "the whole
+array is contained by {X}" (``contained_by``).
+
+The seven cloud handlers used ``icontains`` against these arrays; OCP was moved
+to ``overlap`` in #867. These tests pin the same semantics on the cloud maps and
+on the two paths that consume the mapped operation:
+
+* the user filter (``filter[project]=ns-a``),
+* the RBAC access list (which is bound through the same map entry, #885),
+* the wildcard (``filter[project]=*``), whose "match everything" predicate has
+  no array form (#887).
+
+They are table-driven rather than per-provider so the matrix is visible in one
+place: every entry listed below is exercised on every axis. A provider whose
+schema cannot support an entry is listed in ``wildcard_only`` instead, with the
+reason.
+"""
+from django.contrib.postgres.fields import ArrayField
+from django_tenants.utils import tenant_context
+
+from api.iam.test.iam_test_case import IamTestCase
+from api.tags.all.openshift.queries import OCPAllTagQueryHandler
+from api.tags.all.openshift.view import OCPAllTagView
+from api.tags.aws.openshift.queries import OCPAWSTagQueryHandler
+from api.tags.aws.openshift.view import OCPAWSTagView
+from api.tags.aws.queries import AWSTagQueryHandler
+from api.tags.aws.view import AWSTagView
+from api.tags.azure.openshift.queries import OCPAzureTagQueryHandler
+from api.tags.azure.openshift.view import OCPAzureTagView
+from api.tags.azure.queries import AzureTagQueryHandler
+from api.tags.azure.view import AzureTagView
+from api.tags.gcp.openshift.queries import OCPGCPTagQueryHandler
+from api.tags.gcp.openshift.view import OCPGCPTagView
+from api.tags.gcp.queries import GCPTagQueryHandler
+from api.tags.gcp.view import GCPTagView
+from reporting.provider.aws.models import AWSTagsValues
+from reporting.provider.aws.openshift.models import OCPAWSTagsValues
+from reporting.provider.azure.models import AzureTagsValues
+from reporting.provider.azure.openshift.models import OCPAzureTagsValues
+from reporting.provider.gcp.models import GCPTagsValues
+from reporting.provider.gcp.openshift.models import OCPGCPTagsValues
+
+# The value filter is a substring match on a TextField, so one token selects
+# this module's rows and nothing else. The two values differ only in a suffix
+# that a substring match would blur: see ``LOOKALIKE``.
+KEY = "tag871"
+QUERY = "zq871"
+SHARED = "zq871-shared"
+LOOKALIKE = "zq871-lookalike"
+
+
+def _member(filter_key, suffix):
+    """Return an entity token for one filter map entry."""
+    return f"{KEY}-{filter_key}-{suffix}"
+
+
+# ``filters`` entries are asserted on the user-filter, RBAC and wildcard paths.
+# ``wildcard_only`` entries are asserted on the wildcard path only: on
+# tags/openshift/infrastructures/all/ the account map names columns that exist
+# only on the AWS catalog table, so a value filter raises before it can match
+# (tracked separately).
+PROVIDERS = (
+    {
+        "label": "aws",
+        "handler": AWSTagQueryHandler,
+        "view": AWSTagView,
+        "sources": (AWSTagsValues,),
+        "filters": (
+            {
+                "key": "account",
+                "fields": ("account_aliases", "usage_account_ids"),
+                "access": "aws.account",
+            },
+        ),
+        "wildcard_only": (),
+    },
+    {
+        "label": "azure",
+        "handler": AzureTagQueryHandler,
+        "view": AzureTagView,
+        "sources": (AzureTagsValues,),
+        "filters": (
+            {
+                "key": "subscription_guid",
+                "fields": ("subscription_guids",),
+                "access": "azure.subscription_guid",
+            },
+        ),
+        "wildcard_only": (),
+    },
+    {
+        "label": "gcp",
+        "handler": GCPTagQueryHandler,
+        "view": GCPTagView,
+        "sources": (GCPTagsValues,),
+        "filters": (
+            {"key": "account", "fields": ("account_ids",), "access": "gcp.account"},
+            {
+                "key": "gcp_project",
+                "fields": ("project_ids", "project_names"),
+                "access": "gcp.project",
+            },
+        ),
+        "wildcard_only": (),
+    },
+    {
+        "label": "aws/openshift",
+        "handler": OCPAWSTagQueryHandler,
+        "view": OCPAWSTagView,
+        "sources": (OCPAWSTagsValues,),
+        "filters": (
+            {
+                "key": "account",
+                "fields": ("account_aliases", "usage_account_ids"),
+                "access": "aws.account",
+            },
+            {"key": "project", "fields": ("namespaces",), "access": "openshift.project"},
+            {
+                "key": "cluster",
+                "fields": ("cluster_ids", "cluster_aliases"),
+                "access": "openshift.cluster",
+            },
+        ),
+        "wildcard_only": (),
+    },
+    {
+        "label": "azure/openshift",
+        "handler": OCPAzureTagQueryHandler,
+        "view": OCPAzureTagView,
+        "sources": (OCPAzureTagsValues,),
+        "filters": (
+            {
+                "key": "subscription_guid",
+                "fields": ("subscription_guids",),
+                "access": "azure.subscription_guid",
+            },
+            {"key": "project", "fields": ("namespaces",), "access": "openshift.project"},
+            {
+                "key": "cluster",
+                "fields": ("cluster_ids", "cluster_aliases"),
+                "access": "openshift.cluster",
+            },
+        ),
+        "wildcard_only": (),
+    },
+    {
+        "label": "gcp/openshift",
+        "handler": OCPGCPTagQueryHandler,
+        "view": OCPGCPTagView,
+        "sources": (OCPGCPTagsValues,),
+        "filters": (
+            {"key": "account", "fields": ("account_ids",), "access": "gcp.account"},
+            {"key": "project", "fields": ("namespaces",), "access": "openshift.project"},
+            {
+                "key": "cluster",
+                "fields": ("cluster_ids", "cluster_aliases"),
+                "access": "openshift.cluster",
+            },
+        ),
+        "wildcard_only": (),
+    },
+    {
+        "label": "all/openshift",
+        "handler": OCPAllTagQueryHandler,
+        "view": OCPAllTagView,
+        # Two catalog tables, so a match has to be found in both schemas.
+        "sources": (OCPAzureTagsValues, OCPAWSTagsValues),
+        "filters": (
+            {
+                "key": "cluster",
+                "fields": ("cluster_ids", "cluster_aliases"),
+                "access": "openshift.cluster",
+            },
+        ),
+        "wildcard_only": (
+            {
+                "key": "account",
+                "fields": ("account_aliases", "usage_account_ids"),
+            },
+        ),
+    },
+)
+
+
+class TagValueArrayFilterTest(IamTestCase):
+    """Element membership for every array-mapped value filter (#871)."""
+
+    def setUp(self):
+        """Seed, per catalog table, one shared row and one lookalike row."""
+        super().setUp()
+        with tenant_context(self.tenant):
+            for model, entries in self._entries_by_model().items():
+                self._seed(model, entries)
+
+    def tearDown(self):
+        """Remove every row this module seeded."""
+        with tenant_context(self.tenant):
+            for model in self._entries_by_model():
+                model.objects.filter(key=KEY).delete()
+        super().tearDown()
+
+    @staticmethod
+    def _entries_by_model():
+        """Group every mapped entry by catalog table.
+
+        Several handlers share a table: the OCP-on-all handler reads both the
+        OCP-on-AWS and the OCP-on-Azure catalog, and each of those is also the
+        sole source of its own handler. Seeding per handler would have the
+        narrower map overwrite the wider one's tokens, so the rows are built
+        once from the union of the entries that target each table.
+        """
+        by_model = {}
+        for cfg in PROVIDERS:
+            entries = cfg["filters"] + cfg["wildcard_only"]
+            for model in cfg["sources"]:
+                by_model.setdefault(model, []).extend(entries)
+        return by_model
+
+    def _seed(self, model, entries):
+        """Create the shared and lookalike rows for one catalog table.
+
+        Every array field the model carries is populated, because the columns are
+        non-null even when a handler does not map them (``project_ids`` on the
+        OCP-on-GCP catalog is the example). Mapped fields get this module's
+        tokens; unmapped ones get an empty array.
+        """
+        field_names = {field.name for field in model._meta.fields}
+        mapped = {}
+        for entry in entries:
+            for field in entry["fields"]:
+                if field in field_names:
+                    mapped[field] = entry["key"]
+
+        blanks = {field.name: [] for field in model._meta.fields if isinstance(field, ArrayField)}
+        shared = dict(blanks)
+        for name, filter_key in mapped.items():
+            shared[name] = [_member(filter_key, "a"), _member(filter_key, "b")]
+        shared.update(key=KEY, value=SHARED)
+
+        lookalike = dict(blanks)
+        for name, filter_key in mapped.items():
+            # A superstring of the "a" member: a substring match on the array's
+            # text form returns it, element membership must not.
+            lookalike[name] = [_member(filter_key, "ab")]
+        lookalike.update(key=KEY, value=LOOKALIKE)
+
+        model.objects.filter(key=KEY).delete()
+        model.objects.create(**shared)
+        model.objects.create(**lookalike)
+
+    def _values(self, cfg, extra_filter="", access=None):
+        """Return the value endpoint's values for the shared key."""
+        url = f"/{KEY}/?filter[value]={QUERY}{extra_filter}"
+        query_params = self.mocked_query_params(url, cfg["view"], access=access)
+        query_params.kwargs = {"key": KEY}
+        handler = cfg["handler"](query_params)
+        data = handler.get_tag_values()
+        if not data:
+            return []
+        return data[0].get("values", [])
+
+    def test_shared_value_matches_each_of_its_members(self):
+        """A value shared by two entities must match a filter naming either one."""
+        for cfg in PROVIDERS:
+            for entry in cfg["filters"]:
+                for member in ("a", "b"):
+                    with self.subTest(provider=cfg["label"], filter=entry["key"], member=member):
+                        token = _member(entry["key"], member)
+                        self.assertEqual(
+                            [SHARED],
+                            self._values(cfg, f"&filter[{entry['key']}]={token}"),
+                        )
+
+    def test_lookalike_is_not_a_member(self):
+        """A filter must match elements, not the array's text rendering."""
+        for cfg in PROVIDERS:
+            for entry in cfg["filters"]:
+                with self.subTest(provider=cfg["label"], filter=entry["key"]):
+                    token = _member(entry["key"], "a")
+                    self.assertEqual(
+                        [SHARED],
+                        self._values(cfg, f"&filter[{entry['key']}]={token}"),
+                        msg=(
+                            "a substring match returns the lookalike row as well; "
+                            f"only the row holding {token} as an element may match"
+                        ),
+                    )
+
+    def test_non_member_is_excluded(self):
+        """Membership must not degrade into match-everything."""
+        for cfg in PROVIDERS:
+            for entry in cfg["filters"]:
+                with self.subTest(provider=cfg["label"], filter=entry["key"]):
+                    token = _member(entry["key"], "unknown")
+                    self.assertEqual([], self._values(cfg, f"&filter[{entry['key']}]={token}"))
+
+    def test_rbac_access_list_uses_membership(self):
+        """RBAC binds a list through the same map entry, so it must use the elements.
+
+        The access list is not a string, and it is not a request to describe the
+        whole row: a grant on one entity must keep a value another granted
+        entity also reported (#885).
+        """
+        for cfg in PROVIDERS:
+            for entry in cfg["filters"]:
+                with self.subTest(provider=cfg["label"], filter=entry["key"]):
+                    access = {entry["access"]: {"read": [_member(entry["key"], "b")]}}
+                    self.assertEqual([SHARED], self._values(cfg, access=access))
+
+    def test_rbac_access_list_excludes_ungranted_values(self):
+        """RBAC must still hide a value no granted entity reported."""
+        for cfg in PROVIDERS:
+            for entry in cfg["filters"]:
+                with self.subTest(provider=cfg["label"], filter=entry["key"]):
+                    access = {entry["access"]: {"read": [_member(entry["key"], "unknown")]}}
+                    self.assertEqual([], self._values(cfg, access=access))
+
+    def test_wildcard_on_array_filter_adds_no_predicate(self):
+        """``*`` has no array form: it must return every value, not raise (#887)."""
+        expected = sorted([SHARED, LOOKALIKE])
+        for cfg in PROVIDERS:
+            for entry in cfg["filters"] + cfg["wildcard_only"]:
+                with self.subTest(provider=cfg["label"], filter=entry["key"]):
+                    self.assertEqual(
+                        expected,
+                        sorted(self._values(cfg, f"&filter[{entry['key']}]=*")),
+                    )
+
+    def test_wildcard_response_matches_the_unfiltered_response(self):
+        """A wildcard filter removes no values, so the body must not change."""
+        for cfg in PROVIDERS:
+            for entry in cfg["filters"] + cfg["wildcard_only"]:
+                with self.subTest(provider=cfg["label"], filter=entry["key"]):
+                    self.assertEqual(
+                        sorted(self._values(cfg)),
+                        sorted(self._values(cfg, f"&filter[{entry['key']}]=*")),
+                    )

@@ -68,11 +68,11 @@ class OCPGCPTagQueryHandler(GCPTagQueryHandler, OCPTagQueryHandler):
         if self._parameters.get_filter("value"):
             filter_map.update(
                 {
-                    "account": {"field": "account_ids", "operation": "icontains"},
-                    "project": {"field": "namespaces", "operation": "icontains"},
+                    "account": {"field": "account_ids", "operation": "overlap"},
+                    "project": {"field": "namespaces", "operation": "overlap"},
                     "cluster": [
-                        {"field": "cluster_ids", "operation": "icontains", "composition_key": "cluster_filter"},
-                        {"field": "cluster_aliases", "operation": "icontains", "composition_key": "cluster_filter"},
+                        {"field": "cluster_ids", "operation": "overlap", "composition_key": "cluster_filter"},
+                        {"field": "cluster_aliases", "operation": "overlap", "composition_key": "cluster_filter"},
                     ],
                     "enabled": {"field": "enabled", "operation": "exact", "parameter": True},
                 }

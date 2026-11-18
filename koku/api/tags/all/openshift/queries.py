@@ -69,13 +69,13 @@ class OCPAllTagQueryHandler(TagQueryHandler):
             filter_map.update(
                 {
                     "account": [
-                        {"field": "account_aliases", "operation": "icontains", "composition_key": "account_filter"},
-                        {"field": "usage_account_ids", "operation": "icontains", "composition_key": "account_filter"},
+                        {"field": "account_aliases", "operation": "overlap", "composition_key": "account_filter"},
+                        {"field": "usage_account_ids", "operation": "overlap", "composition_key": "account_filter"},
                     ],
                     "project": {"field": "namespaces", "operation": "icontains"},
                     "cluster": [
-                        {"field": "cluster_ids", "operation": "icontains", "composition_key": "cluster_filter"},
-                        {"field": "cluster_aliases", "operation": "icontains", "composition_key": "cluster_filter"},
+                        {"field": "cluster_ids", "operation": "overlap", "composition_key": "cluster_filter"},
+                        {"field": "cluster_aliases", "operation": "overlap", "composition_key": "cluster_filter"},
                     ],
                 }
             )

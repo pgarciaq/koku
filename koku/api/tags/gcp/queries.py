@@ -61,12 +61,10 @@ class GCPTagQueryHandler(TagQueryHandler):
         if self._parameters.get_filter("value"):
             filter_map.update(
                 {
-                    "account": [
-                        {"field": "account_ids", "operation": "icontains", "composition_key": "account_filter"}
-                    ],
+                    "account": [{"field": "account_ids", "operation": "overlap", "composition_key": "account_filter"}],
                     "gcp_project": [
-                        {"field": "project_ids", "operation": "icontains", "composition_key": "project_filter"},
-                        {"field": "project_names", "operation": "icontains", "composition_key": "project_filter"},
+                        {"field": "project_ids", "operation": "overlap", "composition_key": "project_filter"},
+                        {"field": "project_names", "operation": "overlap", "composition_key": "project_filter"},
                     ],
                     "enabled": {"field": "enabled", "operation": "exact", "parameter": enabled_parameter},
                 }
