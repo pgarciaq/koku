@@ -11,7 +11,15 @@ from api.tags.serializers import FilterSerializer
 from api.tags.serializers import TagsQueryParamSerializer
 
 
-OCP_FILTER_OP_FIELDS = ["project", "enabled", "cluster", "category"]
+# `and:`/`or:`/`exact:` combine a set of values. `enabled` is a boolean
+# literal, not a dimension: the operator has nothing to combine, and the
+# handler binds the map entry's own parameter, so an operator-prefixed
+# `enabled` reached QueryFilter(parameter=..., **{"parameter": ...}) and raised
+# "multiple values for keyword argument 'parameter'" -- a 500 on a parameter
+# this list advertised (#892). Not advertising it makes the tags layer reject
+# the prefix as an unsupported nested key (400), the treatment `exact:node`
+# already gets, instead of raising.
+OCP_FILTER_OP_FIELDS = ["project", "cluster", "category"]
 
 
 class OCPFilterSerializer(FilterSerializer):
