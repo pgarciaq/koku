@@ -4,6 +4,7 @@
 #
 """Test the effective_rates endpoint view."""
 import uuid
+from datetime import date
 from decimal import Decimal
 from unittest.mock import patch
 
@@ -17,6 +18,8 @@ from api.provider.models import Provider
 from api.provider.models import ProviderAuthentication
 from cost_models.models import CostModel
 from cost_models.models import CostModelMap
+from cost_models.models import PriceList
+from cost_models.models import PriceListCostModelMap
 from masu.api import effective_rates as er
 from masu.test import MasuTestCase
 from reporting.provider.ocp.models import OCPUsageLineItemDailySummary
@@ -115,6 +118,8 @@ class EffectiveRatesTest(MasuTestCase):
             expected_keys = {
                 "cost_model_cpu_cost",
                 "cost_model_memory_cost",
+                # #467 contract point 3: observed GPU spend travels with the rest.
+                "cost_model_gpu_cost",
                 "infrastructure_cost",
                 "distributed_cost",
                 "cpu_usage_hours",
@@ -294,30 +299,52 @@ class EffectiveRatesTenantScopingTest(MasuTestCase):
         )
         # Distinct rates per tenant so the response identifies the resolved
         # provider unambiguously (same-value collisions would mask a swap).
+        #
+        # The rates live on a mapped price list (#467): the endpoint now resolves
+        # through CostModelDBAccessor(price_list_effective_on=start_date), which is
+        # exactly what Masu applies. A cost model with inline `rates` and no price
+        # list resolves to no rates at all — zero costs — so a fixture that only
+        # set `rates` would pass this test for the wrong reason.
         self.tenant_cost_models = []
+        self.tenant_price_lists = []
         for schema, provider, value, suffix in (
             ("org1234567", self.provider_a, 2.0, "a"),
             ("org2222222", self.provider_b, 1.0, "b"),
         ):
             with schema_context(schema):
+                rates = [
+                    {
+                        "metric": {"name": "cpu_core_usage_per_hour"},
+                        "tiered_rates": [{"unit": "USD", "value": value}],
+                        "cost_type": "Supplementary",
+                        "custom_name": "CPU usage",
+                    }
+                ]
                 cm = CostModel.objects.create(
                     name=f"scoping-cm-{suffix}",
                     source_type=Provider.PROVIDER_OCP,
-                    rates=[
-                        {
-                            "metric": {"name": "cpu_core_usage_per_hour"},
-                            "tiered_rates": [{"unit": "USD", "value": value}],
-                            "cost_type": "Supplementary",
-                            "name": "CPU usage",
-                        }
-                    ],
+                    rates=rates,
                 )
                 CostModelMap.objects.create(cost_model_id=cm.uuid, provider_uuid=provider.uuid)
+                price_list = PriceList.objects.create(
+                    name=f"scoping-pl-{suffix}",
+                    description="",
+                    currency="USD",
+                    effective_start_date=date(2020, 1, 1),
+                    effective_end_date=date(2099, 12, 31),
+                    rates=rates,
+                )
+                PriceListCostModelMap.objects.create(price_list=price_list, cost_model=cm, priority=1)
                 self.tenant_cost_models.append((schema, cm.uuid))
+                self.tenant_price_lists.append((schema, price_list.uuid))
 
     def tearDown(self):
         """Remove tenant-schema rows explicitly (schema_context writes may
         outlive the public-schema transaction rollback under KEEPDB)."""
+        for schema, pl_uuid in self.tenant_price_lists:
+            with schema_context(schema):
+                PriceListCostModelMap.objects.filter(price_list_id=pl_uuid).delete()
+                PriceList.objects.filter(uuid=pl_uuid).delete()
         for schema, cm_uuid in self.tenant_cost_models:
             with schema_context(schema):
                 CostModelMap.objects.filter(cost_model_id=cm_uuid).delete()
@@ -490,3 +517,332 @@ class EffectiveRatesTenantScopingTest(MasuTestCase):
             Provider.objects.get(name="aaa-unowned-provider").uuid,
             "an unowned provider must never be resolved (#771)",
         )
+
+
+@override_settings(ROOT_URLCONF="masu.urls")
+class EffectiveRatesRatesPassthroughTest(MasuTestCase):
+    """#467: the payload must carry the cost model's rows as-is.
+
+    Baseline `_parse_rates_list` kept only `tiered_rates[0].value` per metric and
+    dropped `tag_rates` entirely, and `_get_configured_rates` read
+    `cost_model.rates` directly instead of resolving through
+    `CostModelDBAccessor(..., price_list_effective_on=start_date)`. Consequences
+    pinned here: tag-only metrics (GPU in the UI, `project_per_month`) surfaced
+    as a fake `$0` while their prices were never emitted, and a cost model whose
+    prices live in mapped price lists (the on-prem layout: `rates == {}`) emitted
+    nothing at all — which is why node/PVC savings were 0 on the demo cluster.
+    """
+
+    CLUSTER_ID = "rates-passthrough-cluster-467"
+    NS = "rates-passthrough-ns"
+
+    def setUp(self):
+        super().setUp()
+        self.auth = ProviderAuthentication.objects.create(credentials={"cluster_id": self.CLUSTER_ID})
+        self.provider = Provider.objects.create(
+            name="rates-passthrough-provider",
+            type=Provider.PROVIDER_OCP,
+            customer=self.customer,
+            authentication=self.auth,
+        )
+        self.cost_model_uuids = []
+        self.price_list_uuids = []
+        self.summary_row_uuids = []
+
+    def tearDown(self):
+        """Remove tenant-schema rows explicitly: schema_context writes may outlive
+        the public-schema transaction rollback under KEEPDB."""
+        with schema_context(self.schema):
+            PriceListCostModelMap.objects.filter(price_list_id__in=self.price_list_uuids).delete()
+            PriceList.objects.filter(uuid__in=self.price_list_uuids).delete()
+            CostModelMap.objects.filter(cost_model_id__in=self.cost_model_uuids).delete()
+            CostModel.objects.filter(uuid__in=self.cost_model_uuids).delete()
+            OCPUsageLineItemDailySummary.objects.filter(uuid__in=self.summary_row_uuids).delete()
+        super().tearDown()
+
+    # -- fixtures ---------------------------------------------------------
+
+    def _make_cost_model(self, rates):
+        """Map a cost model to this provider. Unmapped provider => no model at all."""
+        with schema_context(self.schema):
+            cm = CostModel.objects.create(
+                name=f"rates-passthrough-cm-{uuid.uuid4().hex[:8]}",
+                source_type=Provider.PROVIDER_OCP,
+                rates=rates,
+            )
+            CostModelMap.objects.create(cost_model_id=cm.uuid, provider_uuid=self.provider.uuid)
+        self.cost_model_uuids.append(cm.uuid)
+        return cm
+
+    def _attach_price_list(self, cost_model, rates, start, end, currency="USD", priority=1):
+        with schema_context(self.schema):
+            pl = PriceList.objects.create(
+                name=f"rates-passthrough-pl-{uuid.uuid4().hex[:8]}",
+                description="",
+                currency=currency,
+                effective_start_date=start,
+                effective_end_date=end,
+                rates=rates,
+            )
+            PriceListCostModelMap.objects.create(price_list=pl, cost_model_id=cost_model.uuid, priority=priority)
+        self.price_list_uuids.append(pl.uuid)
+        return pl
+
+    def _this_month(self):
+        return (self.dh.this_month_start.date(), self.dh.this_month_end.date())
+
+    def _get(self, **overrides):
+        params = {"cluster_id": self.CLUSTER_ID, "org_id": self.org_id}
+        params.update(overrides)
+        response = self.client.get(reverse("effective_rates"), params)
+        self.assertEqual(response.status_code, 200)
+        return response.json()
+
+    @staticmethod
+    def _tiered(metric, value, cost_type="Supplementary", unit="USD"):
+        return {
+            "metric": {"name": metric},
+            "tiered_rates": [{"unit": unit, "value": value}],
+            "cost_type": cost_type,
+            "description": "",
+        }
+
+    # -- RED: price lists are the rate source -----------------------------
+
+    @patch("koku.middleware.MASU", return_value=True)
+    def test_price_list_rates_surface_when_cost_model_rates_are_empty(self, _):
+        """Live observation on the demo cluster: `demo-cm1` has `rates == {}` and the
+        prices live in mapped price lists. Baseline emitted neither `rates` nor a
+        populated `configured_rates`, which is why node/PVC savings stayed 0."""
+        cm = self._make_cost_model([])
+        start, end = self._this_month()
+        self._attach_price_list(
+            cm,
+            [
+                self._tiered("cpu_core_usage_per_hour", "0.3"),
+                self._tiered("node_core_cost_per_month", "200.0"),
+            ],
+            start,
+            end,
+        )
+
+        body = self._get()
+
+        self.assertEqual(len(body["rates"]), 2, "price-list rates must reach the payload")
+        self.assertEqual(
+            {row["metric"]["name"] for row in body["rates"]},
+            {"cpu_core_usage_per_hour", "node_core_cost_per_month"},
+        )
+        self.assertEqual(body["configured_rates"]["cpu_core_usage_per_hour"]["supplementary"], 0.3)
+        self.assertEqual(
+            body["configured_rates"]["node_core_cost_per_month"]["supplementary"],
+            200.0,
+            "node_core_cost_per_month must reach configured_rates or node savings stay 0",
+        )
+
+    @patch("koku.middleware.MASU", return_value=True)
+    def test_price_list_is_resolved_for_the_requested_start_date(self, _):
+        """Contract point 4: rates resolve for the requested window, not for today."""
+        cm = self._make_cost_model([])
+        last_start, last_end = self.dh.last_month_start.date(), self.dh.last_month_end.date()
+        this_start, this_end = self._this_month()
+        self._attach_price_list(
+            cm, [self._tiered("cpu_core_usage_per_hour", "9.99")], last_start, last_end, priority=1
+        )
+        self._attach_price_list(
+            cm, [self._tiered("cpu_core_usage_per_hour", "0.007")], this_start, this_end, priority=2
+        )
+
+        this_body = self._get(start_date=str(this_start), end_date=str(this_end))
+        last_body = self._get(start_date=str(last_start), end_date=str(last_end))
+
+        self.assertEqual(this_body["rates"][0]["tiered_rates"][0]["value"], 700000)
+        self.assertEqual(
+            last_body["rates"][0]["tiered_rates"][0]["value"],
+            999000000,
+            "the requested start_date must select the price list that covers it",
+        )
+
+    @patch("koku.middleware.MASU", return_value=True)
+    @patch("masu.database.cost_model_db_accessor.is_feature_flag_enabled_by_schema", return_value=True)
+    def test_disable_price_list_flag_falls_back_to_cost_model_rates(self, _flag, __):
+        """The Unleash kill-switch must still win: flag on => CostModel.rates."""
+        cm = self._make_cost_model([self._tiered("cpu_core_usage_per_hour", "0.5")])
+        start, end = self._this_month()
+        self._attach_price_list(cm, [self._tiered("cpu_core_usage_per_hour", "0.007")], start, end)
+
+        body = self._get()
+
+        self.assertEqual(len(body["rates"]), 1)
+        self.assertEqual(body["rates"][0]["tiered_rates"][0]["value"], 50000000)
+        self.assertEqual(body["configured_rates"]["cpu_core_usage_per_hour"]["supplementary"], 0.5)
+
+    # -- RED: shape + money scale -----------------------------------------
+
+    @patch("koku.middleware.MASU", return_value=True)
+    def test_tiered_row_mirrors_serializer_shape_in_micro_cents(self, _):
+        """Contract point 1 + 7: same shape CostModelSerializer emits, money in
+        integer micro-cents (`1 dollar = 100_000_000`). `configured_rates` keeps
+        its legacy float-dollar scale until #461 converts the whole payload."""
+        cm = self._make_cost_model([])
+        start, end = self._this_month()
+        self._attach_price_list(cm, [self._tiered("cpu_core_usage_per_hour", "0.007")], start, end)
+
+        body = self._get()
+
+        self.assertEqual(
+            body["rates"][0],
+            {
+                "metric": {"name": "cpu_core_usage_per_hour"},
+                "description": "",
+                "cost_type": "Supplementary",
+                "tiered_rates": [{"unit": "USD", "value": 700000}],
+            },
+            "the row must mirror RateSerializer.to_representation, minus the internal rate_id",
+        )
+        self.assertEqual(
+            body["configured_rates"]["cpu_core_usage_per_hour"]["supplementary"],
+            0.007,
+            "configured_rates keeps dollars in this window — two scales on one payload by design (#461)",
+        )
+
+    @patch("koku.middleware.MASU", return_value=True)
+    def test_tag_only_metric_is_absent_from_configured_rates(self, _):
+        """Contract point 2: a tag-priced metric must not appear as a fake `$0`.
+        Baseline seeded every metric with 0.0 and dropped the tag prices."""
+        cm = self._make_cost_model([])
+        start, end = self._this_month()
+        self._attach_price_list(
+            cm,
+            [
+                self._tiered("cpu_core_usage_per_hour", "0.007"),
+                {
+                    "metric": {"name": "gpu_cost_per_month"},
+                    "cost_type": "Infrastructure",
+                    "description": "",
+                    "custom_name": "gpu rates",
+                    "tag_rates": {
+                        "tag_key": "nvidia",
+                        "tag_values": [
+                            {"tag_value": "A100", "value": "70.0", "unit": "USD", "default": False},
+                            {"tag_value": "H100", "value": "120.0", "unit": "USD", "default": True},
+                        ],
+                    },
+                },
+            ],
+            start,
+            end,
+        )
+
+        body = self._get()
+
+        gpu = next(row for row in body["rates"] if row["metric"]["name"] == "gpu_cost_per_month")
+        self.assertEqual(gpu["tag_rates"]["tag_key"], "nvidia")
+        self.assertEqual(gpu["custom_name"], "gpu rates")
+        self.assertNotIn("tiered_rates", gpu, "a tag row carries tag_rates, not an empty tier list")
+        tag_values = {tv["tag_value"]: tv for tv in gpu["tag_rates"]["tag_values"]}
+        self.assertEqual(tag_values["A100"]["value"], 7000000000)
+        self.assertEqual(tag_values["H100"]["value"], 12000000000)
+        self.assertTrue(tag_values["H100"]["default"])
+        self.assertNotIn(
+            "gpu_cost_per_month",
+            body["configured_rates"],
+            "omit a tag-only metric rather than asserting a $0 the tags contradict",
+        )
+        self.assertIn("cpu_core_usage_per_hour", body["configured_rates"])
+
+    @patch("koku.middleware.MASU", return_value=True)
+    def test_currency_comes_from_tag_rates_when_there_are_no_tiered_rates(self, _):
+        """A GPU-only model priced in EUR must not claim USD just because no tier
+        carries a unit."""
+        cm = self._make_cost_model([])
+        start, end = self._this_month()
+        self._attach_price_list(
+            cm,
+            [
+                {
+                    "metric": {"name": "gpu_cost_per_month"},
+                    "cost_type": "Infrastructure",
+                    "description": "",
+                    "tag_rates": {
+                        "tag_key": "nvidia",
+                        "tag_values": [{"tag_value": "A100", "value": "70.0", "unit": "EUR", "default": True}],
+                    },
+                }
+            ],
+            start,
+            end,
+            currency="EUR",
+        )
+
+        body = self._get()
+
+        self.assertEqual(body["currency"], "EUR")
+        self.assertEqual(body["rates"][0]["tag_rates"]["tag_values"][0]["value"], 7000000000)
+
+    @patch("koku.middleware.MASU", return_value=True)
+    def test_tier_usage_bounds_are_folded_not_dropped(self, _):
+        """`RateSerializer` folds bare `usage_start`/`usage_end` into a `usage` dict.
+        Keep that shape for the exotic windowed tier, and keep it off a tier whose
+        bounds are null (every real koku fixture)."""
+        cm = self._make_cost_model([])
+        start, end = self._this_month()
+        self._attach_price_list(
+            cm,
+            [
+                {
+                    "metric": {"name": "node_cost_per_month"},
+                    "tiered_rates": [
+                        {"unit": "USD", "value": "100.0", "usage_start": 1, "usage_end": 100},
+                        {"unit": "USD", "value": "50.0", "usage_start": None, "usage_end": None},
+                    ],
+                    "cost_type": "Infrastructure",
+                    "description": "",
+                }
+            ],
+            start,
+            end,
+        )
+
+        tiers = self._get()["rates"][0]["tiered_rates"]
+
+        self.assertEqual(
+            tiers[0],
+            {"unit": "USD", "value": 10000000000, "usage": {"usage_start": 1, "usage_end": 100, "unit": "USD"}},
+        )
+        self.assertEqual(tiers[1], {"unit": "USD", "value": 5000000000})
+
+    # -- RED: GPU spend aggregate -----------------------------------------
+    @patch("koku.middleware.MASU", return_value=True)
+    def test_gpu_cost_model_spend_reaches_namespace_aggregates(self, _):
+        """Contract point 3: observed GPU spend, not a derived list price."""
+        today = self.dh.today.date()
+        row_uuid = uuid.uuid4()
+        with schema_context(self.schema):
+            OCPUsageLineItemDailySummary.objects.create(
+                uuid=row_uuid,
+                cluster_id=self.CLUSTER_ID,
+                usage_start=today,
+                usage_end=today,
+                namespace=self.NS,
+                data_source="GPU",
+                cost_model_gpu_cost=Decimal("12.5"),
+            )
+        self.summary_row_uuids.append(row_uuid)
+
+        body = self._get()
+
+        self.assertIn(self.NS, body["namespace_aggregates"])
+        self.assertEqual(body["namespace_aggregates"][self.NS]["cost_model_gpu_cost"], 12.5)
+
+    # -- control: nothing configured --------------------------------------
+
+    @patch("koku.middleware.MASU", return_value=True)
+    def test_no_cost_model_emits_no_rates_and_no_fake_currency(self, _):
+        """200 preserved, no invented `rates`, and no `"USD"` for a model that does
+        not exist."""
+        body = self._get()
+
+        self.assertEqual(body["rates"], [])
+        self.assertEqual(body["configured_rates"], {})
+        self.assertIsNone(body["currency"])
