@@ -11,13 +11,16 @@ by entity X" therefore means "X is an element of the row's array", not
 array is contained by {X}" (``contained_by``).
 
 The seven cloud handlers used ``icontains`` against these arrays; OCP was moved
-to ``overlap`` in #867. These tests pin the same semantics on the cloud maps and
-on the two paths that consume the mapped operation:
+to ``overlap`` in #867 and is in the matrix too, because ``exact:`` is the same
+defect wherever one entry maps an array (#886). These tests pin the same
+semantics on the cloud maps and on the paths that consume the mapped operation:
 
 * the user filter (``filter[project]=ns-a``),
 * the RBAC access list (which is bound through the same map entry, #885),
 * the wildcard (``filter[project]=*``), whose "match everything" predicate has
-  no array form (#887).
+  no array form (#887),
+* the ``exact:`` operator (``filter[exact:project]=ns-a``), which forces an
+  exact lookup that compares whole arrays (#886).
 
 They are table-driven rather than per-provider so the matrix is visible in one
 place: every entry listed below is exercised on every axis. A provider whose
@@ -42,12 +45,15 @@ from api.tags.gcp.openshift.queries import OCPGCPTagQueryHandler
 from api.tags.gcp.openshift.view import OCPGCPTagView
 from api.tags.gcp.queries import GCPTagQueryHandler
 from api.tags.gcp.view import GCPTagView
+from api.tags.ocp.queries import OCPTagQueryHandler
+from api.tags.ocp.view import OCPTagView
 from reporting.provider.aws.models import AWSTagsValues
 from reporting.provider.aws.openshift.models import OCPAWSTagsValues
 from reporting.provider.azure.models import AzureTagsValues
 from reporting.provider.azure.openshift.models import OCPAzureTagsValues
 from reporting.provider.gcp.models import GCPTagsValues
 from reporting.provider.gcp.openshift.models import OCPGCPTagsValues
+from reporting.provider.ocp.models import OCPTagsValues
 
 # The value filter is a substring match on a TextField, so one token selects
 # this module's rows and nothing else. The two values differ only in a suffix
@@ -169,6 +175,21 @@ PROVIDERS = (
         "wildcard_only": (),
     },
     {
+        "label": "openshift",
+        "handler": OCPTagQueryHandler,
+        "view": OCPTagView,
+        "sources": (OCPTagsValues,),
+        "filters": (
+            {"key": "project", "fields": ("namespaces",), "access": "openshift.project"},
+            {
+                "key": "cluster",
+                "fields": ("cluster_ids", "cluster_aliases"),
+                "access": "openshift.cluster",
+            },
+        ),
+        "wildcard_only": (),
+    },
+    {
         "label": "all/openshift",
         "handler": OCPAllTagQueryHandler,
         "view": OCPAllTagView,
@@ -259,14 +280,30 @@ class TagValueArrayFilterTest(IamTestCase):
 
     def _values(self, cfg, extra_filter="", access=None):
         """Return the value endpoint's values for the shared key."""
-        url = f"/{KEY}/?filter[value]={QUERY}{extra_filter}"
+        return self._fetch(cfg, f"filter[value]={QUERY}{extra_filter}", access)
+
+    def _fetch(self, cfg, query, access=None, exact_value=None):
+        """Return the value endpoint's values for one query string.
+
+        ``exact_value`` sets ``filter[exact:value]`` on the parameters directly:
+        the tags serializers do not register that field, so it cannot be sent in
+        the query string, but the handler still resolves it.
+        """
+        url = f"/{KEY}/?{query}"
         query_params = self.mocked_query_params(url, cfg["view"], access=access)
+        if exact_value is not None:
+            query_params.set_filter(**{"exact:value": [exact_value]})
         query_params.kwargs = {"key": KEY}
         handler = cfg["handler"](query_params)
         data = handler.get_tag_values()
         if not data:
             return []
         return data[0].get("values", [])
+
+    @staticmethod
+    def _exact_arg(key, token):
+        """Build an ``exact:`` filter argument; the colon is percent-encoded."""
+        return f"filter%5Bexact%3A{key}%5D={token}"
 
     def test_shared_value_matches_each_of_its_members(self):
         """A value shared by two entities must match a filter naming either one."""
@@ -344,3 +381,79 @@ class TagValueArrayFilterTest(IamTestCase):
                         sorted(self._values(cfg)),
                         sorted(self._values(cfg, f"&filter[{entry['key']}]=*")),
                     )
+
+    def test_exact_filter_matches_membership(self):
+        """``exact:`` on an array filter must mean "this element is present" (#886).
+
+        An exact lookup on an array column compares the whole array against the
+        request, so a value that two entities reported can never match it. An
+        element is present or it is not: there is no looser comparison for
+        ``exact`` to tighten, so the entry keeps its membership lookup.
+        """
+        for cfg in PROVIDERS:
+            for entry in cfg["filters"]:
+                for member in ("a", "b"):
+                    with self.subTest(provider=cfg["label"], filter=entry["key"], member=member):
+                        token = _member(entry["key"], member)
+                        self.assertEqual(
+                            [SHARED],
+                            self._values(cfg, f"&{self._exact_arg(entry['key'], token)}"),
+                        )
+
+    def test_exact_filter_response_matches_the_plain_filter_response(self):
+        """``exact:`` must not change which values an array filter answers.
+
+        The plain filter already compares elements, so the two spellings answer
+        the same rows, for a member and for a token nothing holds.
+        """
+        for cfg in PROVIDERS:
+            for entry in cfg["filters"]:
+                for token in (_member(entry["key"], "a"), _member(entry["key"], "unknown")):
+                    with self.subTest(provider=cfg["label"], filter=entry["key"], token=token):
+                        self.assertEqual(
+                            self._values(cfg, f"&filter[{entry['key']}]={token}"),
+                            self._values(cfg, f"&{self._exact_arg(entry['key'], token)}"),
+                        )
+
+    def test_exact_wildcard_on_array_filter_adds_no_predicate(self):
+        """``exact:`` on a wildcard follows the wildcard rule, it does not match nothing.
+
+        ``*`` has no array form, so the filter adds no predicate; an ``exact``
+        lookup bound to ``*`` would instead compare the whole array to it and
+        drop every value (#887, #886).
+        """
+        expected = sorted([SHARED, LOOKALIKE])
+        for cfg in PROVIDERS:
+            for entry in cfg["filters"] + cfg["wildcard_only"]:
+                with self.subTest(provider=cfg["label"], filter=entry["key"]):
+                    self.assertEqual(
+                        expected,
+                        sorted(self._values(cfg, f"&{self._exact_arg(entry['key'], '*')}")),
+                    )
+
+    def test_exact_filter_on_text_column_stays_exact(self):
+        """The array rule must not loosen ``exact:`` on a text column.
+
+        The tags serializers do not register ``exact:value`` today, so the
+        argument is set on the parameters directly: this pins the operator the
+        handler picks, and would catch a future registration that silently
+        turned exact text matching into a substring match.
+        """
+        prefix = QUERY[:-1]
+        for cfg in PROVIDERS:
+            with self.subTest(provider=cfg["label"]):
+                self.assertEqual(
+                    sorted([SHARED, LOOKALIKE]),
+                    sorted(self._fetch(cfg, f"filter[value]={prefix}")),
+                    msg="control: the prefix is a substring of both seeded values",
+                )
+                self.assertEqual(
+                    [SHARED],
+                    self._fetch(cfg, f"filter[value]={prefix}", exact_value=SHARED),
+                    msg="an exact value must still be matched exactly",
+                )
+                self.assertEqual(
+                    [],
+                    self._fetch(cfg, f"filter[value]={prefix}", exact_value=prefix),
+                    msg="exact must not degrade into the substring match",
+                )

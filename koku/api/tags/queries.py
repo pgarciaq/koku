@@ -203,12 +203,43 @@ class TagQueryHandler(QueryHandler):
         PostgreSQL array lookups serialize their right-hand side as an array
         literal, so a bare string raises ``DataError: malformed array literal``.
         ``filter[cluster]=X`` / ``filter[project]=X`` / ``filter[node]=X`` on the
-        value endpoint therefore bind a one-element list. ``overlap`` is only
-        valid on array columns, so it doubles as the array marker.
+        value endpoint therefore bind a one-element list.
         """
-        if filter_obj.get("operation") == "overlap":
+        if TagQueryHandler._has_array_entry(filter_obj):
             return [item]
         return item
+
+    @staticmethod
+    def _has_array_entry(filter_obj):
+        """Return True when a filter-map value names an array lookup.
+
+        A filter-map value is either one entry or a list of entries (``account``
+        and ``cluster`` are ORs over several columns), so both shapes are
+        accepted. ``overlap`` is only valid on array columns and is the marker
+        the value-branch maps use, see ``_array_parameter``.
+        """
+        entries = filter_obj if isinstance(filter_obj, list) else [filter_obj]
+        return any(entry.get("operation") == "overlap" for entry in entries)
+
+    @staticmethod
+    def _entry_logical_operator(logical_operator, filter_obj):
+        """Return the logical operator to pass for one filter-map entry.
+
+        ``QueryFilter`` reads ``logical_operator="exact"`` as "force the exact
+        lookup". That is right for a text column: it is what turns ``key`` and
+        ``value``'s ``icontains`` entry into an exact string match, and a user
+        asking for ``exact:`` on those expects no substring.
+
+        It is wrong for an array column. An element is present or it is not, so
+        there is no looser comparison to tighten, while the ``exact`` lookup
+        compares the whole array against the request and therefore drops every
+        value that more than one entity reported. Array entries keep their
+        ``overlap`` lookup and compose as ``or``, the same grouping the sentinel
+        degrades to in ``QueryFilterCollection.compose``.
+        """
+        if logical_operator == "exact" and filter_obj.get("operation") == "overlap":
+            return "or"
+        return logical_operator
 
     def _get_filter(self, delta=False):  # noqa: C901
         """Create dictionary for filter parameters.
@@ -240,12 +271,7 @@ class TagQueryHandler(QueryHandler):
                 # empty array is contained by every array but overlaps none, and
                 # NULL satisfies neither. A wildcard on an array field therefore
                 # adds no predicate instead of binding a string to an array.
-                operations = (
-                    [filt.get("operation") for filt in filter_obj]
-                    if isinstance(filter_obj, list)
-                    else [filter_obj.get("operation")]
-                )
-                if "overlap" not in operations:
+                if not self._has_array_entry(filter_obj):
                     q_filter = QueryFilter(parameter="", **filter_obj)
                     filters.add(q_filter)
             if filter_value is not None and not TagQueryHandler.has_wildcard(filter_value):
@@ -310,18 +336,29 @@ class TagQueryHandler(QueryHandler):
             if filter_value and (operator == "exact" or not TagQueryHandler.has_wildcard(filter_value)):
                 # always add exact filters to the filter collection
                 filter_obj = self.filter_map.get(filter_key)
+                if (
+                    operator == "exact"
+                    and TagQueryHandler.has_wildcard(filter_value)
+                    and self._has_array_entry(filter_obj)
+                ):
+                    # An "every entity" wildcard has no array right-hand side, so
+                    # it adds no predicate rather than matching nothing. Same rule
+                    # the non-exact branch applies above (#887, #886).
+                    continue
                 if isinstance(filter_obj, list):
                     for _filt in filter_obj:
+                        entry_operator = self._entry_logical_operator(logical_operator, _filt)
                         filt_filters = QueryFilterCollection()
                         for item in filter_value:
                             parameter = self._array_parameter(_filt, item)
-                            q_filter = QueryFilter(parameter=parameter, logical_operator=logical_operator, **_filt)
+                            q_filter = QueryFilter(parameter=parameter, logical_operator=entry_operator, **_filt)
                             filt_filters.add(q_filter)
                         composed_filter = composed_filter | filt_filters.compose()
                 else:
+                    entry_operator = self._entry_logical_operator(logical_operator, filter_obj)
                     for item in filter_value:
                         parameter = self._array_parameter(filter_obj, item)
-                        q_filter = QueryFilter(parameter=parameter, logical_operator=logical_operator, **filter_obj)
+                        q_filter = QueryFilter(parameter=parameter, logical_operator=entry_operator, **filter_obj)
                         filters.add(q_filter)
         if filters:
             composed_filter = composed_filter & filters.compose()
