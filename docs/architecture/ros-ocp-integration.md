@@ -87,19 +87,59 @@ ROS calls this endpoint to fetch cost rates for savings estimation. Parameters:
 
 | Parameter | Description |
 |-----------|-------------|
-| `cluster_id` | OCP cluster UUID |
-| `org_id` | Organization ID |
+| `cluster_id` | OCP cluster UUID (the `ProviderAuthentication.credentials.cluster_id`, not the provider UUID) |
+| `org_id` | Organization ID — resolution is customer-qualified (#771) |
+| `start_date` | `YYYY-MM-DD`; defaults to the first day of the current month |
+| `end_date` | `YYYY-MM-DD`; defaults to today |
 
 Returns aggregated per-namespace cost data including:
 
 - CPU/memory usage hours and costs
 - Infrastructure costs (raw + markup)
 - Distributed overhead (platform, worker, storage, network, GPU)
+- GPU spend in `namespace_aggregates.cost_model_gpu_cost`
 - Configured cost model rates (`cpu_core_usage_per_hour`, `memory_gb_usage_per_hour`, `gpu_cost_per_month`, etc.)
 - `currency` — ISO 4217 code from the cost model's `tiered_rates[0].unit` (default `"USD"`)
 
 The SQL query aggregates from `reporting_ocpusagelineitem_daily_summary`
 with `data_source IN ('Pod', 'GPU')` to include GPU distribution costs.
+
+#### `rates[]` — the cost model's rows, passed through (#467)
+
+`rates[]` carries each rate row as the cost model stores it, so ROS stops
+depending on a lossy flattening:
+
+| Field | Meaning |
+|-------|---------|
+| `metric.name` | Metric identifier, e.g. `node_core_cost_per_month` |
+| `cost_type` | `Infrastructure` or `Supplementary` |
+| `tiered_rates[]` | `usage` (`{unit, value}` bounds) and tier values, when the row is tiered |
+| `tag_rates` | Present instead of `tiered_rates` for tag-priced rows (GPU, node, VM, project, storage) |
+| `description`, `custom_name` | As stored on the cost model |
+
+Rate resolution goes through
+`CostModelDBAccessor(..., price_list_effective_on=start_date)`, so the rows
+returned are the ones Masu actually applied for that window — including the
+`disable_price_list` Unleash kill-switch and the rule that **no price list
+covering `start_date` means no rates**. A date outside every price list's
+`effective_start_date`/`effective_end_date` therefore returns `rates: []` with
+`configured_rates: {}` and is not an error.
+
+**Money scale.** `rates[]` is **integer micro-cents** (`1 USD =
+100_000_000`) per #461's contract. `configured_rates` and
+`namespace_aggregates` remain **float dollars** because the deployed ROS
+reader treats them as dollars; converting them before the reader half lands
+would inflate applied savings by 1e8. This two-scale window closes when #461
+converts the payload whole — it is recorded in the module docstring of
+`effective_rates.py` as well.
+
+#### `configured_rates` — compatibility surface
+
+`configured_rates` is the flattened `{metric: {infrastructure, supplementary}}`
+map the deployed ROS reader consumes. It flattens tiered rows and **omits**
+metrics priced only by tags, rather than reporting a `0.0` the tags contradict.
+To that reader a missing key and a `0.0` are identical, so this is not a
+reader-visible change.
 
 ### 3. Cost Model Rates Used by ROS
 
@@ -111,6 +151,7 @@ ROS uses these cost model metrics from the `effective_rates` response:
 | `memory_gb_usage_per_hour` | Memory savings estimation |
 | `storage_gb_request_per_month` | Quota/PVC storage savings (primary) |
 | `storage_gb_usage_per_month` | Quota/PVC storage savings (fallback when request rate is zero) |
+| `node_cost_per_month` | Node savings; `node_core_cost_per_month` is the fallback name (`costdata.NodeCostPerMonth`) |
 | `gpu_cost_per_month` | GPU savings (idle = full rate, MIG = fractional, time-slicing = shared) |
 | Infrastructure costs | Per-namespace overhead apportionment |
 
@@ -119,6 +160,12 @@ Koku returns every metric defined in the cluster's cost model in
 [`StorageRequestPerMonth()`](../../../../ros-ocp-backend/internal/engine/cost_rates.go):
 prefer `storage_gb_request_per_month` (infrastructure + supplementary sum), fall back
 to `storage_gb_usage_per_month` when the request rate is zero or missing.
+
+> **Consumer status.** The deployed ROS reader (`costdata.ClusterCostData`) has
+> no `rates` field and does not yet read the passthrough — node and PVC savings
+> are driven by `configured_rates` today. #467 ships the data; the reader half
+> is tracked separately in ros-ocp-backend. Until it lands, a metric that exists
+> only as a `tag_rates` row will not reach a dollar figure.
 
 ### 4. Recommendation API Proxy (Koku → ROS)
 
