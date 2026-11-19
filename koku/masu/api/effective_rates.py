@@ -13,15 +13,21 @@ RATE SOURCE (#467): rates are resolved through
 same list Masu applied for that window — including the `disable_price_list`
 Unleash kill-switch and the "no price list covers the date => no rates" rule.
 
-MONEY SCALE — two scales live on this payload until #461 converts it whole:
+MONEY SCALE (#461):
 
-* `rates[]` is the cost model's rows as-is (`tiered_rates` **or** `tag_rates`),
-  with money in **integer micro-cents** (`1 dollar = 100_000_000`), per the
-  contract both #467 and #461 signed off on.
-* `configured_rates` and `namespace_aggregates` keep their legacy **float
-  dollars** scale. They are read by the deployed ROS consumer, which treats the
-  values as dollars; converting them here before #461's reader half lands would
-  inflate applied savings by 100_000_000x.
+* `rates[]` is always the cost model's rows as-is (`tiered_rates` **or**
+  `tag_rates`), with money in **integer micro-cents** (`1 dollar =
+  100_000_000`), per the contract both #467 and #461 signed off on.
+* `configured_rates`, `namespace_aggregates` and `markup_pct` follow the
+  requested `money_scale`. `money_scale=microcents` emits integer micro-cents
+  (money), integer milli-hours (`cpu_*_hours` / `mem_*_hours` keep their
+  names) and integer basis points (`markup_pct`), and the response echoes
+  `"money_scale": "microcents"`. Without the parameter those fields keep the
+  legacy **float dollars** scale and the response echoes `"money_scale":
+  "dollars"`.
+* The float scale exists only for a reader that predates #461. ROS sends
+  `money_scale=microcents` and requires the echo, so a stale Masu is a named
+  error there rather than a silent 100_000_000x inflation of applied savings.
 
 `configured_rates` is compatibility only: it flattens **tiered** rows and omits
 metrics priced by tags, rather than asserting a `$0` the tags contradict.
@@ -53,6 +59,34 @@ LOG = logging.getLogger(__name__)
 
 # 1 dollar = 100_000_000 micro-cents (the ROS int64 money scale, #461).
 MICRO_CENTS_PER_DOLLAR = 100_000_000
+MILLI_HOURS_PER_HOUR = 1000
+BASIS_POINTS_PER_PERCENT = 100
+
+# `money_scale` values. `dollars` is the legacy float scale and the default;
+# `microcents` is the #461 contract (integers all the way down).
+MONEY_SCALE_DOLLARS = "dollars"
+MONEY_SCALE_MICROCENTS = "microcents"
+MONEY_SCALES = (MONEY_SCALE_DOLLARS, MONEY_SCALE_MICROCENTS)
+
+# `namespace_aggregates` columns by scale. A column added to the SQL below that
+# is in neither set is reported rather than silently left as a float.
+MONEY_AGGREGATE_FIELDS = frozenset(
+    {
+        "cost_model_cpu_cost",
+        "cost_model_memory_cost",
+        "cost_model_gpu_cost",
+        "infrastructure_cost",
+        "distributed_cost",
+    }
+)
+HOUR_AGGREGATE_FIELDS = frozenset(
+    {
+        "cpu_usage_hours",
+        "cpu_request_hours",
+        "mem_usage_hours",
+        "mem_request_hours",
+    }
+)
 
 
 def _resolve_provider_uuid(cluster_id: str, org_id: str) -> str | None:
@@ -92,6 +126,28 @@ def _to_micro_cents(value) -> int:
     except (InvalidOperation, ValueError, TypeError):
         # A stored row we cannot price must be loud, not silently $0.
         LOG.warning(f"effective_rates: unparseable rate value {value!r}")
+        return 0
+
+
+def _to_milli_hours(value) -> int:
+    """Convert an hours amount (str/Decimal/int/float) to integer milli-hours."""
+    if value is None:
+        return 0
+    try:
+        return int((Decimal(str(value)) * MILLI_HOURS_PER_HOUR).to_integral_value(rounding=ROUND_HALF_UP))
+    except (InvalidOperation, ValueError, TypeError):
+        LOG.warning(f"effective_rates: unparseable hours value {value!r}")
+        return 0
+
+
+def _to_basis_points(value) -> int:
+    """Convert a percentage (10 means 10%) to integer basis points (1000)."""
+    if value is None:
+        return 0
+    try:
+        return int((Decimal(str(value)) * BASIS_POINTS_PER_PERCENT).to_integral_value(rounding=ROUND_HALF_UP))
+    except (InvalidOperation, ValueError, TypeError):
+        LOG.warning(f"effective_rates: unparseable markup value {value!r}")
         return 0
 
 
@@ -150,12 +206,15 @@ def _has_prices(rate: dict) -> bool:
     return bool((rate.get("tiered_rates") or []) or (rate.get("tag_rates") or {}))
 
 
-def _parse_rates_list(rates_list: list) -> dict:
-    """Flatten **tiered** rows to {metric: {infrastructure, supplementary}} in float dollars.
+def _parse_rates_list(rates_list: list, microcents: bool = False) -> dict:
+    """Flatten **tiered** rows to {metric: {infrastructure, supplementary}}.
+
+    Money is integer micro-cents under `microcents` (#461) and float dollars
+    otherwise — the legacy scale, kept for a reader that predates #461.
 
     Compatibility for the deployed ROS reader (#467 contract point 2). Metrics
-    priced only by tags are omitted rather than reported as `0.0`: ROS resolves a
-    missing key and a `0.0` identically, so this is not a reader-visible
+    priced only by tags are omitted rather than reported as `0`: ROS resolves a
+    missing key and a `0` identically, so this is not a reader-visible
     regression, and it stops the endpoint asserting "no rate" where tags hold one.
     """
     configured_rates: dict = {}
@@ -173,13 +232,21 @@ def _parse_rates_list(rates_list: list) -> dict:
         if cost_type not in ("infrastructure", "supplementary"):
             continue
 
+        raw_value = first_tier.get("value", 0)
         try:
-            value = float(first_tier.get("value", 0))
-        except (TypeError, ValueError):
-            LOG.warning(f"effective_rates: unparseable tiered value for {metric_name}: {first_tier.get('value')!r}")
+            parsed_value = Decimal(str(raw_value))
+        except (InvalidOperation, ValueError, TypeError):
+            LOG.warning(f"effective_rates: unparseable tiered value for {metric_name}: {raw_value!r}")
             continue
 
-        configured_rates.setdefault(metric_name, {"infrastructure": 0.0, "supplementary": 0.0})
+        if microcents:
+            value = int((parsed_value * MICRO_CENTS_PER_DOLLAR).to_integral_value(rounding=ROUND_HALF_UP))
+            empty = 0
+        else:
+            value = float(parsed_value)
+            empty = 0.0
+
+        configured_rates.setdefault(metric_name, {"infrastructure": empty, "supplementary": empty})
         configured_rates[metric_name][cost_type] = value
 
     return configured_rates
@@ -200,8 +267,8 @@ def _extract_currency(rates_list: list) -> str:
 
 
 def _get_cost_snapshot(
-    schema_name: str, provider_uuid: str, effective_on: date
-) -> tuple[list, dict, str, float, str | None]:
+    schema_name: str, provider_uuid: str, effective_on: date, microcents: bool = False
+) -> tuple[list, dict, str, int | float, str | None]:
     """Resolve the provider's cost model for the requested window.
 
     Reads through `CostModelDBAccessor` so the rates are the ones Masu applied:
@@ -209,20 +276,24 @@ def _get_cost_snapshot(
     kill-switch both live there (#467 contract point 4).
 
     Returns (rates, configured_rates, distribution_type, markup_pct, currency).
-    `currency` is None when the provider has no cost model at all — do not invent
-    a currency for a model that does not exist.
+    `markup_pct` is integer basis points under `microcents` and float percent
+    otherwise. `currency` is None when the provider has no cost model at all —
+    do not invent a currency for a model that does not exist.
     """
     with CostModelDBAccessor(schema_name, provider_uuid, price_list_effective_on=effective_on) as accessor:
         cost_model = accessor.cost_model
         if not cost_model:
-            return [], {}, "cpu", 0.0, None
+            return [], {}, "cpu", 0 if microcents else 0.0, None
 
         distribution_type = cost_model.distribution or "cpu"
 
         markup = accessor.markup or {}
-        markup_pct = 0.0
+        markup_pct: int | float = 0 if microcents else 0.0
         if isinstance(markup, dict) and markup.get("value") is not None:
-            markup_pct = float(markup["value"])
+            if microcents:
+                markup_pct = _to_basis_points(markup["value"])
+            else:
+                markup_pct = float(markup["value"])
 
         effective_rates = accessor.effective_rates
         if isinstance(effective_rates, dict):
@@ -232,15 +303,22 @@ def _get_cost_snapshot(
 
         return (
             [_serialize_rate_row(row) for row in rate_rows],
-            _parse_rates_list(rate_rows),
+            _parse_rates_list(rate_rows, microcents=microcents),
             distribution_type,
             markup_pct,
             _extract_currency(rate_rows),
         )
 
 
-def _get_namespace_aggregates(schema_name: str, cluster_id: str, start_date: str, end_date: str) -> dict:
-    """Query OCPUsageLineItemDailySummary for namespace-level cost/usage aggregates."""
+def _get_namespace_aggregates(
+    schema_name: str, cluster_id: str, start_date: str, end_date: str, microcents: bool = False
+) -> dict:
+    """Query OCPUsageLineItemDailySummary for namespace-level cost/usage aggregates.
+
+    Under `microcents` money columns are integer micro-cents and hour columns are
+    integer milli-hours (#461); otherwise every value stays the legacy float
+    dollars / float hours.
+    """
     sql = """
         SELECT namespace,
             SUM(COALESCE(cost_model_cpu_cost, 0))    AS cost_model_cpu_cost,
@@ -273,7 +351,21 @@ def _get_namespace_aggregates(schema_name: str, cluster_id: str, start_date: str
             for row in cursor.fetchall():
                 row_dict = dict(zip(columns, row))
                 ns = row_dict.pop("namespace")
-                namespaces[ns] = {k: float(v) if isinstance(v, Decimal) else v for k, v in row_dict.items()}
+                if microcents:
+                    converted = {}
+                    for field_name, value in row_dict.items():
+                        if field_name in MONEY_AGGREGATE_FIELDS:
+                            converted[field_name] = _to_micro_cents(value)
+                        elif field_name in HOUR_AGGREGATE_FIELDS:
+                            converted[field_name] = _to_milli_hours(value)
+                        else:
+                            # A column this contract does not classify would reach
+                            # the wire as an untyped float; name it instead.
+                            LOG.warning(f"effective_rates: unclassified aggregate field {field_name!r}")
+                            converted[field_name] = value
+                    namespaces[ns] = converted
+                else:
+                    namespaces[ns] = {k: float(v) if isinstance(v, Decimal) else v for k, v in row_dict.items()}
 
     return namespaces
 
@@ -290,6 +382,8 @@ def effective_rates(request):
         org_id (required): Organization ID (maps to schema org{org_id})
         start_date: Start date YYYY-MM-DD (defaults to this month start)
         end_date: End date YYYY-MM-DD (defaults to today)
+        money_scale: `microcents` for the #461 integer contract, `dollars` (the
+            default) for the legacy float scale. Echoed back in the response.
     """
     params = request.query_params
     cluster_id = params.get("cluster_id")
@@ -337,16 +431,27 @@ def effective_rates(request):
             status=status.HTTP_400_BAD_REQUEST,
         )
 
+    money_scale = params.get("money_scale", MONEY_SCALE_DOLLARS)
+    if money_scale not in MONEY_SCALES:
+        return Response(
+            {"Error": f"money_scale must be one of: {', '.join(MONEY_SCALES)}."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    microcents = money_scale == MONEY_SCALE_MICROCENTS
+
     rates, configured_rates, distribution_type, markup_pct, currency = _get_cost_snapshot(
-        schema_name, provider_uuid, parsed_start
+        schema_name, provider_uuid, parsed_start, microcents=microcents
     )
-    namespace_aggregates = _get_namespace_aggregates(schema_name, cluster_id, start_date, end_date)
+    namespace_aggregates = _get_namespace_aggregates(
+        schema_name, cluster_id, start_date, end_date, microcents=microcents
+    )
 
     return Response(
         {
             "cluster_id": cluster_id,
             "provider_uuid": provider_uuid,
             "distribution_type": distribution_type,
+            "money_scale": money_scale,
             "markup_pct": markup_pct,
             "currency": currency,
             "rates": rates,

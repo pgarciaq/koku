@@ -91,6 +91,7 @@ ROS calls this endpoint to fetch cost rates for savings estimation. Parameters:
 | `org_id` | Organization ID — resolution is customer-qualified (#771) |
 | `start_date` | `YYYY-MM-DD`; defaults to the first day of the current month |
 | `end_date` | `YYYY-MM-DD`; defaults to today |
+| `money_scale` | `microcents` or `dollars` (the default); echoed in the response. See [Money scale](#rates--the-cost-models-rows-passed-through-467) |
 
 Returns aggregated per-namespace cost data including:
 
@@ -125,20 +126,28 @@ covering `start_date` means no rates**. A date outside every price list's
 `effective_start_date`/`effective_end_date` therefore returns `rates: []` with
 `configured_rates: {}` and is not an error.
 
-**Money scale.** `rates[]` is **integer micro-cents** (`1 USD =
-100_000_000`) per #461's contract. `configured_rates` and
-`namespace_aggregates` remain **float dollars** because the deployed ROS
-reader treats them as dollars; converting them before the reader half lands
-would inflate applied savings by 1e8. This two-scale window closes when #461
-converts the payload whole — it is recorded in the module docstring of
-`effective_rates.py` as well.
+**Money scale (#461).** The response names the scale it used in
+`money_scale`:
+
+| `money_scale` | `configured_rates`, `namespace_aggregates` money, `markup_pct` | `rates[]` |
+|---|---|---|
+| `microcents` (ROS sends this) | integer micro-cents (`1 USD = 100_000_000`); hours are integer **milli-hours** under their unchanged names; `markup_pct` is integer **basis points** (`10`% → `1000`) | integer micro-cents |
+| `dollars` (default, omitted parameter) | float dollars and float hours; `markup_pct` float percent | integer micro-cents |
+
+`rates[]` is integer micro-cents under both scales — it has no deployed float
+reader (#467 shipped it that way). The request parameter exists because the
+producer and the ROS consumer deploy separately: a stale Masu answers
+`money_scale: dollars`, and ROS treats that as a named contract error rather
+than reading floats as micro-cents and inflating applied savings by 1e8. The
+float scale and the parameter are removed together once no reader predates
+#461.
 
 #### `configured_rates` — compatibility surface
 
 `configured_rates` is the flattened `{metric: {infrastructure, supplementary}}`
 map the deployed ROS reader consumes. It flattens tiered rows and **omits**
-metrics priced only by tags, rather than reporting a `0.0` the tags contradict.
-To that reader a missing key and a `0.0` are identical, so this is not a
+metrics priced only by tags, rather than reporting a `0` the tags contradict.
+To that reader a missing key and a `0` are identical, so this is not a
 reader-visible change.
 
 ### 3. Cost Model Rates Used by ROS

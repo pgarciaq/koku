@@ -846,3 +846,269 @@ class EffectiveRatesRatesPassthroughTest(MasuTestCase):
         self.assertEqual(body["rates"], [])
         self.assertEqual(body["configured_rates"], {})
         self.assertIsNone(body["currency"])
+
+
+@override_settings(ROOT_URLCONF="masu.urls")
+class EffectiveRatesMoneyScaleTest(MasuTestCase):
+    """#461: `money_scale=microcents` is the integer wire contract.
+
+    Baseline emitted `configured_rates`, `namespace_aggregates` and `markup_pct`
+    as JSON floats, so the consumer had to convert dollars to micro-cents on
+    every read and a whole-dollar value was indistinguishable from a
+    micro-cent one by shape. The parameter makes the scale explicit and the
+    response echoes the scale it used, so a reader that predates #461 gets the
+    old payload and a reader that requires integers can fail loudly instead of
+    inflating applied savings by 100_000_000x.
+    """
+
+    CLUSTER_ID = "money-scale-cluster-461"
+    NS = "money-scale-ns"
+
+    CPU_RATE = "0.007"  # $0.007 / core-hour -> 700_000 micro-cents
+    NODE_RATE = "1000.0"  # $1000 / month -> 100_000_000_000 micro-cents
+    MARKUP_PCT = 10  # 10% -> 1000 basis points
+
+    def setUp(self):
+        super().setUp()
+        self.auth = ProviderAuthentication.objects.create(credentials={"cluster_id": self.CLUSTER_ID})
+        self.provider = Provider.objects.create(
+            name="money-scale-provider",
+            type=Provider.PROVIDER_OCP,
+            customer=self.customer,
+            authentication=self.auth,
+        )
+        self.cost_model_uuids = []
+        self.price_list_uuids = []
+        self.summary_row_uuids = []
+
+    def tearDown(self):
+        """Remove tenant-schema rows explicitly: schema_context writes may outlive
+        the public-schema transaction rollback under KEEPDB."""
+        with schema_context(self.schema):
+            PriceListCostModelMap.objects.filter(price_list_id__in=self.price_list_uuids).delete()
+            PriceList.objects.filter(uuid__in=self.price_list_uuids).delete()
+            CostModelMap.objects.filter(cost_model_id__in=self.cost_model_uuids).delete()
+            CostModel.objects.filter(uuid__in=self.cost_model_uuids).delete()
+            OCPUsageLineItemDailySummary.objects.filter(uuid__in=self.summary_row_uuids).delete()
+        super().tearDown()
+
+    # -- fixtures ---------------------------------------------------------
+
+    @staticmethod
+    def _tiered(metric, value, cost_type="Supplementary", unit="USD"):
+        return {
+            "metric": {"name": metric},
+            "tiered_rates": [{"unit": unit, "value": value}],
+            "cost_type": cost_type,
+            "description": "",
+        }
+
+    def _seed_priced_model(self, markup=None):
+        """A price list covering this month plus a mapped cost model."""
+        rates = [
+            self._tiered("cpu_core_usage_per_hour", self.CPU_RATE),
+            self._tiered("node_cost_per_month", self.NODE_RATE, cost_type="Infrastructure"),
+        ]
+        start, end = self.dh.this_month_start.date(), self.dh.this_month_end.date()
+        with schema_context(self.schema):
+            cm = CostModel.objects.create(
+                name=f"money-scale-cm-{uuid.uuid4().hex[:8]}",
+                source_type=Provider.PROVIDER_OCP,
+                rates=rates,
+                markup=markup or {},
+            )
+            CostModelMap.objects.create(cost_model_id=cm.uuid, provider_uuid=self.provider.uuid)
+            pl = PriceList.objects.create(
+                name=f"money-scale-pl-{uuid.uuid4().hex[:8]}",
+                description="",
+                currency="USD",
+                effective_start_date=start,
+                effective_end_date=end,
+                rates=rates,
+            )
+            PriceListCostModelMap.objects.create(price_list=pl, cost_model_id=cm.uuid, priority=1)
+        self.cost_model_uuids.append(cm.uuid)
+        self.price_list_uuids.append(pl.uuid)
+        return cm
+
+    def _seed_namespace_row(self):
+        today = self.dh.today.date()
+        row_uuid = uuid.uuid4()
+        with schema_context(self.schema):
+            OCPUsageLineItemDailySummary.objects.create(
+                uuid=row_uuid,
+                cluster_id=self.CLUSTER_ID,
+                usage_start=today,
+                usage_end=today,
+                namespace=self.NS,
+                data_source="Pod",
+                cost_model_rate_type="Supplementary",
+                cost_model_cpu_cost=Decimal("1.5"),
+                cost_model_memory_cost=Decimal("0.25"),
+                infrastructure_raw_cost=Decimal("2.0"),
+                distributed_cost=Decimal("0.5"),
+                pod_usage_cpu_core_hours=Decimal("2.5"),
+                pod_request_cpu_core_hours=Decimal("4.0"),
+                pod_usage_memory_gigabyte_hours=Decimal("3.25"),
+                pod_request_memory_gigabyte_hours=Decimal("8.0"),
+            )
+        self.summary_row_uuids.append(row_uuid)
+
+    def _get(self, **overrides):
+        params = {"cluster_id": self.CLUSTER_ID, "org_id": self.org_id}
+        params.update(overrides)
+        response = self.client.get(reverse("effective_rates"), params)
+        self.assertEqual(response.status_code, 200, response.content[:500])
+        return response.json()
+
+    # -- the scaled fields -------------------------------------------------
+
+    @patch("koku.middleware.MASU", return_value=True)
+    def test_microcents_configured_rates_are_integers(self, _):
+        """`$0.007` and `$1000` must arrive exactly, as integers, not floats."""
+        self._seed_priced_model()
+
+        body = self._get(money_scale="microcents")
+
+        self.assertEqual(body["money_scale"], "microcents")
+        cpu = body["configured_rates"]["cpu_core_usage_per_hour"]["supplementary"]
+        node = body["configured_rates"]["node_cost_per_month"]["infrastructure"]
+        self.assertEqual(cpu, 700000, "$0.007 must be exactly 700_000 micro-cents, not 699_999")
+        self.assertEqual(node, 100000000000, "$1000 must be exactly 1e11 micro-cents")
+        self.assertIsInstance(cpu, int)
+        self.assertNotIsInstance(cpu, float)
+        self.assertIsInstance(node, int)
+
+    @patch("koku.middleware.MASU", return_value=True)
+    def test_microcents_markup_is_basis_points(self, _):
+        """`markup_pct = 10` means 10%, which is 1000 basis points as an integer."""
+        self._seed_priced_model(markup={"value": 10, "unit": "percent"})
+
+        body = self._get(money_scale="microcents")
+
+        self.assertEqual(body["markup_pct"], 1000)
+        self.assertIsInstance(body["markup_pct"], int)
+        self.assertNotIsInstance(body["markup_pct"], float)
+
+    @patch("koku.middleware.MASU", return_value=True)
+    def test_microcents_aggregates_split_money_from_hours(self, _):
+        """Money columns are micro-cents; hour columns are milli-hours.
+
+        The two scales share one response object, so a blanket conversion would
+        have turned `cpu_usage_hours` into micro-cents and `cost_model_cpu_cost`
+        into milli-hours.
+        """
+        self._seed_priced_model()
+        self._seed_namespace_row()
+
+        ns = self._get(money_scale="microcents")["namespace_aggregates"][self.NS]
+
+        self.assertEqual(ns["cost_model_cpu_cost"], 150000000, "$1.50 -> 1.5e8 micro-cents")
+        self.assertEqual(ns["cost_model_memory_cost"], 25000000)
+        self.assertEqual(ns["infrastructure_cost"], 200000000)
+        self.assertEqual(ns["distributed_cost"], 50000000)
+        self.assertEqual(ns["cpu_usage_hours"], 2500, "2.5 hours -> 2500 milli-hours")
+        self.assertEqual(ns["cpu_request_hours"], 4000)
+        self.assertEqual(ns["mem_usage_hours"], 3250)
+        self.assertEqual(ns["mem_request_hours"], 8000)
+        for field_name, value in ns.items():
+            self.assertIsInstance(value, int, f"{field_name} must be an integer under microcents")
+            self.assertNotIsInstance(value, float, f"{field_name} must not be a float under microcents")
+
+    # -- the legacy scale stays available ----------------------------------
+
+    @patch("koku.middleware.MASU", return_value=True)
+    def test_default_scale_is_dollars_and_is_echoed(self, _):
+        """No parameter => the pre-#461 payload, with the scale named.
+
+        A reader that predates #461 must keep receiving float dollars, and a
+        reader that requires micro-cents must be able to see which it got.
+        """
+        self._seed_priced_model(markup={"value": 10, "unit": "percent"})
+        self._seed_namespace_row()
+
+        body = self._get()
+
+        self.assertEqual(body["money_scale"], "dollars")
+        self.assertEqual(body["configured_rates"]["cpu_core_usage_per_hour"]["supplementary"], 0.007)
+        self.assertEqual(body["markup_pct"], 10.0)
+        ns = body["namespace_aggregates"][self.NS]
+        self.assertEqual(ns["cost_model_cpu_cost"], 1.5)
+        self.assertEqual(ns["cpu_usage_hours"], 2.5)
+
+    @patch("koku.middleware.MASU", return_value=True)
+    def test_explicit_dollars_matches_the_default(self, _):
+        """`money_scale=dollars` is the same payload as omitting it."""
+        self._seed_priced_model(markup={"value": 10, "unit": "percent"})
+
+        self.assertEqual(self._get(money_scale="dollars"), self._get())
+
+    @patch("koku.middleware.MASU", return_value=True)
+    def test_no_cost_model_markup_is_integer_zero_under_microcents(self, _):
+        """No cost model => `0` under microcents and `0.0` on the legacy scale.
+
+        The empty case is the one that leaks a float default most easily.
+        """
+        micro = self._get(money_scale="microcents")
+        dollars = self._get()
+
+        self.assertEqual(micro["markup_pct"], 0)
+        self.assertIsInstance(micro["markup_pct"], int)
+        self.assertEqual(dollars["markup_pct"], 0.0)
+        self.assertIsInstance(dollars["markup_pct"], float)
+
+    # -- the untouched field and the rejection -----------------------------
+
+    @patch("koku.middleware.MASU", return_value=True)
+    def test_rates_stay_micro_cents_under_both_scales(self, _):
+        """`rates[]` was already integer micro-cents (#467); the parameter must
+        not change it in either direction."""
+        rates = [
+            {
+                "metric": {"name": "cpu_core_usage_per_hour"},
+                "tiered_rates": [{"unit": "USD", "value": 0.007}],
+                "cost_type": "Supplementary",
+                "description": "",
+            }
+        ]
+        start, end = self.dh.this_month_start.date(), self.dh.this_month_end.date()
+        with schema_context(self.schema):
+            cm = CostModel.objects.create(
+                name=f"money-scale-rates-cm-{uuid.uuid4().hex[:8]}",
+                source_type=Provider.PROVIDER_OCP,
+                rates=rates,
+            )
+            CostModelMap.objects.create(cost_model_id=cm.uuid, provider_uuid=self.provider.uuid)
+            pl = PriceList.objects.create(
+                name=f"money-scale-rates-pl-{uuid.uuid4().hex[:8]}",
+                description="",
+                currency="USD",
+                effective_start_date=start,
+                effective_end_date=end,
+                rates=rates,
+            )
+            PriceListCostModelMap.objects.create(price_list=pl, cost_model_id=cm.uuid, priority=1)
+        self.cost_model_uuids.append(cm.uuid)
+        self.price_list_uuids.append(pl.uuid)
+
+        for scale in ("dollars", "microcents"):
+            with self.subTest(scale=scale):
+                body = self._get(money_scale=scale)
+                self.assertEqual(body["rates"][0]["tiered_rates"][0]["value"], 700000)
+
+    @patch("koku.middleware.MASU", return_value=True)
+    def test_unknown_money_scale_is_rejected(self, _):
+        """A typo must not silently fall back to dollars: the consumer sends the
+        parameter because it cannot read floats, so a 200 with floats would be
+        the exact mispricing this contract exists to prevent."""
+        self._seed_priced_model()
+
+        response = self.client.get(
+            reverse("effective_rates"),
+            {"cluster_id": self.CLUSTER_ID, "org_id": self.org_id, "money_scale": "microcent"},
+        )
+        body = response.json()
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("money_scale", body["Error"])
+        self.assertNotIn("configured_rates", body)
