@@ -4,6 +4,7 @@
 #
 """Test Case extension to collect common test data."""
 import functools
+import uuid
 from base64 import b64encode
 from copy import deepcopy
 from json import dumps as json_dumps
@@ -117,7 +118,21 @@ class IamTestCase(TestCase):
             "openshift.node": {"read": ["*"]},
         }
         profile = cls.fake.simple_profile()
-        return {"username": profile["username"], "email": profile["mail"], "access": access}
+        # #903: Faker's simple_profile username pool is ~100k with heavy
+        # clustering (169 duplicate draws per 5,000 measured) and the mail
+        # is drawn independently of the username, so a redraw of a username
+        # inside one class's atomic block — the setUpClass user plus every
+        # @RbacPermissions-decorated test's user, all created through
+        # get_or_create(username, email, customer) — nearly always carries
+        # a different email: the get misses and the create violates
+        # api_user_username_key, failing one random test per full-suite
+        # run in a way that reads as a code regression. A short uniqueness
+        # suffix eliminates the collision class. Retrying on the
+        # IntegrityError is not viable (it poisons the TestCase atomic in
+        # PostgreSQL), and get_or_create on username alone would silently
+        # reuse the other draw's email and customer.
+        username = f"{profile['username']}_{uuid.uuid4().hex[:8]}"
+        return {"username": username, "email": profile["mail"], "access": access}
 
     @classmethod
     def _create_customer(cls, account, org_id, create_tenant=False):
