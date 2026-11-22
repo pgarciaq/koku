@@ -30,7 +30,6 @@ class AzureExcludeSerializer(ExcludeSerializer):
     """Serializer for handling tag query parameter exclude."""
 
     subscription_guid = StringOrListField(child=serializers.CharField(), required=False)
-    enabled = serializers.BooleanField(default=True, required=False)
 
     def __init__(self, *args, **kwargs):
         """Initialize the AzureExcludeSerializer."""

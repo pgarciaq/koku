@@ -243,8 +243,17 @@ class OperatorPrefixedEnabledFilterTest(IamTestCase):
                     )
 
     def test_the_boolean_filter_field_is_still_advertised(self):
-        """The fix removes the operator prefixes, not ``enabled`` itself."""
+        """The fix removes the operator prefixes, not ``enabled`` itself.
+
+        Scoped to the filter serializers: #900 later removed the plain
+        ``enabled`` from the exclude serializers (cargo-culted from the
+        filter side, never read by the query layer), so the exclude-side
+        boolean is intentionally gone — ``test_exclude_enabled.py`` pins
+        its new treatment (400) and the filter boolean stays guarded here.
+        """
         for label, serializer_cls, _ in SERIALIZERS:
+            if "exclude" in label:
+                continue
             with self.subTest(serializer=label):
                 self.assertIn(
                     "enabled",

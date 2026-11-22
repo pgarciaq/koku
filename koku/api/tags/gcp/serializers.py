@@ -32,7 +32,6 @@ class GCPExcludeSerializer(ExcludeSerializer):
 
     account = StringOrListField(child=serializers.CharField(), required=False)
     gcp_project = StringOrListField(child=serializers.CharField(), required=False)
-    enabled = serializers.BooleanField(default=True, required=False)
 
     def __init__(self, *args, **kwargs):
         """Initialize the GCPExcludeSerializer."""

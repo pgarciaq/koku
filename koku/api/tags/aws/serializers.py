@@ -32,7 +32,6 @@ class AWSExcludeSerializer(ExcludeSerializer):
 
     account = StringOrListField(child=serializers.CharField(), required=False)
     org_unit_id = StringOrListField(child=serializers.CharField(), required=False)
-    enabled = serializers.BooleanField(default=True, required=False)
 
     def __init__(self, *args, **kwargs):
         """Initialize the AWSExcludeSerializer."""

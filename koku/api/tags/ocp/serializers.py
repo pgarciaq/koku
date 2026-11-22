@@ -44,7 +44,6 @@ class OCPExcludeSerializer(ExcludeSerializer):
     TYPE_CHOICES = (("pod", "pod"), ("storage", "storage"), ("*", "*"))
     type = serializers.ChoiceField(choices=TYPE_CHOICES, required=False)
     project = StringOrListField(child=serializers.CharField(), required=False)
-    enabled = serializers.BooleanField(default=True, required=False)
     cluster = StringOrListField(child=serializers.CharField(), required=False)
     category = StringOrListField(child=serializers.CharField(), required=False)
 
