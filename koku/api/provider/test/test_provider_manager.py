@@ -949,3 +949,33 @@ class ProviderManagerTest(IamTestCase):
             manager = ProviderManager(provider_uuid)
             with self.assertRaises(ProviderManagerError):
                 manager.remove(self._create_delete_request(other_user))
+
+    def test_get_additional_context_null_context_with_manifest(self):
+        """A NULL additional_context OCP provider with a manifest must not crash.
+
+        Found live (2026-11-25, ros-ocp-backend #935): providers whose creation
+        path never populated additional_context crashed the whole /sources/
+        list with TypeError once a manifest existed for them —
+        get_additional_context assigns into the stored value unconditionally.
+        """
+        provider = baker.make(
+            "Provider",
+            customer=self.customer,
+            type="OCP",
+            authentication__credentials={"cluster_id": "null-ctx-cluster"},
+            billing_source__data_source={},
+        )
+        Provider.objects.filter(uuid=provider.uuid).update(additional_context=None)
+        baker.make(
+            "CostUsageReportManifest",
+            provider=provider,
+            assembly_id="null-ctx-assembly",
+            operator_version="5.4.2",
+            num_total_files=1,
+            billing_period_start_datetime=DateHelper().this_month_start,
+        )
+        manager = ProviderManager(provider.uuid)
+        # Pre-fix: TypeError 'NoneType' object does not support item assignment.
+        context = manager.get_additional_context()
+        self.assertEqual(context.get("operator_version"), "5.4.2")
+        self.assertIn("operator_update_available", context)

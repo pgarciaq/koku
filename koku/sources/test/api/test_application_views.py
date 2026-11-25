@@ -118,7 +118,7 @@ class ApplicationsViewTest(IamTestCase):
     def test_list_applications_other_org(self):
         """Test GET from different org returns no applications."""
         user_data = self._create_user_data()
-        other_account = "10002"
+        other_account = "10003"
         other_org_id = "2222222"
         customer = self._create_customer_data(account=other_account, org_id=other_org_id)
         IdentityHeaderMiddleware.create_customer(other_account, other_org_id, "POST")

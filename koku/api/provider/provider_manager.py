@@ -232,7 +232,9 @@ class ProviderManager:
 
     def get_additional_context(self):
         """Returns additional context information."""
-        base_additional_context = self.model.additional_context if self.model else {}
+        # #935: the column is nullable — providers whose creation path never
+        # populated it must not crash the sources list once a manifest exists.
+        base_additional_context = self.model.additional_context if self.model and self.model.additional_context else {}
         if self.manifest and self.model.type == self.model.PROVIDER_OCP:
             base_additional_context["operator_version"] = self.manifest.operator_version
             base_additional_context["operator_airgapped"] = self.manifest.operator_airgapped

@@ -26,7 +26,6 @@ from api.provider.models import Provider
 from api.provider.models import Sources
 from api.provider.provider_builder import ProviderBuilder
 from api.provider.provider_builder import ProviderBuilderError
-from koku.middleware import IdentityHeaderMiddleware
 from providers.provider_access import ProviderAccessor
 from providers.provider_errors import SkipStatusPush
 from sources import storage
@@ -124,9 +123,6 @@ class SourcesKafkaMsgHandlerTest(IamTestCase):
         """Set up the test class."""
         super().setUpClass()
         post_save.disconnect(storage_callback, sender=Sources)
-        account = "10001"
-        org_id = "1234567"
-        IdentityHeaderMiddleware.create_customer(account, org_id, "POST")
 
     def setUp(self):
         """Setup the test method."""

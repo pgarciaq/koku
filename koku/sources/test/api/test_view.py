@@ -193,7 +193,7 @@ class SourcesViewTests(IamTestCase):
     def test_source_list_other_header(self):
         """Test the LIST endpoint with other auth header not matching test data."""
         user_data = self._create_user_data()
-        other_account = "10002"
+        other_account = "10003"
         other_org_id = "2222222"
         customer = self._create_customer_data(account=other_account, org_id=other_org_id)
         IdentityHeaderMiddleware.create_customer(other_account, other_org_id, "POST")
@@ -231,7 +231,7 @@ class SourcesViewTests(IamTestCase):
     def test_source_get_other_header(self):
         """Test the GET endpoint other header not matching test data."""
         user_data = self._create_user_data()
-        other_account = "10002"
+        other_account = "10003"
         other_org_id = "2222222"
         customer = self._create_customer_data(account=other_account, org_id=other_org_id)
         IdentityHeaderMiddleware.create_customer(other_account, other_org_id, "POST")

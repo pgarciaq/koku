@@ -11,7 +11,6 @@ from django.test import TestCase
 from django.test.utils import override_settings
 
 from api.provider.models import Sources
-from koku.middleware import IdentityHeaderMiddleware
 from sources.api.source_status import SourceStatus
 from sources.config import Config
 from sources.kafka_listener import storage_callback
@@ -28,9 +27,8 @@ class SourcesTasksTest(TestCase):
         """Set up the test class."""
         super().setUpClass()
         post_save.disconnect(storage_callback, sender=Sources)
-        account = "12345"
-        org_id = "3333333"
-        IdentityHeaderMiddleware.create_customer(account, org_id, "POST")
+        # The customer (12345/3333333) is seeded by the KokuTestRunner —
+        # re-creating it here only produced the #924 IntegrityError noise.
 
     def setUp(self):
         """Setup the test method."""

@@ -14,7 +14,6 @@ from api.iam.test.iam_test_case import IamTestCase
 from api.models import Provider
 from api.provider.provider_builder import ProviderBuilder
 from api.provider.provider_builder import ProviderBuilderError
-from koku.middleware import IdentityHeaderMiddleware
 from masu.test.external.downloader.aws import fake_arn
 from providers.provider_access import ProviderAccessor
 from sources.config import Config
@@ -42,7 +41,6 @@ class ProviderBuilderTest(IamTestCase):
         super().setUpClass()
         cls.account = "12345"
         cls.org_id = "3333333"
-        IdentityHeaderMiddleware.create_customer(cls.account, cls.org_id, "POST")
 
     def setUp(self):
         """Test case setup."""

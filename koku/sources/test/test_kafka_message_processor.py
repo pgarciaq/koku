@@ -17,7 +17,6 @@ from faker import Faker
 from api.iam.test.iam_test_case import IamTestCase
 from api.provider.models import Provider
 from api.provider.models import Sources
-from koku.middleware import IdentityHeaderMiddleware
 from sources.config import Config
 from sources.kafka_listener import storage_callback
 from sources.kafka_message_processor import ApplicationMsgProcessor
@@ -140,9 +139,6 @@ class KafkaMessageProcessorTest(IamTestCase):
         """Set up the test class."""
         super().setUpClass()
         post_save.disconnect(storage_callback, sender=Sources)
-        account = "10001"
-        org_id = "1234567"
-        IdentityHeaderMiddleware.create_customer(account, org_id, "POST")
 
     def setUp(self):
         self.valid_creds = {
