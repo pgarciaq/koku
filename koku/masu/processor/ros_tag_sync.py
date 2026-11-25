@@ -140,9 +140,10 @@ def build_namespace_tags_payload(schema_name: str) -> dict:
         {
             "cluster_uuid": cluster_id,
             "namespace": namespace,
-            # Koku keeps a list of values per key; resolved_tags holds one, so
-            # take the lowest deterministically rather than last-row-wins.
-            "tags": {key: sorted(values)[0] for key, values in sorted(tags.items()) if values},
+            # Koku keeps a list of values per key; ROS stores sorted arrays and
+            # matches a namespace when any of them matches (#814). Sorting here
+            # keeps the payload byte-comparable across builds.
+            "tags": {key: sorted(values) for key, values in sorted(tags.items()) if values},
         }
         for (cluster_id, namespace), tags in sorted(namespace_values.items())
     ]

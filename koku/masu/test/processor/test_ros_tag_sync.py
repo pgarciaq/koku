@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 """Tests for ROS OCP tag sync."""
+import json
 import os
 import tempfile
 import uuid as uuid_lib
@@ -114,7 +115,7 @@ class RosTagSyncTest(MasuTestCase):
         entry = payload["namespace_tags"][0]
         self.assertEqual(self.ocp_cluster_id, entry["cluster_uuid"])
         self.assertEqual("ros-tag-sync-ns", entry["namespace"])
-        self.assertEqual({"environment": "production"}, entry["tags"])
+        self.assertEqual({"environment": ["production"]}, entry["tags"])
         self.assertEqual(
             [{"key": "environment", "values": ["production"]}],
             payload["tag_keys"],
@@ -203,11 +204,11 @@ class RosTagSyncTest(MasuTestCase):
             (entry["cluster_uuid"], entry["namespace"]): entry["tags"] for entry in payload["namespace_tags"]
         }
         self.assertEqual(
-            {"environment": "production", "app": "cost-management"},
+            {"app": ["cost-management"], "environment": ["production"]},
             tags_by_namespace[(cluster_a, "ros-tag-ns-a")],
         )
         self.assertEqual(
-            {"environment": "production"},
+            {"environment": ["production"]},
             tags_by_namespace[(cluster_b, "ros-tag-ns-b")],
         )
         self.assertEqual(
@@ -218,8 +219,8 @@ class RosTagSyncTest(MasuTestCase):
             payload["tag_keys"],
         )
 
-    def test_build_namespace_tags_payload_collapses_multi_value_deterministically(self):
-        """Koku returns a value list per key; the payload must pick one, reproducibly."""
+    def test_build_namespace_tags_payload_emits_multi_value_union(self):
+        """Koku holds a value list per key; the payload must carry the whole union, sorted."""
         with schema_context(self.schema):
             self._label_summary(
                 OCPUsagePodLabelSummary,
@@ -237,16 +238,50 @@ class RosTagSyncTest(MasuTestCase):
                 ["production"],
                 node="ros-tag-node-a",
             )
+            # Storage labels are a second source; the union spans both.
+            self._label_summary(
+                OCPStorageVolumeLabelSummary,
+                self.ocp_cluster_id,
+                "ros-tag-multi-ns",
+                "environment",
+                ["canary"],
+                node="ros-tag-node-b",
+            )
 
         payload = build_namespace_tags_payload(self.schema)
         self.assertEqual(1, len(payload["namespace_tags"]))
-        self.assertEqual({"environment": "production"}, payload["namespace_tags"][0]["tags"])
-        # The catalog is the org-wide union; resolved_tags holds a single value
-        # until multi-value storage exists (#814).
         self.assertEqual(
-            [{"key": "environment", "values": ["production", "staging"]}],
+            {"environment": ["canary", "production", "staging"]},
+            payload["namespace_tags"][0]["tags"],
+        )
+        # Every advertised value is now reachable by a filter: the catalog and
+        # the stored values carry the same union (#814).
+        self.assertEqual(
+            [{"key": "environment", "values": ["canary", "production", "staging"]}],
             payload["tag_keys"],
         )
+
+    def test_build_namespace_tags_payload_is_order_independent(self):
+        """Row order must not change the payload: that is the sync contract (#814)."""
+        rows = [
+            (self.ocp_cluster_id, "ros-tag-order-ns", "environment", ["production"]),
+            (self.ocp_cluster_id, "ros-tag-order-ns", "environment", ["staging"]),
+            (self.ocp_cluster_id, "ros-tag-order-ns", "environment", ["canary", "staging"]),
+        ]
+
+        def build(order):
+            with patch(
+                "masu.processor.ros_tag_sync._iter_label_rows",
+                side_effect=lambda *args, **kwargs: iter(order),
+            ):
+                payload = build_namespace_tags_payload(self.schema)
+            payload.pop("synced_at")  # the one field expected to move between builds
+            return json.dumps(payload, sort_keys=True)
+
+        forward = build(rows)
+        backward = build(list(reversed(rows)))
+        self.assertEqual(forward, backward)
+        self.assertIn('"environment": ["canary", "production", "staging"]', forward)
 
     @patch("masu.processor.ros_tag_sync.push_namespace_tags", return_value=2)
     @patch(

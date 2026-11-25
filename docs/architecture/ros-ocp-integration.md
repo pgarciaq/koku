@@ -422,7 +422,7 @@ sequenceDiagram
     participant ROS as ROS internal API
     participant DB as ROS PostgreSQL
     Settings->>Worker: schedule_ros_tag_sync(schema)
-    Note over Worker: build payload from<br/>OCPUsageLineItemDailySummary.all_labels
+    Note over Worker: build payload from<br/>pod + storage label summaries
     Worker->>ROS: POST /internal/tags/sync<br/>Bearer SA token
     ROS->>DB: full-replace resolved_tags
     ROS-->>Worker: updated row count
